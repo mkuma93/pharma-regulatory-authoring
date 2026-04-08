@@ -1,0 +1,83 @@
+# Cloud Build — ICH4 Template Service
+# Substitution variables:
+#   _PROJECT_ID   — GCP project ID
+#   _REGION       — Cloud Run / Artifact Registry region
+#   _SERVICE_NAME — Cloud Run service name
+#   _AR_REPO      — Artifact Registry repo name
+
+substitutions:
+  _PROJECT_ID: pharma-reguatory-author
+  _REGION: us-central1
+  _SERVICE_NAME: ich4-template
+  _AR_REPO: ich4
+  _TAG: latest
+
+steps:
+  # 0. Run unit tests
+  - name: "python:3.11-slim"
+    id: test
+    dir: ICH4/template
+    entrypoint: bash
+    args:
+      - "-c"
+      - |
+        pip install --quiet \
+          pytest \
+          fastapi \
+          httpx \
+          pydantic \
+          pydantic-settings \
+          starlette \
+          google-cloud-storage \
+          google-auth
+        OPENAI_API_KEY=test-key GCP_PROJECT_ID="" \
+        python -m pytest tests/ -v --tb=short
+
+  # 1. Create Artifact Registry repo (idempotent)
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
+    entrypoint: bash
+    args:
+      - "-c"
+      - |
+        gcloud artifacts repositories describe $_AR_REPO \
+          --location=$_REGION --project=$_PROJECT_ID &>/dev/null \
+        || gcloud artifacts repositories create $_AR_REPO \
+          --repository-format=docker \
+          --location=$_REGION \
+          --project=$_PROJECT_ID
+
+  # 2. Build and push Docker image
+  - name: "gcr.io/cloud-builders/docker"
+    args:
+      - build
+      - -t
+      - "$_REGION-docker.pkg.dev/$_PROJECT_ID/$_AR_REPO/$_SERVICE_NAME:$_TAG"
+      - -f
+      - ICH4/template/Dockerfile
+      - .
+
+  - name: "gcr.io/cloud-builders/docker"
+    args:
+      - push
+      - "$_REGION-docker.pkg.dev/$_PROJECT_ID/$_AR_REPO/$_SERVICE_NAME:$_TAG"
+
+  # 3. Deploy to Cloud Run
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - "$_SERVICE_NAME"
+      - "--image=$_REGION-docker.pkg.dev/$_PROJECT_ID/$_AR_REPO/$_SERVICE_NAME:$_TAG"
+      - "--region=$_REGION"
+      - "--project=$_PROJECT_ID"
+      - "--platform=managed"
+      - "--no-allow-unauthenticated"
+      - "--memory=1Gi"
+      - "--cpu=1"
+      - "--timeout=300"
+      - "--set-env-vars=GCP_PROJECT_ID=$_PROJECT_ID"
+      - "--set-secrets=OPENAI_API_KEY=OPENAI_API_KEY:latest"
+
+images:
+  - "$_REGION-docker.pkg.dev/$_PROJECT_ID/$_AR_REPO/$_SERVICE_NAME:$_TAG"

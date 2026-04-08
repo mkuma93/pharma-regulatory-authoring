@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local data (never bake into the image — served from GCS)
+data/
+ctd/
+clinical/
+
+# Secrets / local config
+config/.env
+config/secrets/
+
+# Dev / test
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+tests/
+scripts/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Git
+.git/
+.gitignore
+
+# macOS
+.DS_Store

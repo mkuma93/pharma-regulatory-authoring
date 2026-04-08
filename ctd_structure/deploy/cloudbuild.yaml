@@ -1,0 +1,117 @@
+# Cloud Build — CTD Structure Gradio demo
+#
+# Build context: repo root (submitted by deploy.sh)
+# Dockerfile:    ctd_structure/deploy/Dockerfile
+# Tests gate:    tests/test_ctd_structure/  — deployment is blocked if any test fails
+#
+# Substitution variables:
+#   _PROJECT_ID     — GCP project ID
+#   _REGION         — Cloud Run + Artifact Registry region
+#   _SERVICE_NAME   — Cloud Run service name
+#   _AR_REPO        — Artifact Registry repository (shared with ich4-index)
+#   _TAG            — image tag (default: latest)
+#   _ICH_INDEX_URL  — base URL of the deployed ICH4/index Cloud Run service
+
+substitutions:
+  _PROJECT_ID:    pharma-reguatory-author
+  _REGION:        us-central1
+  _SERVICE_NAME:  ctd-structure
+  _AR_REPO:       ich4
+  _TAG:           latest
+  _ICH_INDEX_URL: "https://ich4-index-811317821863.us-central1.run.app"
+  _GCS_BUCKET:    pharma-reguatory-author-life-science
+
+steps:
+  # 0. Run ctd_structure unit tests — deployment is blocked if any test fails
+  - name: "python:3.11-slim"
+    id: test-ctd-structure
+    entrypoint: bash
+    args:
+      - "-c"
+      - |
+        pip install --quiet \
+          pytest \
+          langgraph \
+          langchain-openai \
+          openai \
+          pydantic \
+          requests \
+          typing-extensions \
+          google-cloud-storage \
+          google-auth \
+          google-auth-httplib2
+        python -m pytest tests/test_ctd_structure/ -v --tb=short
+
+  # 1. Ensure Artifact Registry repo exists (idempotent)
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
+    entrypoint: bash
+    args:
+      - "-c"
+      - |
+        gcloud artifacts repositories describe $_AR_REPO \
+          --location=$_REGION --project=$_PROJECT_ID &>/dev/null \
+        || gcloud artifacts repositories create $_AR_REPO \
+          --repository-format=docker \
+          --location=$_REGION \
+          --project=$_PROJECT_ID \
+          --description="ICH4 Docker images"
+
+  # 2. Authenticate Docker with Artifact Registry
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
+    entrypoint: bash
+    args:
+      - "-c"
+      - "gcloud auth configure-docker $_REGION-docker.pkg.dev --quiet"
+
+  # 3. Build image
+  #    dir: ctd_structure so the Dockerfile COPY paths (relative to ctd_structure/)
+  #    resolve correctly even though the build context is the repo root.
+  - name: "gcr.io/cloud-builders/docker"
+    dir: ctd_structure
+    args:
+      - build
+      - -f
+      - deploy/Dockerfile
+      - -t
+      - "$_REGION-docker.pkg.dev/$_PROJECT_ID/$_AR_REPO/$_SERVICE_NAME:$_TAG"
+      - -t
+      - "$_REGION-docker.pkg.dev/$_PROJECT_ID/$_AR_REPO/$_SERVICE_NAME:latest"
+      - .
+
+  # 4. Push both tags
+  - name: "gcr.io/cloud-builders/docker"
+    args:
+      - push
+      - "--all-tags"
+      - "$_REGION-docker.pkg.dev/$_PROJECT_ID/$_AR_REPO/$_SERVICE_NAME"
+
+  # 5. Deploy to Cloud Run
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - "$_SERVICE_NAME"
+      - "--image=$_REGION-docker.pkg.dev/$_PROJECT_ID/$_AR_REPO/$_SERVICE_NAME:$_TAG"
+      - "--region=$_REGION"
+      - "--platform=managed"
+      - "--allow-unauthenticated"
+      - "--min-instances=1"
+      - "--max-instances=3"
+      - "--memory=2Gi"
+      - "--cpu=1"
+      - "--port=8080"
+      # 3-pass pipeline + 3 eval-retry cycles can take up to ~10 min
+      - "--timeout=900"
+      - "--cpu-boost"
+      # ICH_INDEX_URL is read by app.py as the default URL shown in the UI,
+      # and by _gcloud_token() as the OIDC audience when running on Cloud Run.
+      - "--set-env-vars=GCP_PROJECT_ID=$_PROJECT_ID,ICH_INDEX_URL=$_ICH_INDEX_URL,GCS_BUCKET=$_GCS_BUCKET,PUBSUB_TOPIC=ctd-extraction,COMPLIANCE_OFFICER_EMAILS=mritunjay.kmr1@gmail.com"
+      - "--set-secrets=OPENAI_API_KEY=OPENAI_API_KEY:latest"
+
+images:
+  - "$_REGION-docker.pkg.dev/$_PROJECT_ID/$_AR_REPO/$_SERVICE_NAME:$_TAG"
+  - "$_REGION-docker.pkg.dev/$_PROJECT_ID/$_AR_REPO/$_SERVICE_NAME:latest"
+
+options:
+  logging: CLOUD_LOGGING_ONLY

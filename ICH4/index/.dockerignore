@@ -1,0 +1,24 @@
+# Local dev data — never bake into image
+data/
+guidelines/
+
+# Secrets
+config/.env
+config/secrets/
+
+# Offline scripts (not needed to serve the API)
+scripts/
+
+# One-time infrastructure setup (never in Docker)
+infra/
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp

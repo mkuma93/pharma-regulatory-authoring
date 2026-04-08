@@ -1,0 +1,120 @@
+# Cloud Build — triggered from ICH4/index/
+# Builds the Docker image and deploys it to Cloud Run.
+#
+# Substitution variables (set in Cloud Build trigger or pass via --substitutions):
+#   _PROJECT_ID     — your GCP project ID
+#   _REGION         — Cloud Run region + Artifact Registry region, e.g. us-central1
+#   _SERVICE_NAME   — Cloud Run service name, e.g. ich4-index
+#   _GCS_BUCKET     — GCS bucket that holds the pre-built LlamaIndex
+#   _AR_REPO        — Artifact Registry repo name (created automatically below)
+#
+# Image path format (Artifact Registry):
+#   {REGION}-docker.pkg.dev/{PROJECT_ID}/{AR_REPO}/{SERVICE_NAME}:{TAG}
+
+substitutions:
+  _PROJECT_ID: pharma-reguatory-author
+  _REGION: us-central1
+  _SERVICE_NAME: ich4-index
+  _GCS_BUCKET: pharma-reguatory-author-ich4-index
+  _AR_REPO: ich4
+  # Tag defaults to 'latest' for manual submissions; overridden by trigger with $SHORT_SHA
+  _TAG: latest
+  # Set after running scripts/setup_iap.py — format:
+  #   /projects/PROJECT_NUMBER/global/backendServices/BACKEND_SERVICE_ID
+  _IAP_AUDIENCE: ""
+
+steps:
+  # 0. Run ich4-index unit tests — deployment is blocked if any test fails
+  - name: "python:3.11-slim"
+    id: test-ich4-index
+    dir: ICH4/index
+    entrypoint: bash
+    args:
+      - "-c"
+      - |
+        pip install --quiet \
+          pytest \
+          fastapi \
+          httpx \
+          pydantic \
+          pydantic-settings \
+          google-auth \
+          google-auth-httplib2 \
+          google-cloud-storage \
+          starlette
+        OPENAI_API_KEY=test-key \
+        LLAMA_CLOUD_API_KEY=test-key \
+        GCP_PROJECT_ID="" \
+        GCS_BUCKET_NAME="" \
+        python -m pytest tests/ -v --tb=short
+
+  # 1. Create Artifact Registry repo if it doesn't exist yet (idempotent)
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
+    entrypoint: bash
+    args:
+      - "-c"
+      - |
+        gcloud artifacts repositories describe $_AR_REPO \
+          --location=$_REGION --project=$_PROJECT_ID &>/dev/null \
+        || gcloud artifacts repositories create $_AR_REPO \
+          --repository-format=docker \
+          --location=$_REGION \
+          --project=$_PROJECT_ID \
+          --description="ICH4 Docker images"
+
+  # 2. Configure Docker to authenticate with Artifact Registry
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
+    entrypoint: bash
+    args:
+      - "-c"
+      - "gcloud auth configure-docker $_REGION-docker.pkg.dev --quiet"
+
+  # 3. Build the Docker image
+  - name: "gcr.io/cloud-builders/docker"
+    args:
+      - build
+      - -t
+      - "$_REGION-docker.pkg.dev/$_PROJECT_ID/$_AR_REPO/$_SERVICE_NAME:$_TAG"
+      - -t
+      - "$_REGION-docker.pkg.dev/$_PROJECT_ID/$_AR_REPO/$_SERVICE_NAME:latest"
+      - .
+    dir: "."
+
+  # 4. Push to Artifact Registry
+  - name: "gcr.io/cloud-builders/docker"
+    args:
+      - push
+      - "--all-tags"
+      - "$_REGION-docker.pkg.dev/$_PROJECT_ID/$_AR_REPO/$_SERVICE_NAME"
+
+  # 5. Deploy to Cloud Run
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - "$_SERVICE_NAME"
+      - "--image=$_REGION-docker.pkg.dev/$_PROJECT_ID/$_AR_REPO/$_SERVICE_NAME:$_TAG"
+      - "--region=$_REGION"
+      - "--platform=managed"
+      - "--no-allow-unauthenticated"
+      - "--min-instances=0"
+      - "--max-instances=2"
+      - "--memory=2Gi"
+      - "--cpu=1"
+      - "--port=8080"
+      - "--timeout=300"
+      # Extra CPU during cold start so GCS index download doesn't hit startup timeout
+      - "--cpu-boost"
+      # GCP_PROJECT_ID tells settings.py to fetch API keys from Secret Manager at startup.
+      # All other secrets (OPENAI_API_KEY, LLAMA_CLOUD_API_KEY) are pulled by the Python SDK —
+      # no need to list them individually here.
+      - "--set-env-vars=GCP_PROJECT_ID=$_PROJECT_ID,GCS_BUCKET_NAME=$_GCS_BUCKET,INDEX_PERSIST_DIR=/tmp/index_store,IAP_AUDIENCE=$_IAP_AUDIENCE"
+
+images:
+  - "$_REGION-docker.pkg.dev/$_PROJECT_ID/$_AR_REPO/$_SERVICE_NAME:$_TAG"
+  - "$_REGION-docker.pkg.dev/$_PROJECT_ID/$_AR_REPO/$_SERVICE_NAME:latest"
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+

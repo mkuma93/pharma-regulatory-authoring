@@ -1,0 +1,26 @@
+# Gradio demo
+gradio>=5.0.0
+
+# LangGraph workflow + LLM intent classification
+langgraph>=0.1.0
+langchain-openai>=0.1.0
+openai>=1.0.0
+
+# Data models
+pydantic>=2.0.0
+
+# HTTP client (used by _post_query)
+requests
+
+# Google auth — OIDC token fetching inside Cloud Run (no gcloud needed)
+google-auth
+google-auth-httplib2
+
+# GCS — for writing program-level folder markers
+google-cloud-storage
+
+# Pub/Sub — publishing extraction job requests to ctd-worker
+google-cloud-pubsub
+
+# Stdlib extras
+typing-extensions

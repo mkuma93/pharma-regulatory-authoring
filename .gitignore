@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env
+
+# Secrets & credentials
+config/secrets/
+**/config/secrets/
+**/config/.env
+*.env
+.env.*
+*.key
+*.pem
+service_account*.json
+*credentials*.json
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+*.xml
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# IDE
+.vscode/settings.json
+.idea/
+
+# Large data / outputs
+data/output/
+data/input/
+ctd/
+ICH4/index/data/
+ICH4/index/knowledge/
+
+# Clinical patient data (upload via API, not committed)
+clinical/**/*.csv
+
+# Node / build artifacts
+node_modules/
+*.log

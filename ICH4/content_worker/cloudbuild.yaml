@@ -1,0 +1,151 @@
+# Cloud Build — ICH4 content worker
+#
+# Build context: ICH4/content_worker/
+#
+# Steps:
+#   1. Ensure Artifact Registry repo exists
+#   2. Build + push worker image
+#   3. Deploy Cloud Run service (no-allow-unauthenticated — Pub/Sub uses OIDC)
+#   4. Grant Pub/Sub SA roles/run.invoker on this service
+#   5. Create/update Pub/Sub topic + push subscription
+
+substitutions:
+  _PROJECT_ID:      pharma-reguatory-author
+  _PROJECT_NUMBER:  "811317821863"
+  _REGION:          us-central1
+  _WORKER_NAME:     ich4-content-worker
+  _AR_REPO:         ich4
+  _TAG:             latest
+  _ORCHESTRATOR_URL: "https://ich4-orchestrator-811317821863.us-central1.run.app"
+  _WRITER_URL:       "https://ich4-writer-811317821863.us-central1.run.app"
+  _PUBSUB_TOPIC:    ich4-content-generation
+  _SA_NAME:         ich4-content-worker
+
+steps:
+  # 1. Ensure Artifact Registry repo exists
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
+    entrypoint: bash
+    args:
+      - "-c"
+      - |
+        gcloud artifacts repositories describe $_AR_REPO \
+          --location=$_REGION --project=$_PROJECT_ID &>/dev/null \
+        || gcloud artifacts repositories create $_AR_REPO \
+          --repository-format=docker \
+          --location=$_REGION \
+          --project=$_PROJECT_ID \
+          --description="ICH4 Docker images"
+
+  # 2. Authenticate Docker
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
+    entrypoint: bash
+    args:
+      - "-c"
+      - "gcloud auth configure-docker $_REGION-docker.pkg.dev --quiet"
+
+  # 3. Build worker image
+  - name: "gcr.io/cloud-builders/docker"
+    args:
+      - build
+      - -t
+      - "$_REGION-docker.pkg.dev/$_PROJECT_ID/$_AR_REPO/$_WORKER_NAME:$_TAG"
+      - .
+
+  # 4. Push image
+  - name: "gcr.io/cloud-builders/docker"
+    args:
+      - push
+      - "$_REGION-docker.pkg.dev/$_PROJECT_ID/$_AR_REPO/$_WORKER_NAME:$_TAG"
+
+  # 5. Ensure service account exists
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
+    entrypoint: bash
+    args:
+      - "-c"
+      - |
+        gcloud iam service-accounts describe \
+          $_SA_NAME@$_PROJECT_ID.iam.gserviceaccount.com \
+          --project=$_PROJECT_ID &>/dev/null \
+        || gcloud iam service-accounts create $_SA_NAME \
+          --project=$_PROJECT_ID \
+          --display-name="ICH4 Content Worker"
+
+  # 6. Deploy Cloud Run service
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
+    entrypoint: bash
+    args:
+      - "-c"
+      - |
+        gcloud run deploy $_WORKER_NAME \
+          --image="$_REGION-docker.pkg.dev/$_PROJECT_ID/$_AR_REPO/$_WORKER_NAME:$_TAG" \
+          --region=$_REGION \
+          --project=$_PROJECT_ID \
+          --platform=managed \
+          --no-allow-unauthenticated \
+          --service-account=$_SA_NAME@$_PROJECT_ID.iam.gserviceaccount.com \
+          --set-env-vars="ORCHESTRATOR_URL=$_ORCHESTRATOR_URL,WRITER_URL=$_WRITER_URL" \
+          --memory=512Mi \
+          --timeout=660 \
+          --concurrency=5 \
+          --min-instances=0 \
+          --max-instances=10
+
+  # 7. Grant Pub/Sub SA roles/run.invoker so push subscription can deliver
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
+    entrypoint: bash
+    args:
+      - "-c"
+      - |
+        PUBSUB_SA="service-$_PROJECT_NUMBER@gcp-sa-pubsub.iam.gserviceaccount.com"
+        gcloud run services add-iam-policy-binding $_WORKER_NAME \
+          --region=$_REGION \
+          --project=$_PROJECT_ID \
+          --member="serviceAccount:$${PUBSUB_SA}" \
+          --role="roles/run.invoker" \
+          --quiet 2>/dev/null || true
+
+  # 8. Create Pub/Sub topic (idempotent)
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
+    entrypoint: bash
+    args:
+      - "-c"
+      - |
+        gcloud pubsub topics describe $_PUBSUB_TOPIC --project=$_PROJECT_ID &>/dev/null \
+        || gcloud pubsub topics create $_PUBSUB_TOPIC --project=$_PROJECT_ID
+
+  # 9. Create push subscription pointing to the worker's /generate endpoint
+  #    (requires iam.serviceAccounts.actAs — skipped if Cloud Build SA lacks it;
+  #     run  bash ICH4/content_worker/infra/setup.sh  to wire Pub/Sub manually)
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
+    entrypoint: bash
+    args:
+      - "-c"
+      - |
+        WORKER_URL=$(gcloud run services describe $_WORKER_NAME \
+          --region=$_REGION --project=$_PROJECT_ID \
+          --format='value(status.url)')
+        PUSH_URL="$${WORKER_URL}/generate"
+        PUBSUB_SA="service-$_PROJECT_NUMBER@gcp-sa-pubsub.iam.gserviceaccount.com"
+        SUB_NAME="$_PUBSUB_TOPIC-push"
+
+        gcloud pubsub subscriptions describe "$${SUB_NAME}" \
+          --project=$_PROJECT_ID &>/dev/null \
+        && gcloud pubsub subscriptions modify-push-config "$${SUB_NAME}" \
+          --push-endpoint="$${PUSH_URL}" \
+          --push-auth-service-account="$${PUBSUB_SA}" \
+          --project=$_PROJECT_ID \
+        || gcloud pubsub subscriptions create "$${SUB_NAME}" \
+          --topic=$_PUBSUB_TOPIC \
+          --push-endpoint="$${PUSH_URL}" \
+          --push-auth-service-account="$${PUBSUB_SA}" \
+          --ack-deadline=600 \
+          --min-retry-delay=30s \
+          --max-retry-delay=300s \
+          --project=$_PROJECT_ID \
+        || echo "WARNING: Could not create subscription — run bash ICH4/content_worker/infra/setup.sh to wire Pub/Sub manually"
+
+images:
+  - "$_REGION-docker.pkg.dev/$_PROJECT_ID/$_AR_REPO/$_WORKER_NAME:$_TAG"
+
+options:
+  logging: CLOUD_LOGGING_ONLY
