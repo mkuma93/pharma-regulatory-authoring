@@ -19,19 +19,11 @@ steps:
     dir: ICH4/template
     entrypoint: bash
     args:
-      - "-c"
+      - "-ec"
       - |
-        pip install --quiet \
-          pytest \
-          fastapi \
-          httpx \
-          pydantic \
-          pydantic-settings \
-          starlette \
-          google-cloud-storage \
-          google-auth
-        OPENAI_API_KEY=test-key GCP_PROJECT_ID="" \
-        python -m pytest tests/ -v --tb=short
+        pip install --upgrade pip && \
+        pip install -r requirements.txt pytest httpx && \
+        OPENAI_API_KEY=test-key GCP_PROJECT_ID="" python -m pytest tests/ -v --tb=short
 
   # 1. Create Artifact Registry repo (idempotent)
   - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"

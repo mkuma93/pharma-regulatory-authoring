@@ -15,16 +15,10 @@ steps:
     dir: ICH4/orchestrator
     entrypoint: bash
     args:
-      - "-c"
+      - "-ec"
       - |
-        pip install --quiet \
-          pytest \
-          fastapi \
-          httpx \
-          pydantic \
-          pydantic-settings \
-          starlette \
-          anyio
+        pip install --upgrade pip && \
+        pip install -r requirements.txt pytest httpx && \
         python -m pytest tests/ -v --tb=short
 
   # 1. Create Artifact Registry repo (idempotent)
@@ -47,7 +41,7 @@ steps:
       - "$_REGION-docker.pkg.dev/$_PROJECT_ID/$_AR_REPO/$_SERVICE_NAME:$_TAG"
       - -f
       - ICH4/orchestrator/Dockerfile
-      - ICH4/orchestrator
+      - .
 
   - name: "gcr.io/cloud-builders/docker"
     args:

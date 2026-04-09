@@ -52,7 +52,7 @@ gcloud services enable \
   --project="${PROJECT_ID}" --quiet
 
 echo "[3/3] Submitting build and deploy to Cloud Build..."
-gcloud builds submit "${SCRIPT_DIR}" \
+gcloud builds submit "${REPO_ROOT}" \
   --config="${SCRIPT_DIR}/cloudbuild.yaml" \
   --project="${PROJECT_ID}" \
   --substitutions="_PROJECT_ID=${PROJECT_ID},_REGION=${REGION},_SERVICE_NAME=${SERVICE_NAME},_AR_REPO=${AR_REPO},_INDEX_SERVICE_URL=${INDEX_SERVICE_URL},_TEMPLATE_SERVICE_URL=${TEMPLATE_SERVICE_URL}"

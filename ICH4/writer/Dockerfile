@@ -1,6 +1,6 @@
 FROM python:3.11-slim AS builder
 WORKDIR /build
-COPY requirements.txt .
+COPY ICH4/writer/requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip \
  && pip install --no-cache-dir -r requirements.txt
 
@@ -10,10 +10,10 @@ WORKDIR /app
 COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
 
-COPY api/        api/
-COPY writer/     writer/
-COPY validator/  validator/
-COPY config/     config/
+COPY ICH4/writer/api/        api/
+COPY ICH4/writer/writer/     writer/
+COPY ICH4/writer/validator/  validator/
+COPY ICH4/writer/config/     config/
 
 ENV PYTHONPATH=/app
 ENV PORT=8080

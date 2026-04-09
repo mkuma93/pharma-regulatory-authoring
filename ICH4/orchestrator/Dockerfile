@@ -1,6 +1,6 @@
 FROM python:3.11-slim AS builder
 WORKDIR /build
-COPY requirements.txt .
+COPY ICH4/orchestrator/requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip \
  && pip install --no-cache-dir -r requirements.txt
 
@@ -10,9 +10,9 @@ WORKDIR /app
 COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
 
-COPY main.py    main.py
-COPY models.py  models.py
-COPY config/    config/
+COPY ICH4/orchestrator/main.py    main.py
+COPY ICH4/orchestrator/models.py  models.py
+COPY ICH4/orchestrator/config/    config/
 
 ENV PYTHONPATH=/app
 ENV PORT=8080
