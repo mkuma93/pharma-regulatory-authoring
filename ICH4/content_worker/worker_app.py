@@ -46,6 +46,7 @@ app = FastAPI(title="ICH4 Content Worker", version="1.0.0")
 
 _ORCHESTRATOR_URL = os.environ.get("ORCHESTRATOR_URL", "").rstrip("/")
 _WRITER_URL       = os.environ.get("WRITER_URL", "").rstrip("/")
+_INDEX_URL        = os.environ.get("INDEX_URL", "").rstrip("/")
 _TIMEOUT          = float(os.environ.get("SERVICE_TIMEOUT", "600"))
 
 _gcs_client = storage.Client()
@@ -59,8 +60,15 @@ def _program_prefix(ta: str, dis: str, drug: str) -> str:
     return f"therapeutic-area/{_slug(ta)}/{_slug(dis)}/{_slug(drug)}"
 
 
-def _content_status_path(ta: str, dis: str, drug: str, session_id: str) -> str:
-    return f"{_program_prefix(ta, dis, drug)}/content_status/{session_id}.json"
+def _program_namespace(ta: str, dis: str, drug: str) -> str:
+    """Build the base program namespace used for per-program LlamaIndex namespaces."""
+    def _slug(s: str) -> str:
+        return s.strip().lower().replace(" ", "_")
+    return f"program_{_slug(ta)}_{_slug(dis)}_{_slug(drug)}"
+
+
+def _content_status_path(ta: str, dis: str, drug: str, session_id: str = "") -> str:
+    return f"{_program_prefix(ta, dis, drug)}/content_status/latest.json"
 
 
 def _write_status(bucket: str, path: str, payload: dict) -> None:
@@ -141,96 +149,211 @@ async def generate(request: Request):
         pass  # first run — status file doesn't exist yet
 
     _write_status(bucket, status_path, {
-        "status": "running", "run_id": run_id, "step": "orchestrator",
+        "status": "running", "run_id": run_id, "step": "starting",
     })
     logger.info("[worker] Content generation started  %s/%s/%s  session=%s", ta, dis, drug, session_id)
 
-    # ── Step 1: orchestrator → templates ─────────────────────────────────────
+    # ── ICH M4E(R2) evidence-ordered generation ───────────────────────────────
+    # Module 5 CSRs are the primary evidence layer (ICH M4E(R2) §5.3).
+    # Module 2.7 Clinical Summary aggregates Module 5 findings (ICH M4E(R2) §2.7).
+    # Module 2.5 Clinical Overview critically analyses Module 2.7+5 (ICH M4E(R2) §2.5).
+    # Each pass indexes its output into a per-program LlamaIndex namespace so
+    # downstream passes can retrieve actual generated content via RAG, preventing
+    # hallucinated statistics in Module 2 sections.
+    GENERATION_DAG = [
+        {
+            "pass_id":          "module5",
+            "pass_label":       "Module 5: Clinical Study Reports",
+            "module_filter":    ["module5"],
+            "section_prefixes": [],
+            "evidence_from":    [],
+            "index_after":      True,
+        },
+        {
+            "pass_id":          "module2_clinical_summary",
+            "pass_label":       "Module 2.7: Clinical Summary",
+            "module_filter":    ["module2"],
+            "section_prefixes": ["2.7"],
+            "evidence_from":    ["module5"],
+            "index_after":      True,
+        },
+        {
+            "pass_id":          "module2_overview",
+            "pass_label":       "Module 2.5/2.4/2.3: Overviews",
+            "module_filter":    ["module2"],
+            "section_prefixes": ["2.5", "2.4", "2.3", "2.2", "2.1"],
+            "evidence_from":    ["module5", "module2_clinical_summary"],
+            "index_after":      False,
+        },
+    ]
+
+    base_ns      = _program_namespace(ta, dis, drug)
+    total_passes = len(GENERATION_DAG)
+    all_sections_written = 0
+    all_sections_failed: list[str] = []
+    final_validation: dict = {}
+
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
-            orch_audience = _service_audience(_ORCHESTRATOR_URL)
-            r = await client.post(
-                f"{_ORCHESTRATOR_URL}/generate",
-                json={
-                    "program": {
-                        "therapeutic_area": ta,
-                        "disease_type":     dis,
-                        "drug_name":        drug,
+        for pass_idx, dag_pass in enumerate(GENERATION_DAG):
+            pass_id    = dag_pass["pass_id"]
+            pass_label = dag_pass["pass_label"]
+            evidence_namespaces = [f"{base_ns}_{eid}" for eid in dag_pass["evidence_from"]]
+
+            _write_status(bucket, status_path, {
+                "status":       "running",
+                "run_id":       run_id,
+                "step":         f"pass_{pass_id}",
+                "pass_label":   pass_label,
+                "pass_number":  pass_idx + 1,
+                "total_passes": total_passes,
+            })
+            logger.info("[worker] Pass %d/%d: %s", pass_idx + 1, total_passes, pass_label)
+
+            # ── Step A: Orchestrator → templates ──────────────────────────────
+            async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+                orch_aud = _service_audience(_ORCHESTRATOR_URL)
+                r = await client.post(
+                    f"{_ORCHESTRATOR_URL}/generate",
+                    json={
+                        "program": {
+                            "therapeutic_area": ta,
+                            "disease_type":     dis,
+                            "drug_name":        drug,
+                        },
+                        "include_clinical_data": True,
+                        "include_ich_context":   True,
+                        "module_filter":         dag_pass["module_filter"],
+                        "evidence_namespaces":   evidence_namespaces,
+                        "section_key_prefixes":  dag_pass["section_prefixes"],
                     },
-                    "include_clinical_data": True,
-                    "include_ich_context":  True,
-                },
-                headers=_oidc_headers(orch_audience),
-            )
-            if r.status_code >= 400:
-                detail = f"orchestrator returned HTTP {r.status_code}: {r.text[:300]}"
-                _write_status(bucket, status_path, {
-                    "status": "failed", "run_id": run_id, "error": detail,
-                })
-                # 4xx from orchestrator = permanent failure; ack to avoid infinite retry
-                if r.status_code < 500:
-                    return {"status": "failed", "reason": detail}
-                raise httpx.HTTPStatusError(detail, request=r.request, response=r)
+                    headers=_oidc_headers(orch_aud),
+                )
+                if r.status_code >= 400:
+                    detail = (
+                        f"orchestrator (pass={pass_id}) returned HTTP "
+                        f"{r.status_code}: {r.text[:300]}"
+                    )
+                    _write_status(bucket, status_path, {
+                        "status": "failed", "run_id": run_id, "error": detail,
+                    })
+                    if r.status_code < 500:
+                        return {"status": "failed", "reason": detail}
+                    raise httpx.HTTPStatusError(detail, request=r.request, response=r)
 
-            templates = r.json().get("templates", [])
-            logger.info("[worker] Orchestrator returned %d templates", len(templates))
+                templates = r.json().get("templates", [])
+                logger.info(
+                    "[worker] Pass %s: orchestrator returned %d templates",
+                    pass_id, len(templates),
+                )
 
-        # ── Step 2: save templates to GCS ────────────────────────────────────
-        _write_status(bucket, status_path, {
-            "status": "running", "run_id": run_id,
-            "step": "saving_templates", "templates_total": len(templates),
-        })
-        prefix = _program_prefix(ta, dis, drug)
-        bkt    = _gcs_client.bucket(bucket)
-        for tmpl in templates:
-            gcs_path = (
-                f"{prefix}/templates"
-                f"/{tmpl['module_key']}"
-                f"/{tmpl['section_key']}.md"
-            )
-            bkt.blob(gcs_path).upload_from_string(
-                tmpl["content"],
-                content_type="text/markdown; charset=utf-8",
-            )
-        logger.info("[worker] Saved %d templates to gs://%s/%s/templates/", len(templates), bucket, prefix)
+            if not templates:
+                logger.warning("[worker] Pass %s: no templates — skipping write", pass_id)
+                continue
 
-        # ── Step 3: writer /write ─────────────────────────────────────────────
-        _write_status(bucket, status_path, {
-            "status": "running", "run_id": run_id,
-            "step": "writing", "templates_total": len(templates),
-        })
-        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
-            writer_audience = _service_audience(_WRITER_URL)
-            r = await client.post(
-                f"{_WRITER_URL}/write",
-                json={
-                    "program": {
-                        "therapeutic_area": ta,
-                        "disease_type":     dis,
-                        "drug_name":        drug,
-                    },
-                    "bucket_name":   bucket,
-                    "run_validator": True,
-                },
-                headers=_oidc_headers(writer_audience),
-            )
-            if r.status_code >= 400:
-                detail = f"writer returned HTTP {r.status_code}: {r.text[:300]}"
-                _write_status(bucket, status_path, {
-                    "status": "failed", "run_id": run_id, "error": detail,
-                })
-                if r.status_code < 500:
-                    return {"status": "failed", "reason": detail}
-                raise httpx.HTTPStatusError(detail, request=r.request, response=r)
-
-            writer_data      = r.json()
-            sections_written = writer_data.get("sections_written", 0)
-            sections_failed  = writer_data.get("sections_failed", [])
-            validation       = writer_data.get("validation", {})
+            # ── Step B: Save templates to GCS ────────────────────────────────
+            prefix = _program_prefix(ta, dis, drug)
+            bkt    = _gcs_client.bucket(bucket)
+            for tmpl in templates:
+                gcs_path = (
+                    f"{prefix}/templates"
+                    f"/{tmpl['module_key']}"
+                    f"/{tmpl['section_key']}.md"
+                )
+                bkt.blob(gcs_path).upload_from_string(
+                    tmpl["content"],
+                    content_type="text/markdown; charset=utf-8",
+                )
             logger.info(
-                "[worker] Writer done  written=%d  failed=%s  validation_passed=%s",
-                sections_written, sections_failed, validation.get("passed"),
+                "[worker] Pass %s: saved %d templates to gs://%s/%s/templates/",
+                pass_id, len(templates), bucket, prefix,
             )
+
+            # ── Step C: Writer ────────────────────────────────────────────────
+            _write_status(bucket, status_path, {
+                "status":     "running",
+                "run_id":     run_id,
+                "step":       f"writing_{pass_id}",
+                "pass_label": pass_label,
+            })
+            section_keys = [t["section_key"] for t in templates]
+            async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+                writer_aud = _service_audience(_WRITER_URL)
+                r = await client.post(
+                    f"{_WRITER_URL}/write",
+                    json={
+                        "program": {
+                            "therapeutic_area": ta,
+                            "disease_type":     dis,
+                            "drug_name":        drug,
+                        },
+                        "bucket_name":   bucket,
+                        "sections":      section_keys,
+                        "run_validator": pass_idx == total_passes - 1,
+                    },
+                    headers=_oidc_headers(writer_aud),
+                )
+                if r.status_code >= 400:
+                    detail = (
+                        f"writer (pass={pass_id}) returned HTTP "
+                        f"{r.status_code}: {r.text[:300]}"
+                    )
+                    _write_status(bucket, status_path, {
+                        "status": "failed", "run_id": run_id, "error": detail,
+                    })
+                    if r.status_code < 500:
+                        return {"status": "failed", "reason": detail}
+                    raise httpx.HTTPStatusError(detail, request=r.request, response=r)
+
+                writer_data      = r.json()
+                sections_written = writer_data.get("sections_written", 0)
+                sections_failed  = writer_data.get("sections_failed", [])
+                final_validation = writer_data.get("validation", {})
+                all_sections_written += sections_written
+                all_sections_failed.extend(sections_failed)
+                logger.info(
+                    "[worker] Pass %s: written=%d  failed=%s",
+                    pass_id, sections_written, sections_failed,
+                )
+
+            # ── Step D: Ingest into program index (if configured) ─────────────
+            if dag_pass.get("index_after") and _INDEX_URL and writer_data.get("documents"):
+                pass_namespace  = f"{base_ns}_{pass_id}"
+                ingest_sections = [
+                    {
+                        "module_key":  doc["module_key"],
+                        "section_key": doc["section_key"],
+                        "content":     doc["content"],
+                    }
+                    for doc in writer_data["documents"]
+                    if doc.get("content", "").strip()
+                ]
+                if ingest_sections:
+                    try:
+                        async with httpx.AsyncClient(timeout=120.0) as client:
+                            idx_aud = _service_audience(_INDEX_URL)
+                            ir = await client.post(
+                                f"{_INDEX_URL}/index/ingest-program",
+                                json={
+                                    "program_namespace": pass_namespace,
+                                    "sections":          ingest_sections,
+                                },
+                                headers=_oidc_headers(idx_aud),
+                            )
+                            if ir.status_code == 200:
+                                logger.info(
+                                    "[worker] Pass %s: indexed %d sections -> %s",
+                                    pass_id, len(ingest_sections), pass_namespace,
+                                )
+                            else:
+                                logger.warning(
+                                    "[worker] Pass %s: index ingest HTTP %s — continuing",
+                                    pass_id, ir.status_code,
+                                )
+                    except Exception as exc:
+                        logger.warning(
+                            "[worker] Pass %s: index ingest failed (non-fatal): %s",
+                            pass_id, exc,
+                        )
 
     except (httpx.ConnectError, httpx.TimeoutException) as exc:
         # Transient infra error — nack (Pub/Sub will retry)
@@ -241,7 +364,6 @@ async def generate(request: Request):
 
     except Exception as exc:
         if not isinstance(exc, httpx.HTTPStatusError):
-            # Unexpected / permanent error — ack to avoid infinite retry
             _write_status(bucket, status_path, {
                 "status": "failed", "run_id": run_id, "error": str(exc),
             })
@@ -251,18 +373,18 @@ async def generate(request: Request):
 
     # ── Write final done status ───────────────────────────────────────────────
     _write_status(bucket, status_path, {
-        "status":              "done",
-        "run_id":              run_id,
-        "sections_written":    sections_written,
-        "sections_failed":     sections_failed,
-        "validation_passed":   validation.get("passed", False),
-        "validation_summary":  validation.get("summary", ""),
+        "status":             "done",
+        "run_id":             run_id,
+        "sections_written":   all_sections_written,
+        "sections_failed":    all_sections_failed,
+        "validation_passed":  final_validation.get("passed", False),
+        "validation_summary": final_validation.get("summary", ""),
     })
     logger.info(
-        "[worker] Content generation complete  written=%d  validation_passed=%s",
-        sections_written, validation.get("passed"),
+        "[worker] Generation complete  written=%d  validation_passed=%s",
+        all_sections_written, final_validation.get("passed"),
     )
-    return {"status": "ok", "sections_written": sections_written}
+    return {"status": "ok", "sections_written": all_sections_written}
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

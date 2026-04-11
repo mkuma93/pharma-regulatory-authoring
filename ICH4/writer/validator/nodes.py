@@ -8,8 +8,11 @@ Node pipeline:
                                      are available from other sections
   4. check_unfilled_placeholders   — flag any remaining [DATA PENDING] (error)
   5. check_not_filled_markers      — flag any remaining {{key}} [NOT FILLED] (error)
-  6. llm_deep_check                — LLM narrative coherence + remaining contradiction scan
-  7. finalise                      — produce passed/failed verdict + summary
+  6. check_ich_coverage            — LLM checks each section against ICH M4 mandatory
+                                     content requirements (missing elements = error/warning)
+  7. llm_deep_check                — LLM semantic coherence: benefit-risk alignment,
+                                     cross-module claim support, regulatory language
+  8. finalise                      — produce passed/failed verdict + summary
 """
 from __future__ import annotations
 
@@ -348,24 +351,183 @@ def check_not_filled_markers(state: ValidatorState) -> dict:
     return {"issues": issues}
 
 
-# ── Node 6: LLM deep check ────────────────────────────────────────────────────
+# ── Node 6: ICH mandatory content coverage ───────────────────────────────────
+
+# Per-section mandatory content requirements per ICH M4E(R2), M4Q, M4S, E3, E9.
+# Keys are fragments of section_key strings (matched with 'in').
+_ICH_COVERAGE_REQUIREMENTS: dict[str, list[str]] = {
+    "2.5.1": [
+        "unmet medical need or disease burden",
+        "mechanism of action or pharmacological rationale",
+        "dose or dose regimen selection rationale",
+        "patient population or target indication",
+    ],
+    "2.5.2": [
+        "bioavailability or absorption",
+        "BCS classification or formulation",
+        "food effect or fed/fasted comparison",
+    ],
+    "2.5.3": [
+        "pharmacokinetic parameters (Cmax, AUC, t½ or half-life)",
+        "metabolic pathway or CYP involvement",
+        "protein binding",
+        "dose-response or exposure-response relationship",
+    ],
+    "2.5.4": [
+        "primary efficacy endpoint and result",
+        "secondary efficacy endpoints",
+        "study population (N, demographics)",
+        "subgroup analyses or consistency across subgroups",
+        "clinical meaningfulness or responder definition",
+    ],
+    "2.5.5": [
+        "overall adverse event (AE) incidence rate",
+        "serious adverse events (SAEs)",
+        "discontinuations due to adverse events",
+        "deaths",
+        "special populations (elderly, renal/hepatic impairment)",
+    ],
+    "2.5.6": [
+        "quantified benefit (specific efficacy figure)",
+        "characterised key risks (specific safety figure)",
+        "benefit-risk conclusion statement",
+        "comparison to available alternatives or standard of care",
+    ],
+    "2.7.3": [
+        "primary endpoint result with confidence interval or p-value",
+        "ITT or full analysis set population",
+        "per-protocol population",
+        "statistical method (e.g. ANCOVA, log-rank, MMRM)",
+        "sensitivity analyses",
+    ],
+    "2.7.4": [
+        "treatment-emergent adverse events by System Organ Class",
+        "dose-limiting or dose-dependent toxicity",
+        "exposure-response for safety",
+        "laboratory abnormalities",
+    ],
+    "5.3.5": [
+        "study objectives",
+        "study design (randomised/controlled/blinded)",
+        "subject disposition (enrolled, completed, discontinued)",
+        "primary endpoint result",
+        "safety results summary",
+        "conclusion",
+    ],
+}
+
+_ICH_COVERAGE_SYSTEM = """\
+You are a senior ICH M4 regulatory reviewer auditing CTD sections for mandatory content.
+You will receive the full text of one or more CTD sections.
+
+For each section, check whether the required elements listed are present and adequately addressed.
+A required element is ABSENT if it is not discussed at all or only appears as a placeholder.
+A required element is WEAK if it is mentioned but without supporting data or quantification.
+
+For each missing or weak required element, output exactly one line:
+  ISSUE|<severity>|<section_key>|<message>
+  severity = "error"  if the element is completely absent
+  severity = "warning" if the element is present but lacks data/quantification
+
+If a section has no coverage gaps, output nothing for that section.
+If ALL sections are complete, output exactly: NO_ISSUES
+No other text — no prose, no headers.
+"""
+
+
+def check_ich_coverage(state: ValidatorState, llm: ChatOpenAI) -> dict:
+    """Check each section against ICH M4 mandatory content requirements.
+
+    Matches sections by checking whether any ICH requirement key is a substring
+    of the document's section_key.  One LLM call per matched section to avoid
+    an enormous monolithic prompt.
+    """
+    issues: list[ValidationIssue] = []
+
+    # Build lookup: section_key → list of required elements
+    def _requirements_for(section_key: str) -> list[str]:
+        for prefix, reqs in _ICH_COVERAGE_REQUIREMENTS.items():
+            if prefix in section_key:
+                return reqs
+        return []
+
+    for doc in state.documents:
+        reqs = _requirements_for(doc.section_key)
+        if not reqs:
+            continue  # no specific ICH requirements defined for this section
+
+        req_block = "\n".join(f"  - {r}" for r in reqs)
+        # Use full content — truncated only at 4000 chars to stay within token budget
+        content_excerpt = doc.content[:4000]
+
+        prompt = (
+            f"Section: {doc.section_key} — {doc.section_label}\n\n"
+            f"Required elements per ICH M4:\n{req_block}\n\n"
+            f"Section content:\n{content_excerpt}"
+        )
+
+        try:
+            response = llm.invoke([
+                SystemMessage(content=_ICH_COVERAGE_SYSTEM),
+                HumanMessage(content=prompt),
+            ])
+            raw = response.content.strip()
+        except Exception as exc:
+            logger.warning("[validator] ICH coverage check failed for %s: %s", doc.section_key, exc)
+            continue
+
+        if raw == "NO_ISSUES" or not raw:
+            continue
+
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line.startswith("ISSUE|"):
+                continue
+            parts = line.split("|", 3)
+            if len(parts) == 4:
+                _, sev, sec, msg = parts
+                if sev in ("error", "warning", "info"):
+                    issues.append(ValidationIssue(
+                        severity=sev,  # type: ignore[arg-type]
+                        section_key=sec.strip() or doc.section_key,
+                        message=msg.strip(),
+                    ))
+
+    logger.info("[validator] ICH coverage check found %d issue(s).", len(issues))
+    return {"issues": issues}
+
+
+# ── Node 7: LLM deep check ────────────────────────────────────────────────────
 
 _CONSISTENCY_SYSTEM = """\
-You are a senior regulatory reviewer doing a cross-module consistency audit.
-You will receive excerpts from CTD sections plus any known consensus values.
+You are a senior regulatory reviewer doing a cross-module semantic consistency audit.
+You will receive full text excerpts from CTD sections plus any known consensus values.
 
-Check for:
-1. DRUG_NAME   — drug/compound name stated differently across sections.
-2. DEMOGRAPHICS — patient N, age, gender ratio inconsistent across sections.
-3. EFFICACY    — conflicting efficacy claims (e.g. ORR 68% in 2.5 vs 72% in 2.7).
-4. SAFETY      — conflicting safety data (AE or SAE rates differ between sections).
-5. CROSS_REF   — a section references data still marked [DATA PENDING] that is clearly
-                 stated in another section.
-6. NARRATIVE   — contradictory language (e.g. "well tolerated" vs "significant toxicity").
+Check for ALL of the following:
+1. DRUG_NAME       — drug/compound name stated differently across sections.
+2. DEMOGRAPHICS    — patient N, age, gender ratio inconsistent across sections.
+3. EFFICACY        — conflicting efficacy claims (e.g. ORR 68% in 2.5 vs 72% in 2.7).
+4. SAFETY          — conflicting safety data (AE or SAE rates differ between sections).
+5. CROSS_REF       — a section references [DATA PENDING] data that is clearly stated
+                     in another section.
+6. NARRATIVE       — contradictory language (e.g. "well tolerated" vs "significant toxicity").
+7. BENEFIT_RISK    — the benefit-risk conclusion in 2.5.6 is inconsistent with efficacy
+                     data in 2.5.4 / 2.7.3 or safety data in 2.5.5 / 2.7.4.
+                     (e.g. conclusion is "favourable" but safety section reports high SAE rate
+                     without justification; or claimed ORR in conclusion doesn't match 2.5.4)
+8. INDICATION      — the target indication, patient population, or disease description
+                     is stated inconsistently across sections.
+9. REG_LANGUAGE    — promotional, superlative, or non-regulatory language (e.g. "best-in-class",
+                     "superior", "revolutionary", "cures") used without hedging or citation.
+10. CLAIM_SUPPORT  — a clinical claim in a Module 2 summary (2.5.x, 2.7.x) is not supported
+                     by any data cited from Module 5 study reports.
 
 For EACH issue found respond with exactly one line:
   ISSUE|<severity>|<section_key>|<message>
 <severity>: error, warning, or info
+  error   = factual contradictions, unsupported safety/efficacy claims, benefit-risk incoherence
+  warning = ambiguous language, minor inconsistencies, missing citations
+  info    = style/language notes
 If no issues are found respond with exactly: NO_ISSUES
 No other text.
 """
@@ -378,7 +540,9 @@ def llm_deep_check(state: ValidatorState, llm: ChatOpenAI) -> dict:
 
     digest_parts: list[str] = []
     for doc in state.documents:
-        snippet = doc.content[:500].replace("\n", " ")
+        # Use up to 2500 chars so benefit-risk alignment and regulatory language
+        # checks can see enough context to make meaningful judgements.
+        snippet = doc.content[:2500]
         digest_parts.append(f"[{doc.section_key}] {doc.section_label}:\n{snippet}")
     digest = "\n\n".join(digest_parts)
 

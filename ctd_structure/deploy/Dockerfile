@@ -1,22 +1,25 @@
-# Build context must be the ctd_structure/ directory (parent of deploy/).
-# deploy.sh submits that context:
-#   gcloud builds submit ctd_structure/ --config=ctd_structure/deploy/cloudbuild.yaml
+# Build context is the repo root.
+# gcloud builds submit <repo_root> --config=ctd_structure/deploy/cloudbuild.yaml
 #
 # Directory layout seen by Docker at build time:
-#   .                    ← ctd_structure/
-#   ├── __init__.py
-#   ├── structure.py
-#   ├── scaffold.py
-#   └── deploy/
-#       ├── app.py
-#       ├── requirements.txt
-#       └── Dockerfile    ← this file
+#   .                      ← repo root
+#   ├── ctd_structure/
+#   │   ├── __init__.py
+#   │   ├── structure.py
+#   │   ├── scaffold.py
+#   │   └── deploy/
+#   │       ├── app.py
+#   │       ├── main.py
+#   │       ├── requirements.txt
+#   │       └── Dockerfile    ← this file
+#   ├── clinical/
+#   └── template/
 
 # ── Stage 1: install dependencies ────────────────────────────────────────────
 FROM python:3.11-slim AS builder
 
 WORKDIR /build
-COPY deploy/requirements.txt .
+COPY ctd_structure/deploy/requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip \
  && pip install --no-cache-dir -r requirements.txt
 
@@ -31,13 +34,19 @@ COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/pytho
 COPY --from=builder /usr/local/bin /usr/local/bin
 
 # Copy ctd_structure package
-COPY __init__.py  ctd_structure/__init__.py
-COPY structure.py ctd_structure/structure.py
-COPY scaffold.py  ctd_structure/scaffold.py
+COPY ctd_structure/__init__.py  ctd_structure/__init__.py
+COPY ctd_structure/structure.py ctd_structure/structure.py
+COPY ctd_structure/scaffold.py  ctd_structure/scaffold.py
+
+# Copy clinical data ingestion package
+COPY clinical/ clinical/
+
+# Copy template models (required by clinical/)
+COPY template/ template/
 
 # Copy Gradio app
-COPY deploy/app.py  app.py
-COPY deploy/main.py main.py
+COPY ctd_structure/deploy/app.py  app.py
+COPY ctd_structure/deploy/main.py main.py
 
 ENV PYTHONPATH=/app
 

@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from clinical.models import ClinicalDataManifest
 from clinical.storage import load_manifest
@@ -155,6 +155,23 @@ class GenerateRequest(BaseModel):
     include_clinical_data: bool = True
     """When True the template service loads the clinical manifest from GCS
     (using the bucket configured in settings). Set to False to skip."""
+    section_key_prefixes: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Only generate sections whose key starts with one of these prefixes. "
+            "Empty = all sections. Allows caller to run module2 in two ordered "
+            "passes: first '2.7' (Clinical Summary), then '2.5'/'2.4'/'2.3' (Overviews)."
+        ),
+    )
+    prior_evidence: dict[str, str] | None = Field(
+        default=None,
+        description=(
+            "RAG evidence from previously generated CTD sections, keyed by program "
+            "namespace (e.g. 'program_neurology_..._module5' → answer text). "
+            "Injected into the LLM prompt so Module 2 summaries can cite actual "
+            "CSR findings rather than hallucinating statistics."
+        ),
+    )
 
 
 class GenerateResponse(BaseModel):
@@ -176,12 +193,25 @@ def generate(body: GenerateRequest) -> GenerateResponse:
         clinical_manifest = load_manifest(settings.gcs_bucket_name, body.program)
 
     demo_modules = _build_demo_modules()
+
+    # Apply section_key_prefixes: filter sections within each module,
+    # then drop modules with no remaining sections.
+    if body.section_key_prefixes:
+        prefixes = body.section_key_prefixes
+        for mod in demo_modules:
+            mod.sections = [
+                s for s in mod.sections
+                if any(s.key.startswith(p) for p in prefixes)
+            ]
+        demo_modules = [m for m in demo_modules if m.sections]
+
     try:
         templates = generate_program_templates(
             program=body.program,
             ctd_output=_CTDView(demo_modules),  # type: ignore[arg-type]
             clinical_manifest=clinical_manifest,
             ich_context=body.ich_context,
+            prior_evidence=body.prior_evidence,
             api_key=settings.openai_api_key,
             model=settings.llm_model,
         )

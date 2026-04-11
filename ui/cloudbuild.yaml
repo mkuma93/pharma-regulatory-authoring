@@ -1,0 +1,88 @@
+# Cloud Build — Regulatory Authoring Platform UI
+#
+# Build context: repo root
+# Dockerfile:    ui/Dockerfile
+#
+# This service is the user-facing Gradio shell.
+# It runs the coordinator (LangGraph) and routes intents to downstream APIs.
+
+substitutions:
+  _PROJECT_ID:              pharma-reguatory-author
+  _REGION:                  us-central1
+  _SERVICE_NAME:            reguatory-ui
+  _AR_REPO:                 ich4
+  _TAG:                     latest
+  _CTD_API_URL:             "https://ctd-api-74ugcbbbya-uc.a.run.app"
+  _ICH4_ORCHESTRATOR_URL:   "https://ich4-orchestrator-811317821863.us-central1.run.app"
+  _ICH4_WRITER_URL:         "https://ich4-writer-811317821863.us-central1.run.app"
+  _CLINICAL_ANALYST_URL:    "https://clinical-analyst-74ugcbbbya-uc.a.run.app"
+  _GCS_BUCKET:              pharma-reguatory-author-life-science
+
+steps:
+  # 1. Ensure Artifact Registry repo exists
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
+    entrypoint: bash
+    args:
+      - "-c"
+      - |
+        gcloud artifacts repositories describe $_AR_REPO \
+          --location=$_REGION --project=$_PROJECT_ID &>/dev/null \
+        || gcloud artifacts repositories create $_AR_REPO \
+          --repository-format=docker \
+          --location=$_REGION \
+          --project=$_PROJECT_ID \
+          --description="ICH4 Docker images"
+
+  # 2. Docker auth
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
+    entrypoint: bash
+    args:
+      - "-c"
+      - "gcloud auth configure-docker $_REGION-docker.pkg.dev --quiet"
+
+  # 3. Build
+  - name: "gcr.io/cloud-builders/docker"
+    args:
+      - build
+      - -f
+      - ui/Dockerfile
+      - -t
+      - "$_REGION-docker.pkg.dev/$_PROJECT_ID/$_AR_REPO/$_SERVICE_NAME:$_TAG"
+      - -t
+      - "$_REGION-docker.pkg.dev/$_PROJECT_ID/$_AR_REPO/$_SERVICE_NAME:latest"
+      - .
+
+  # 4. Push
+  - name: "gcr.io/cloud-builders/docker"
+    args:
+      - push
+      - "--all-tags"
+      - "$_REGION-docker.pkg.dev/$_PROJECT_ID/$_AR_REPO/$_SERVICE_NAME"
+
+  # 5. Deploy to Cloud Run
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - "$_SERVICE_NAME"
+      - "--image=$_REGION-docker.pkg.dev/$_PROJECT_ID/$_AR_REPO/$_SERVICE_NAME:$_TAG"
+      - "--region=$_REGION"
+      - "--platform=managed"
+      - "--allow-unauthenticated"
+      - "--min-instances=1"
+      - "--max-instances=3"
+      - "--memory=1Gi"
+      - "--cpu=1"
+      - "--port=8080"
+      - "--timeout=120"
+      - "--cpu-boost"
+      - "--set-env-vars=GCP_PROJECT_ID=$_PROJECT_ID,CTD_API_URL=$_CTD_API_URL,GCS_BUCKET=$_GCS_BUCKET,ICH4_ORCHESTRATOR_URL=$_ICH4_ORCHESTRATOR_URL,ICH4_WRITER_URL=$_ICH4_WRITER_URL,CLINICAL_ANALYST_URL=$_CLINICAL_ANALYST_URL"
+      - "--set-secrets=OPENAI_API_KEY=OPENAI_API_KEY:latest"
+
+images:
+  - "$_REGION-docker.pkg.dev/$_PROJECT_ID/$_AR_REPO/$_SERVICE_NAME:$_TAG"
+  - "$_REGION-docker.pkg.dev/$_PROJECT_ID/$_AR_REPO/$_SERVICE_NAME:latest"
+
+options:
+  logging: CLOUD_LOGGING_ONLY

@@ -17,7 +17,9 @@ env/
 # Local data (never bake into the image — served from GCS)
 data/
 ctd/
-clinical/
+# Exclude clinical raw data but keep the Python package (ingestion.py etc.)
+clinical/covid/
+clinical/palsy/
 
 # Secrets / local config
 config/.env

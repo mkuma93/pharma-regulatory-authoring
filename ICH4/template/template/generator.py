@@ -107,6 +107,32 @@ When generating templates:
 - Where requirements are marked [NOT RETRIEVED], preserve that flag so the author \
   knows to verify manually against the guideline.
 - Keep language formal, precise, and regulatory-appropriate.
+
+EVIDENCE-GROUNDING RULES FOR PLACEHOLDERS
+─────────────────────────────────────────
+Every placeholder you define in the Placeholders table MUST include a "Source" tag
+that tells the future writer LLM exactly where the value must come from.
+Use one of three source types:
+
+  [SOURCE: clinical_data]
+      The value is a numeric outcome, rate, or statistic that MUST come from
+      registered clinical study data. The writer MUST NOT invent this value.
+      Example: {{recovery_rate_3mo}}, {{n_enrolled}}, {{ae_rate_pct}}
+
+  [SOURCE: regulatory_context]
+      The value is a mechanism description, study design rationale, regulatory
+      process narrative, or pharmacological class description. The writer may
+      compose this from drug-class knowledge and guideline context — but MUST NOT
+      make specific numeric claims without a data source.
+      Example: {{mechanism_of_action}}, {{dose_selection_rationale}}
+
+  [SOURCE: author_supplied]
+      Information only the sponsor / study team can provide (e.g. internal study IDs,
+      submission reference numbers, proprietary formulation details).
+      The writer MUST write [DATA PENDING — author to supply] for these.
+      Example: {{study_id_ba}}, {{regulatory_reference_submission}}
+
+In the Placeholders table, append the appropriate [SOURCE: ...] tag to every row.
 - Return ONLY valid JSON — no prose, no markdown fences.\
 """
 
@@ -368,6 +394,7 @@ Sections
 ────────
 {sections_json}
 {ich_retrieved_requirements}
+{prior_evidence_block}
 For EACH section return one JSON object with exactly these keys:
   "section_key"   — copy from input
   "section_label" — copy from input
@@ -463,6 +490,38 @@ def _build_ich_requirements_block(ich_context_text: str | None) -> str:
     return "\n" + _ICH_REQUIREMENTS_HEADER + text + "\n"
 
 
+def _build_prior_evidence_block(prior_evidence: dict[str, str] | None) -> str:
+    """Format prior-pass generated section content into a structured prompt block.
+
+    Converts the orchestrator's {namespace: answer} evidence dict into a clearly
+    delimited prompt block.  Returns an empty string when no evidence is supplied
+    (e.g. for the first pass / Module 5).
+    """
+    if not prior_evidence:
+        return ""
+
+    _SEP = "\u2500" * 72
+    lines = [
+        "",
+        _SEP,
+        "PRIOR MODULE EVIDENCE (from already-generated CTD sections)",
+        "Use the findings below when writing this module.  Rules:",
+        "  1. DO NOT contradict these findings with different numbers or conclusions.",
+        "  2. Cross-reference them explicitly (e.g. 'As reported in Module 5...').",
+        "  3. Treat them as the primary source; ICH guidelines provide the structure.",
+        _SEP,
+    ]
+    for ns, text in prior_evidence.items():
+        # Derive a human-readable label from namespace suffix
+        # Namespace format: program_{ta}_{dis}_{drug}_{pass_id}
+        pass_id = ns.rsplit("_", 1)[-1]
+        label = pass_id.replace("_", " ").title()
+        lines.append(f"\n[Evidence source: {label}]")
+        lines.append(text.strip())
+
+    return "\n".join(lines) + "\n"
+
+
 # ── Clinical data injection ───────────────────────────────────────────────────
 
 def _clinical_context_block(section_key: str, manifest: ClinicalDataManifest) -> str:
@@ -514,6 +573,7 @@ def generate_program_templates(
     ctd_output: CTDStructureOutput,
     clinical_manifest: ClinicalDataManifest | None = None,
     ich_context: dict[str, str] | None = None,
+    prior_evidence: dict[str, str] | None = None,
     api_key: str | None = None,
     model: str = "gpt-4o",
 ) -> list[SectionTemplate]:
@@ -532,6 +592,11 @@ def generate_program_templates(
                            ICH guideline text pre-fetched by the orchestrator from the
                            index service. When provided, ICH requirements are grounded
                            in actual guideline PDFs rather than LLM training memory.
+        prior_evidence:    Optional dict keyed by program namespace (e.g.
+                           'program_neurology_bells_palsy_prednisolone_module5') →
+                           RAG answer text from previously generated CTD sections.
+                           Injected into the prompt so Module 2 summaries cite actual
+                           CSR findings (ICH M4E(R2) evidence chain).
         api_key:           OpenAI API key (falls back to OPENAI_API_KEY env var).
         model:             OpenAI model to use (default gpt-4o).
 
@@ -572,6 +637,7 @@ def generate_program_templates(
             module_label=module.label,
             sections_json=json.dumps(sections_input, indent=2),
             ich_retrieved_requirements=ich_requirements_block,
+            prior_evidence_block=_build_prior_evidence_block(prior_evidence),
         )
 
         messages = [

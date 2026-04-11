@@ -1,0 +1,16 @@
+# Gradio UI shell
+gradio>=5.0.0
+
+# HTTP client — calls ctd-api and future service APIs
+requests
+
+# Coordinator (LangGraph: understand intent + decide + route)
+langgraph>=0.1.0
+langchain-openai>=0.1.0
+langchain-core>=0.2.0
+openai>=1.0.0
+
+# Data models (coordinator uses pydantic)
+pydantic>=2.0.0
+
+typing-extensions

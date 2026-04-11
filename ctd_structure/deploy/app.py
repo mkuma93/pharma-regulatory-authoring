@@ -44,12 +44,20 @@ for _p in [_workspace, _pkg_root]:
         sys.path.insert(0, _p)
 
 from ctd_structure.scaffold import scaffold_in_gcs  # noqa: E402
-from ctd_structure.structure import (                                    # noqa: E402
+from ctd_structure.structure import (
     CTDStructureOutput,
     EvaluationResult,
     refine_from_feedback,
 )
-from main import CoordinatorDecision, IntentResult, parse_intent, run_coordinator  # noqa: E402
+from main import CoordinatorDecision, IntentResult, parse_intent, run_coordinator
+
+# Clinical data ingestion — available when clinical/ package is in PYTHONPATH
+try:
+    from clinical.ingestion import register_clinical_csv as _register_csv
+    from template.models import ProgramInfo as _ProgramInfo
+    _CLINICAL_UPLOAD_AVAILABLE = True
+except ImportError:
+    _CLINICAL_UPLOAD_AVAILABLE = False
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -79,12 +87,12 @@ def _gcs_user_ctd_prefix(session_id: str) -> str:
     """Per-user draft CTD prefix — isolated from every other user's work."""
     return f"ctd_structure/users/{session_id}/ctd"
 
-def _content_status_path(ta: str, dis: str, drug: str, session_id: str) -> str:
+def _content_status_path(ta: str, dis: str, drug: str, session_id: str = "") -> str:
     def _slug(s: str) -> str:
         return s.strip().lower().replace(" ", "_")
     return (
         f"{_GCS_PROGRAMS}/{_slug(ta)}/{_slug(dis)}/{_slug(drug)}"
-        f"/content_status/{session_id}.json"
+        f"/content_status/latest.json"
     )
 
 def _publish_content_generation(
@@ -113,12 +121,48 @@ def _publish_content_generation(
     return run_id
 
 def _load_content_status(bucket: str, ta: str, dis: str, drug: str, session_id: str) -> dict:
-    """Read content-generation job status from GCS. Returns {} if not found."""
+    """Read content-generation job status from GCS. Returns {} if not found.
+
+    Tries latest.json first; falls back to any existing session-scoped status
+    file (legacy, written before the latest.json migration) and migrates it.
+    """
+    def _slug(s: str) -> str:
+        return s.strip().lower().replace(" ", "_")
+    prefix = (
+        f"{_GCS_PROGRAMS}/{_slug(ta)}/{_slug(dis)}/{_slug(drug)}/content_status/"
+    )
+    bkt_obj = _gcs_client.bucket(bucket)
+
+    # Primary: latest.json (written by updated worker)
     try:
-        path = _content_status_path(ta, dis, drug, session_id)
-        raw  = _gcs_client.bucket(bucket).blob(path).download_as_text()
-        job  = json.loads(raw)
+        raw = bkt_obj.blob(f"{prefix}latest.json").download_as_text()
+        job = json.loads(raw)
     except Exception:
+        job = None
+
+    # Fallback: any session-scoped file (legacy)
+    if job is None:
+        try:
+            blobs = sorted(
+                bkt_obj.list_blobs(prefix=prefix),
+                key=lambda b: b.updated or b.time_deleted,
+                reverse=True,
+            )
+            for blob in blobs:
+                if blob.name.endswith(".json"):
+                    job = json.loads(blob.download_as_text())
+                    # Migrate to latest.json so future reads are fast
+                    try:
+                        bkt_obj.blob(f"{prefix}latest.json").upload_from_string(
+                            json.dumps(job), content_type="application/json"
+                        )
+                    except Exception:
+                        pass
+                    break
+        except Exception:
+            pass
+
+    if job is None:
         return {}
     if job.get("status") in ("running",):
         updated_at = job.get("updated_at")
@@ -174,6 +218,42 @@ def _load_cached_paths(bucket_name: str, session_id: str | None = None) -> list[
     except Exception:
         return []
 
+def _load_canonical_paths(bucket_name: str) -> list[str]:
+    """Return only the shared canonical template paths (never a user draft)."""
+    return _load_cached_paths(bucket_name, session_id=None)
+
+def _load_clinical_manifest(bucket: str, ta: str, dis: str, drug: str) -> dict | None:
+    """Load clinical data manifest.json from GCS for a program. Returns None if absent."""
+    def _slug(s: str) -> str:
+        return s.strip().lower().replace(" ", "_")
+    path = f"therapeutic-area/{_slug(ta)}/{_slug(dis)}/{_slug(drug)}/clinical_data/manifest.json"
+    try:
+        raw = _gcs_client.bucket(bucket).blob(path).download_as_text()
+        return json.loads(raw)
+    except Exception:
+        return None
+
+def _summarise_clinical_manifest(manifest: dict) -> str:
+    """Build a Markdown summary of available clinical datasets."""
+    sources = manifest.get("sources", [])
+    if not sources:
+        return "_(manifest found but no datasets registered)_"
+    lines = [f"📋 **{len(sources)} clinical dataset(s) registered:**\n"]
+    for src in sources:
+        cols = src.get("column_mappings", [])
+        secs = src.get("ctd_section_keys", [])
+        sec_str = ", ".join(sorted(secs)[:5]) or "—"
+        lines.append(
+            f"- **{src.get('filename', '?')}** — {src.get('study_type', '?')} study "
+            f"({len(cols)} mapped columns → CTD sections: {sec_str})"
+        )
+        endpoints = [f"`{m['placeholder_key']}`" for m in cols[:6]]
+        if endpoints:
+            more = f" + {len(cols) - 6} more" if len(cols) > 6 else ""
+            lines.append(f"  Endpoints mapped: {', '.join(endpoints)}{more}")
+    return "\n".join(lines)
+
+
 def _save_to_gcs(bucket_name: str, folder_paths: list[str]) -> None:
     """Write to the shared canonical template (called only on approve)."""
     bkt = _get_bucket(bucket_name)
@@ -195,8 +275,10 @@ def _save_session_state(bucket_name: str, state: dict) -> None:
         bkt  = _get_bucket(bucket_name)
         blob = bkt.blob(_gcs_session_path(session_id))
         payload = {
-            "approved":   state.get("approved", False),
-            "ctd_output": state.get("ctd_output"),
+            "approved":        state.get("approved", False),
+            "ctd_output":      state.get("ctd_output"),
+            "content_program": state.get("content_program"),
+            "content_run_id":  state.get("content_run_id"),
         }
         blob.upload_from_string(json.dumps(payload), content_type="application/json")
     except Exception as exc:
@@ -319,8 +401,9 @@ def _fmt_tree_output(output: CTDStructureOutput, evaluation: EvaluationResult) -
 
 def _initial_state(bucket_name: str, session_id: str) -> tuple[list, dict]:
     """Called once when the page loads to build the opening chatbot message."""
-    paths   = _load_cached_paths(bucket_name, session_id)
-    session = _load_session_state(bucket_name, session_id)
+    paths            = _load_cached_paths(bucket_name, session_id)
+    canonical_exists = bool(_load_canonical_paths(bucket_name))
+    session          = _load_session_state(bucket_name, session_id)
     approved   = session.get("approved", False)
     ctd_output = session.get("ctd_output")
 
@@ -341,26 +424,29 @@ def _initial_state(bucket_name: str, session_id: str) -> tuple[list, dict]:
     if paths:
         tree  = _fmt_tree_paths(paths)
         state = {
-            "folder_paths": paths,
-            "approved":     approved,
-            "ctd_output":   ctd_output,
-            "bucket":       bucket_name,
-            "session_id":   session_id,
+            "folder_paths":    paths,
+            "approved":        approved,
+            "ctd_output":      ctd_output,
+            "bucket":          bucket_name,
+            "session_id":      session_id,
+            "canonical_exists": canonical_exists,
         }
         if approved:
             opening = (
-                "Welcome back! The **ICH M4(R4) CTD folder structure** is loaded and ✅ **already approved**.\n\n"
+                "Welcome back! The **default ICH M4(R4) CTD structure** is loaded and ✅ **published**.\n\n"
                 f"```\n{tree}\n```\n\n"
-                "Ready to copy to a program directory. Tell me the therapeutic area, disease, and drug name.\n\n"
-                "> Example: *set up for oncology / lung cancer / carboplatin*"
+                "Ready to scaffold a program. Tell me the therapeutic area, disease, and drug name — "
+                "I'll set up the folder structure and kick off content generation.\n\n"
+                "> Example: *set up authoring for oncology / lung cancer / carboplatin*"
             )
         else:
             opening = (
                 "I found an existing **ICH M4(R4) CTD folder structure** in GCS.\n\n"
                 f"```\n{tree}\n```\n\n"
-                "Does this look correct? Say **yes / approve** to accept it and unlock "
-                "copying to a program directory, or tell me to **re-extract** to rebuild "
-                "from the ICH index."
+                "You can:\n"
+                "- Say **copy to \u003carea\u003e / \u003cdisease\u003e / \u003cdrug\u003e** to scaffold a program directory\n"
+                "- Say **approve** to commit this as the shared default canonical template\n"
+                "- Say **re-extract** to rebuild from the ICH index"
             )
     else:
         job = _load_extraction_status(bucket_name, session_id)
@@ -386,14 +472,15 @@ def _initial_state(bucket_name: str, session_id: str) -> tuple[list, dict]:
             )
         else:
             opening = (
-                "Hello! I'm your **ICH CTD Structure assistant**.\n\n"
-                "No existing structure was found in GCS. "
-                "Tell me to **extract** (or *generate / build*) the canonical "
-                "ICH M4(R4) CTD folder hierarchy — I'll query the ICH index and "
-                "present the structure for your review before saving anything.\n\n"
-                "> ⏳ Extraction takes **3–8 minutes**."
+                "Hello! I'm your **Regulatory Authoring Assistant**.\n\n"
+                "No default CTD structure has been published yet. "
+                "Tell me to **build the ICH CTD structure** and I'll query the ICH M4 guidelines "
+                "index to assemble the full module → section → subsection hierarchy.\n\n"
+                "Once extracted, **approve** it to publish as the default — then scaffold "
+                "programs and generate section-level content.\n\n"
+                "> ⏳ Structure build takes **3–8 minutes**."
             )
-        state = {"folder_paths": [], "approved": False, "bucket": bucket_name, "session_id": session_id}
+        state = {"folder_paths": [], "approved": False, "canonical_exists": canonical_exists, "bucket": bucket_name, "session_id": session_id}
     return [{"role": "assistant", "content": opening}], state
 
 
@@ -410,18 +497,30 @@ def _refresh_state_from_gcs(state: dict, bucket: str) -> dict:
     if not session_id:
         return st
     changed = False
+    # Always refresh canonical_exists from GCS — the key may already be in state
+    # but set to False if canonical was published after this session started.
+    _canonical_now = bool(_load_canonical_paths(bkt))
+    if _canonical_now != st.get("canonical_exists", False):
+        st = {**st, "canonical_exists": _canonical_now}
+        changed = True
     if not st.get("folder_paths"):
         fresh = _load_cached_paths(bkt, session_id)
         if fresh:
             st = {**st, "folder_paths": fresh, "bucket": bkt}
             changed = True
-    if not st.get("approved"):
+    if not st.get("approved") or not st.get("content_program"):
         sess = _load_session_state(bkt, session_id)
-        if sess.get("approved"):
+        if sess.get("approved") and not st.get("approved"):
             st = {**st, "approved": True}
             changed = True
         if sess.get("ctd_output") and not st.get("ctd_output"):
             st = {**st, "ctd_output": sess["ctd_output"]}
+            changed = True
+        if sess.get("content_program") and not st.get("content_program"):
+            st = {**st, "content_program": sess["content_program"]}
+            changed = True
+        if sess.get("content_run_id") and not st.get("content_run_id"):
+            st = {**st, "content_run_id": sess["content_run_id"]}
             changed = True
     # Cache the GCS scaffold check in state so the coordinator context string
     # is accurate without an extra GCS call in the LLM path.
@@ -467,7 +566,8 @@ def _do_extract(state: dict, bucket: str, reviewer_email: str,
         reply = (
             "I found a cached structure in GCS — no need to re-query the ICH index.\n\n"
             f"```\n{tree}\n```\n\n"
-            "Say **approve** if this looks good, or ask me to **re-extract** to rebuild it."
+            "You can copy it to a program now, or say **approve** to commit it as the "
+            "shared default canonical template. Say **re-extract** to rebuild from scratch."
         )
         history.append({"role": "assistant", "content": reply})
         yield history, new_state
@@ -507,7 +607,7 @@ def _do_extract(state: dict, bucket: str, reviewer_email: str,
         "⏳ This takes **3–8 minutes**. You can:\n"
         "- Ask me **status** at any time to check progress\n"
         "- **Refresh the page** when done — the completed structure will load automatically\n\n"
-        "_Your connection won't be interrupted while it runs._"
+        
     )})
     yield history, state
 
@@ -515,9 +615,7 @@ def _do_extract(state: dict, bucket: str, reviewer_email: str,
 def _do_approve(intent: CoordinatorDecision, state: dict, bucket: str,
                 reviewer_email: str, history: list):
     """
-    Mark the structure as approved.
-    - Any user: saves to their own draft + marks session approved.
-    - Compliance officer only: also promotes to the shared canonical template.
+    Mark the structure as approved and publish it as the shared canonical template.
     """
     folder_paths = (state or {}).get("folder_paths", [])
     if not folder_paths:
@@ -526,27 +624,19 @@ def _do_approve(intent: CoordinatorDecision, state: dict, bucket: str,
         return history, state
 
     bkt = (state or {}).get("bucket") or bucket or _DEFAULT_BUCKET
-    is_compliance = (reviewer_email or "").strip().lower() in _COMPLIANCE_OFFICERS
 
-    if is_compliance:
-        # Promote to shared canonical template — all future users will see this
-        try:
-            _save_to_gcs(bkt, folder_paths)
-        except Exception as exc:
-            print(f"[app] Warning: GCS canonical persist on approve: {exc}")
-        canonical_note = (
-            f"✅ Structure **promoted to the shared canonical template** at "
-            f"`gs://{bkt}/{_GCS_TEMPLATE}/`.\n\n"
-            "All future users will load this as the default structure."
-        )
-    else:
-        canonical_note = (
-            "⚠️ Your approval has been recorded, but the **shared canonical template "
-            "will only be updated by a compliance officer**.\n\n"
-            "A compliance officer can approve the same structure to publish it for everyone."
-        )
+    # Promote to shared canonical template — all future users will see this
+    try:
+        _save_to_gcs(bkt, folder_paths)
+    except Exception as exc:
+        print(f"[app] Warning: GCS canonical persist on approve: {exc}")
+    canonical_note = (
+        f"✅ Structure **committed as the shared canonical template** at "
+        f"`gs://{bkt}/{_GCS_TEMPLATE}/`.\n\n"
+        "All future users will load this as the default structure."
+    )
 
-    new_state = {**state, "approved": True, "bucket": bkt}
+    new_state = {**state, "approved": True, "canonical_exists": True, "bucket": bkt}
 
     # Persist approved=True to GCS so page-refresh picks it up
     try:
@@ -643,7 +733,9 @@ def _do_refine(feedback: str, state: dict, bucket: str, reviewer_email: str, his
     # Reconstruct CTDStructureOutput from the serialised dict stored in state
     raw_output = (state or {}).get("ctd_output")
     if not raw_output:
-        _write_extraction_status(refine_bucket, refine_session_id, {"status": "failed", "error": "no prior structure in session"})
+        # Reset extraction status to idle — do NOT write 'failed' here because
+        # that would be shown the next time the user asks for status.
+        _write_extraction_status(refine_bucket, refine_session_id, {"status": "idle"})
         history.append({"role": "assistant",
                         "content": "❌ No previous structure found in session. "
                                    "Please run a full **extract** first."})
@@ -653,7 +745,7 @@ def _do_refine(feedback: str, state: dict, bucket: str, reviewer_email: str, his
     try:
         current_output = CTDStructureOutput(**raw_output)
     except Exception as exc:
-        _write_extraction_status(refine_bucket, refine_session_id, {"status": "failed", "error": str(exc)})
+        _write_extraction_status(refine_bucket, refine_session_id, {"status": "idle"})
         history.append({"role": "assistant",
                         "content": f"❌ Could not deserialise stored structure: {exc}"})
         yield history, new_state
@@ -699,13 +791,13 @@ def _do_refine(feedback: str, state: dict, bucket: str, reviewer_email: str, his
         )
         eval_note = f"\n\n**Remaining issues after re-query:**\n{issues}"
 
-    reply = (
-        f"✅ Refinement complete — **{len(folder_paths)} folder paths** assembled.\n\n"
-        f"```\n{tree}\n```"
-        f"{eval_note}\n\n"
-        "Does the updated structure look correct? "
-        "Say **approve** to accept, or tell me what else needs fixing."
-    )
+        reply = (
+            f"✅ Refinement complete — **{len(folder_paths)} folder paths** assembled.\n\n"
+            f"```\n{tree}\n```"
+            f"{eval_note}\n\n"
+            "You can copy this to a program now, or say **approve** to commit it as the "
+            "shared default canonical template."
+        )
     history[-1] = {"role": "assistant", "content": reply}
     yield history, new_state
 
@@ -718,21 +810,33 @@ def _do_copy(intent: CoordinatorDecision, state: dict, bucket: str, history: lis
     bkt  = st.get("bucket") or bucket or _DEFAULT_BUCKET
     gcs_base = f"{_GCS_PROGRAMS}/{ta}/{dis}/{drug}/ctd"
 
+    # Always scaffold from the shared canonical default — never from a user's draft
+    canonical_paths = _load_canonical_paths(bkt)
+    if not canonical_paths:
+        history.append({"role": "assistant", "content": (
+            "❌ No default CTD structure has been established yet.\n\n"
+            "To set it up:\n"
+            "1. Say **extract** to build the ICH M4(R4) hierarchy from the ICH index\n"
+            "2. Say **approve** to publish it as the shared default\n\n"
+            "Once established, anyone can scaffold programs from it instantly."
+        )})
+        return history, state
+
     try:
         bkt_obj = _get_bucket(bkt)
         if not bkt_obj.exists():
             bkt_obj = _gcs_client.create_bucket(bkt)
-        scaffold_in_gcs(bkt_obj, gcs_base, st["folder_paths"])
+        scaffold_in_gcs(bkt_obj, gcs_base, canonical_paths)
     except Exception as exc:
         history.append({"role": "assistant",
                         "content": f"❌ GCS copy failed: {exc}"})
         return history, state
 
     gcs_path = f"gs://{bkt}/{gcs_base}/"
-    # Mark the scaffold as existing in state so subsequent write calls know
     new_state = {
         **st,
         "program_scaffold_exists": True,
+        "canonical_exists": True,
         "content_program": {"ta": intent.therapeutic_area.strip(),
                              "dis": intent.disease_type.strip(),
                              "drug": intent.drug_name.strip()},
@@ -740,13 +844,29 @@ def _do_copy(intent: CoordinatorDecision, state: dict, bucket: str, history: lis
     history.append({
         "role": "assistant",
         "content": (
-            f"✅ Done! The CTD folder structure has been scaffolded at:\n\n"
+            f"✅ Done! The default CTD structure has been scaffolded at:\n\n"
             f"`{gcs_path}`\n\n"
-            f"**{len(st['folder_paths'])} folder markers** written for "
+            f"**{len(canonical_paths)} folder markers** written for "
             f"**{ta.replace('_',' ')} / {dis.replace('_',' ')} / {drug.replace('_',' ')}**.\n\n"
-            "Ready to generate content? Say **generate content** and I'll kick it off."
+            "---\n"
+            "**Before generating content, upload your clinical data:**\n\n"
+            "The **🔬 Clinical Data Upload** panel has appeared above. "
+            "Upload a clinical trial CSV so the content worker can fill all "
+            "`{{placeholder}}` values with real study statistics.\n\n"
+            "| Step | Action |\n"
+            "|---|---|\n"
+            "| 1️⃣ | Open the **🔬 Clinical Data Upload** panel |\n"
+            "| 2️⃣ | Upload your clinical trial CSV (fields auto-filled) |\n"
+            "| 3️⃣ | Say **generate content** to kick off the 3-pass generation |\n\n"
+            "> _Without clinical data, all `{{placeholder}}` values will remain unfilled "
+            "and require manual editing._"
         ),
     })
+    bkt = (state or {}).get("bucket") or bucket or _DEFAULT_BUCKET
+    try:
+        _save_session_state(bkt, new_state)
+    except Exception as exc:
+        print(f"[app] Warning: could not save session state after copy: {exc}")
     return history, new_state
 
 
@@ -759,6 +879,61 @@ def _do_write(intent: CoordinatorDecision, state: dict, bucket: str, history: li
     drug = intent.drug_name.strip()
     bkt  = st.get("bucket") or bucket or _DEFAULT_BUCKET
     session_id = st.get("session_id", "default")
+
+    # Auto-scaffold the program directory if it doesn't exist yet.
+    if not st.get("program_scaffold_exists"):
+        canonical_paths = _load_canonical_paths(bkt)
+        if not canonical_paths:
+            history.append({"role": "assistant", "content": (
+                "❌ No default CTD structure has been established yet.\n\n"
+                "Say **extract** to build it, then **approve** to publish it, "
+                "and I'll scaffold the program and kick off content generation."
+            )})
+            return history, state
+        try:
+            bkt_obj = _get_bucket(bkt)
+            scaffolded_base = f"{_GCS_PROGRAMS}/{ta.lower().replace(' ','_')}/{dis.lower().replace(' ','_')}/{drug.lower().replace(' ','_')}/ctd"
+            scaffold_in_gcs(bkt_obj, scaffolded_base, canonical_paths)
+            st = {**st, "program_scaffold_exists": True}
+            history.append({"role": "assistant", "content": (
+                f"✅ Program directory scaffolded at `gs://{bkt}/{scaffolded_base}/`. "
+                "Now queuing content generation…"
+            )})
+        except Exception as exc:
+            history.append({"role": "assistant", "content": f"❌ Auto-scaffold failed: {exc}"})
+            return history, state
+
+    # ── Clinical data check ──────────────────────────────────────────────────
+    # Warn the user when no clinical manifest exists — all placeholders would
+    # remain as {{key}} [NOT FILLED].  If a manifest is found, summarise it so
+    # the user knows exactly what data will be used before committing.
+    manifest = _load_clinical_manifest(bkt, ta, dis, drug)
+    if not manifest or not manifest.get("sources"):
+        # No data — ask for confirmation before proceeding with empty placeholders.
+        st_pending = {
+            **st,
+            "awaiting_write_confirm": {"ta": ta, "dis": dis, "drug": drug},
+            "bucket": bkt,
+        }
+        history.append({"role": "assistant", "content": (
+            f"⚠️ **No clinical data found** for **{ta} / {dis} / {drug}**.\n\n"
+            "Without clinical data, all `{{placeholder}}` values in the generated "
+            "content will appear as `{{placeholder}} [NOT FILLED]` and will need manual editing.\n\n"
+            "**Options:**\n"
+            "- Say **yes, proceed** to generate content with empty placeholders.\n"
+            "- Say **cancel** to stop and upload clinical data first.\n\n"
+            "_Tip: register a clinical CSV for this program and the content worker will "
+            "automatically fill every placeholder with real study statistics._"
+        )})
+        return history, st_pending
+
+    # Manifest found — show a brief summary so the user knows what data will be used.
+    summary = _summarise_clinical_manifest(manifest)
+    history.append({"role": "assistant", "content": (
+        f"{summary}\n\n"
+        "✅ Content generation will use this real clinical data to fill in all placeholder values. "
+        "Queuing now…"
+    )})
 
     try:
         run_id = _publish_content_generation(bkt, ta, dis, drug, session_id)
@@ -781,11 +956,16 @@ def _do_write(intent: CoordinatorDecision, state: dict, bucket: str, history: li
         f"**{ta} / {dis} / {drug}** (run `{run_id[:8]}…`).\n\n"
         "The worker will:\n"
         "1. Query ICH guidelines (index service)\n"
-        "2. Generate section templates\n"
-        "3. Write and validate all CTD sections\n\n"
+        "2. Load the clinical datasets listed above\n"
+        "3. Generate section templates and fill placeholders with real data\n"
+        "4. Validate all CTD sections\n\n"
         "This usually takes 5–10 minutes. Ask me **content status** to check progress, "
         "or I'll notify you automatically when it's done."
     )})
+    try:
+        _save_session_state(bkt, new_state)
+    except Exception as exc:
+        print(f"[app] Warning: could not save session state after write: {exc}")
     return history, new_state
 
 
@@ -808,17 +988,74 @@ def chat(
 
     # ── Short-circuit: disapproval feedback loop ─────────────────────────────
     # When _do_disapprove sets awaiting_feedback=True, the next user message
-    # goes straight to refinement.  Explicit extract keywords break out of the
-    # loop so the user can always escape with a fresh extraction.
+    # goes straight to refinement.  Several keyword families break out of the
+    # loop so the user can always escape to any positive action.
     _EXTRACT_KEYWORDS = ("re-extract", "reextract", "re extract", "extract", "rebuild", "refresh")
+    _ESCAPE_KEYWORDS  = ("generate", "content", "status", "copy", "write", "approve",
+                          "scaffold", "set up", "setup")
     _msg_lower = message.strip().lower()
     _is_explicit_extract = any(_msg_lower.startswith(kw) or _msg_lower == kw
                                 for kw in _EXTRACT_KEYWORDS)
-    if (state or {}).get("awaiting_feedback") and not _is_explicit_extract:
+    _is_escape = any(kw in _msg_lower for kw in _ESCAPE_KEYWORDS)
+    if (state or {}).get("awaiting_feedback") and not _is_explicit_extract and not _is_escape:
         gen = _do_refine(message, state, bkt, reviewer_email, history)
         for history, state in gen:
             yield history, state, gr.update(value="")
         return
+    # Clear the awaiting_feedback flag when escaping so subsequent messages
+    # are routed normally through the coordinator.
+    if (state or {}).get("awaiting_feedback") and (_is_explicit_extract or _is_escape):
+        state = {**state, "awaiting_feedback": False}
+
+    # ── Short-circuit: write confirmation pending (no clinical data warning) ─
+    # When _do_write finds no clinical manifest it sets awaiting_write_confirm
+    # and waits for the user to say "yes, proceed" or "cancel".
+    if (state or {}).get("awaiting_write_confirm"):
+        pending  = state["awaiting_write_confirm"]
+        ta_p     = pending.get("ta", "")
+        dis_p    = pending.get("dis", "")
+        drug_p   = pending.get("drug", "")
+        _YES     = ("yes", "proceed", "go ahead", "ok", "sure", "continue", "confirm")
+        _NO      = ("no", "cancel", "stop", "skip")
+        if any(_msg_lower.startswith(w) for w in _YES):
+            st_p = {**state, "awaiting_write_confirm": None}
+            try:
+                run_id = _publish_content_generation(bkt, ta_p, dis_p, drug_p,
+                                                     st_p.get("session_id", "default"))
+                new_state = {
+                    **st_p,
+                    "content_run_id": run_id,
+                    "content_program": {"ta": ta_p, "dis": dis_p, "drug": drug_p},
+                    "bucket": bkt,
+                }
+                history.append({"role": "assistant", "content": (
+                    f"⏳ Content generation queued for **{ta_p} / {dis_p} / {drug_p}** "
+                    f"(run `{run_id[:8]}…`).\n\n"
+                    "⚠️ Placeholder values will appear as `{{key}} [NOT FILLED]` — "
+                    "edit them manually after generation, or register clinical data and regenerate.\n\n"
+                    "Ask me **content status** to check progress."
+                )})
+                try:
+                    _save_session_state(bkt, new_state)
+                except Exception as _exc:
+                    print(f"[app] Warning: could not save session state after write-confirm: {_exc}")
+                yield history, new_state, gr.update(value="")
+            except Exception as exc:
+                history.append({"role": "assistant",
+                                 "content": f"❌ Could not queue content generation: {exc}"})
+                yield history, st_p, gr.update(value="")
+            return
+        elif any(_msg_lower.startswith(w) for w in _NO):
+            new_state = {**state, "awaiting_write_confirm": None}
+            history.append({"role": "assistant", "content": (
+                "OK, content generation cancelled. "
+                "Register a clinical CSV for this program first, then say **generate content** again."
+            )})
+            yield history, new_state, gr.update(value="")
+            return
+        else:
+            # Any other message — clear the flag and fall through to the coordinator.
+            state = {**state, "awaiting_write_confirm": None}
 
     # ── Coordinator: understand + decide in one LangGraph call ───────────────
     # Show a "thinking" placeholder while the two-node graph runs (~1 s).
@@ -866,6 +1103,78 @@ def chat(
         session_id = st.get("session_id", "default")
         job        = _load_extraction_status(bkt_st, session_id)
 
+        # ── Content-generation status (checked first when a run is in progress) ──
+        _asking_content = "content" in _msg_lower
+        prog = st.get("content_program")
+        if prog:
+            ta_c, dis_c, drug_c = prog.get("ta", ""), prog.get("dis", ""), prog.get("drug", "")
+            cjob   = _load_content_status(bkt_st, ta_c, dis_c, drug_c, session_id)
+            cstatus = cjob.get("status")
+            if cstatus == "running":
+                step       = cjob.get("step", "")
+                pass_label = cjob.get("pass_label", "")
+                pass_num   = cjob.get("pass_number", "")
+                total      = cjob.get("total_passes", 3)
+                if pass_label:
+                    step_info = f"Pass {pass_num}/{total}: **{pass_label}**"
+                elif step:
+                    step_info = f"Step: `{step}`"
+                else:
+                    step_info = "Initialising…"
+                history.append({"role": "assistant", "content": (
+                    f"⏳ **Content generation is running** — {step_info}\n\n"
+                    "**Generation order (ICH M4E(R2) evidence chain):**\n"
+                    "1. 📄 Module 5 CSRs → indexed into program RAG namespace\n"
+                    "2. 📊 Module 2.7 Clinical Summary → grounded in Module 5 evidence\n"
+                    "3. 📝 Module 2.5/2.4/2.3 Overviews → grounded in Module 5 + 2.7\n\n"
+                    "⚠️ **Important:** Do not manually regenerate Module 2 without first "
+                    "completing Module 5 — the Module 5 index must exist before Module 2 is written. "
+                    "Ask me **status** again in a minute to check progress."
+                )})
+                yield history, state, gr.update(value="")
+                return
+            elif cstatus == "done":
+                history.append({"role": "assistant", "content": (
+                    "✅ **Content generation is complete.** "
+                    "All three passes (Module 5 → 2.7 → 2.5 overviews) finished successfully.\n\n"
+                    "Say **generate content** to regenerate with updated clinical data."
+                )})
+                yield history, state, gr.update(value="")
+                return
+            elif cstatus == "failed":
+                history.append({"role": "assistant", "content": (
+                    f"❌ **Content generation failed** — {cjob.get('error', 'unknown')}\n\n"
+                    "Say **generate content** to re-run. The 3-pass DAG is safe to restart — "
+                    "Module 5 will be re-indexed automatically before Module 2 is written."
+                )})
+                yield history, state, gr.update(value="")
+                return
+            else:
+                # prog is set but no active/completed job found
+                ta_label   = ta_c.replace("_", " ")
+                dis_label  = dis_c.replace("_", " ")
+                drug_label = drug_c.replace("_", " ")
+                history.append({"role": "assistant", "content": (
+                    f"No content generation job has been queued yet for "
+                    f"**{ta_label} / {dis_label} / {drug_label}**.\n\n"
+                    "Say **generate content** to start the 3-pass pipeline."
+                )})
+                yield history, state, gr.update(value="")
+                return
+        elif _asking_content:
+            # User asked about content status but no program is set in this session
+            history.append({"role": "assistant", "content": (
+                "No content program is set up in this session yet.\n\n"
+                "To check content status I need to know which program you're working on. "
+                "Please scaffold a program first:\n\n"
+                "> *Copy the structure to \\<therapeutic area\\> / \\<disease\\> / \\<drug\\>*\n\n"
+                "Then say **generate content** to queue the 3-pass pipeline, "
+                "and **content status** to monitor it."
+            )})
+            yield history, state, gr.update(value="")
+            return
+
+        # ── Extraction status ─────────────────────────────────────────────────
         if job.get("status") == "refining":
             fresh_paths = _load_cached_paths(bkt_st, session_id)
             if fresh_paths:
@@ -917,7 +1226,8 @@ def chat(
                 history.append({"role": "assistant", "content": (
                     "✅ **Yes, extraction is complete!**\n\n"
                     f"```\n{tree}\n```\n\n"
-                    "Does this look correct? Say **approve** to accept it, or **re-extract** if something looks off."
+                    "You can copy it to a program now — tell me the therapeutic area, disease, and drug.\n"
+                    "Or say **approve** to commit it as the shared default canonical template."
                 )})
                 yield history, new_state, gr.update(value="")
             else:
@@ -956,8 +1266,8 @@ def chat(
                     history.append({"role": "assistant", "content": (
                         "✅ **Extraction is complete!** Here's the ICH M4(R4) CTD folder structure:\n\n"
                         f"```\n{tree}\n```\n\n"
-                        "Does this look correct? Say **approve** to accept it, or "
-                        "**re-extract** if something looks off."
+                        "You can copy it to a program now — tell me the therapeutic area, disease, and drug.\n"
+                        "Or say **approve** to commit it as the shared default canonical template."
                     )})
                     yield history, new_state, gr.update(value="")
                     return
@@ -1021,8 +1331,8 @@ def _auto_poll(history: list, state: dict):
                 new_history.append({"role": "assistant", "content": (
                     f"✅ **{label}!** Here's the ICH M4(R4) CTD folder structure:\n\n"
                     f"```\n{tree}\n```\n\n"
-                    "Does this look correct? Say **approve** to accept it, or "
-                    "**re-extract** if something looks off."
+                    "You can copy it to a program now — tell me the therapeutic area, disease, and drug.\n"
+                    "Or say **approve** to commit it as the shared default canonical template."
                 )})
                 return new_history, new_state
 
@@ -1046,14 +1356,49 @@ def _auto_poll(history: list, state: dict):
                 f"Documents saved to `gs://{bkt}/therapeutic-area/"
                 f"{ta.replace(' ','_').lower()}/"
                 f"{dis.replace(' ','_').lower()}/"
-                f"{drug.replace(' ','_').lower()}/ctd/`"
+                f"{drug.replace(' ','_').lower()}/ctd/`\n\n"
+                "---\n"
+                "**📊 How it was generated (ICH M4E(R2) evidence chain)**\n\n"
+                "| Pass | Sections | Evidence source |\n"
+                "|---|---|---|\n"
+                "| 1 — Module 5 CSRs | All 5.3 study reports | Primary data (no prior context) |\n"
+                "| 2 — Module 2.7 Clinical Summary | 2.7.3 efficacy, 2.7.4 safety | Indexed Module 5 CSR content |\n"
+                "| 3 — Module 2.5/2.4/2.3 Overviews | Clinical & nonclinical overviews | Module 5 + 2.7 indexes |\n\n"
+                "⚠️ **If any pass was skipped or the job was interrupted mid-run**, "
+                "Module 2 sections may not be grounded in actual CSR findings. "
+                "Say **generate content** to re-run the full sequence — it is safe to re-run; "
+                "Module 5 will be re-indexed automatically before Module 2 is written.\n\n"
+                "**Next steps:**\n"
+                "1. 📑 Upload a clinical CSV via the **Clinical Data Upload** panel to register real trial data\n"
+                "2. 🔄 Say **generate content** again to re-run with the registered evidence\n"
+                "3. 🔍 Review written documents in GCS and fill any remaining `{{placeholder}}` values"
             )})
             return new_history, new_state
         elif status == "failed":
             new_state = {**st, "content_run_id": None}
             new_history = list(history or [])
+            step = job.get("step", "")
+            # Determine which pass failed to give targeted guidance
+            if "module2" in step:
+                step_note = (
+                    "The job failed during a **Module 2** pass. "
+                    "Module 5 CSR content and its index were already created.\n"
+                    "Re-running is safe — Module 5 will be re-indexed and Module 2 will "
+                    "be rewritten with fresh CSR evidence."
+                )
+            elif "module5" in step:
+                step_note = (
+                    "The job failed during the **Module 5 CSR** pass (before indexing). "
+                    "No program index exists yet. Re-running starts fresh."
+                )
+            else:
+                step_note = (
+                    "Re-run is safe — the full 3-pass sequence "
+                    "(Module 5 → 2.7 → 2.5 overviews) will restart from the beginning."
+                )
             new_history.append({"role": "assistant", "content": (
                 f"❌ **Content generation failed** — {job.get('error', 'unknown error')}\n\n"
+                f"{step_note}\n\n"
                 "Say **generate content** to try again."
             )})
             return new_history, new_state
@@ -1064,42 +1409,269 @@ def _auto_poll(history: list, state: dict):
             new_history.append({"role": "assistant", "content": (
                 f"⚠️ **Content generation timed out** — the job started {age} minutes ago "
                 "and never completed (worker was likely interrupted).\n\n"
+                "Re-running is safe. The worker will:\n"
+                "1. Re-run **Module 5** CSR generation → re-index into program namespace\n"
+                "2. Re-run **Module 2.7** Clinical Summary → query Module 5 index for evidence\n"
+                "3. Re-run **Module 2.5/2.4/2.3** Overviews → grounded in Module 5 + 2.7\n\n"
                 "Say **generate content** to start a fresh run."
             )})
             return new_history, new_state
 
     return history, state
 
+
+def _upload_clinical_csv(
+    csv_file,
+    ta: str,
+    dis: str,
+    drug: str,
+    bucket: str,
+) -> str:
+    """Gradio handler: register an uploaded CSV for a drug program.
+
+    Returns a Markdown status string shown in the UI.
+    """
+    if not _CLINICAL_UPLOAD_AVAILABLE:
+        return "⚠️ Clinical ingestion package not available in this environment."
+
+    ta   = (ta   or "").strip()
+    dis  = (dis  or "").strip()
+    drug = (drug or "").strip()
+
+    if not ta or not dis or not drug:
+        return "⚠️ Please fill in Therapeutic Area, Disease, and Drug Name before uploading."
+
+    if csv_file is None:
+        return "⚠️ No file selected."
+
+    # Gradio 5.x passes the file as a dict with a 'path' key (tmp path on disk)
+    local_path = csv_file if isinstance(csv_file, str) else csv_file.get("path", "")
+    if not local_path:
+        return "⚠️ Could not read uploaded file path."
+
+    bucket = (bucket or "").strip() or _DEFAULT_BUCKET
+
+    try:
+        program  = _ProgramInfo(therapeutic_area=ta, disease_type=dis, drug_name=drug)
+        api_key  = os.environ.get("OPENAI_API_KEY")
+        manifest = _register_csv(
+            bucket_name=bucket,
+            program=program,
+            local_csv_path=local_path,
+            api_key=api_key,
+        )
+        sources = manifest.sources
+        src     = next((s for s in sources if s.filename in local_path or True), sources[-1])
+        cols    = src.column_mappings if src else []
+        secs    = src.ctd_section_keys if src else []
+        lines = [
+            f"✅ **{src.filename}** registered successfully!\n",
+            f"- Study type: **{src.study_type}**",
+            f"- Mapped columns: **{len(cols)}**",
+            f"- CTD sections: `{'`, `'.join(secs)}`" if secs else "- CTD sections: _(none detected)_",
+            f"\nTotal datasets for **{drug}** / **{dis}** / **{ta}**: **{len(sources)}**",
+            "\nYou can now say **generate content** in the chat to populate CTD sections with this data.",
+        ]
+        return "\n".join(lines)
+    except Exception as exc:
+        return f"❌ Upload failed: {exc}"
+
+
 # ── Gradio UI ─────────────────────────────────────────────────────────────────
 
 _CSS = """
 footer { display: none !important; }
-.chatbot-wrap { border-radius: 8px; }
-.examples-row { margin-top: 4px; }
-.examples-row button {
-    font-size: 0.82em !important;
-    padding: 4px 10px !important;
-    border-radius: 20px !important;
-    background: var(--background-fill-secondary) !important;
-    border: 1px solid var(--border-color-primary) !important;
-    cursor: pointer;
+
+/* ══════════════════════════════════════════════════════════════
+   Force light mode — works regardless of html.dark class
+   ══════════════════════════════════════════════════════════════ */
+
+/* Redefine Gradio's own CSS custom properties for both :root and html.dark */
+:root,
+html.dark {
+    --body-background-fill:      #ffffff !important;
+    --background-fill-primary:   #ffffff !important;
+    --background-fill-secondary: #f5f8fd !important;
+    --body-text-color:           #1a1a2e !important;
+    --block-background-fill:     #ffffff !important;
+    --block-border-color:        #d1dce8 !important;
+    --input-background-fill:     #ffffff !important;
+    --block-label-text-color:    #1a1a2e !important;
+    --block-title-text-color:    #1a1a2e !important;
+    --prose-text-color:          #1a1a2e !important;
+    --chatbot-background:        #ffffff !important;
 }
+
+/* Background */
+body,
+.gradio-container,
+html.dark .gradio-container,
+html.dark body {
+    background-color: #ffffff !important;
+    background: #ffffff !important;
+    color: #1a1a2e !important;
+}
+
+/* Every text-bearing element */
+html.dark .gradio-container,
+html.dark .gradio-container p,
+html.dark .gradio-container span,
+html.dark .gradio-container div,
+html.dark .gradio-container label,
+html.dark .gradio-container li,
+html.dark .gradio-container td,
+html.dark .gradio-container th,
+html.dark .gradio-container h1,
+html.dark .gradio-container h2,
+html.dark .gradio-container h3,
+html.dark .gradio-container h4 {
+    color: #1a1a2e !important;
+    background-color: transparent;
+}
+
+/* Blocks / panels */
+html.dark .block,
+html.dark .panel,
+html.dark .form,
+html.dark fieldset {
+    background-color: #ffffff !important;
+}
+
+/* Inputs */
+html.dark input,
+html.dark textarea,
+html.dark select {
+    background-color: #ffffff !important;
+    color: #1a1a2e !important;
+}
+
+/* Chatbot bubbles (Gradio 6 markup) */
+html.dark .bubble-wrap { background-color: #f5f8fd !important; }
+html.dark .prose,
+html.dark .prose * { color: #1a1a2e !important; }
+html.dark code,
+html.dark pre { background-color: #eef3fb !important; color: #1a3a6a !important; }
+
+/* ── Brand header ── */
+.rp-header { padding: 16px 0 8px 0; border-bottom: 2px solid #1a4f8a; margin-bottom: 16px; }
+.rp-header h1 { font-size: 1.55em; font-weight: 700; color: #1a4f8a !important; margin: 0 0 2px 0; }
+.rp-header p  { font-size: 0.88em; color: #444 !important; margin: 0; }
+
+/* ── Capability badges ── */
+.rp-badges { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
+.rp-badge {
+    font-size: 0.78em; font-weight: 600; padding: 3px 10px;
+    border-radius: 12px; background: #eef3fb !important; color: #1a4f8a !important;
+    border: 1px solid #b3c9e8;
+}
+
+/* ── Chat area ── */
+.chatbot-wrap { border-radius: 8px; border: 1px solid #d1dce8 !important; background: #ffffff !important; }
+
+/* ── Quick-action chips ── */
+.qa-row { margin-top: 6px; margin-bottom: 2px; }
+.qa-row button {
+    font-size: 0.80em !important; padding: 4px 12px !important;
+    border-radius: 20px !important; font-weight: 500 !important;
+    background: #eef3fb !important; color: #1a4f8a !important;
+    border: 1px solid #b3c9e8 !important; cursor: pointer;
+}
+.qa-row button:hover { background: #d6e4f5 !important; }
 """
 
 _EXAMPLES = [
-    "Extract the ICH CTD structure from the index",
-    "Approve the structure",
-    "Set up CTD structure for oncology / lung cancer / carboplatin",
-    "Set up CTD structure for neurology / bells palsy / prednisolone",
+    "Build the ICH M4 CTD structure from guidelines",
+    "Approve and publish the default CTD structure",
+    "Set up authoring for oncology / lung cancer / carboplatin",
+    "Set up authoring for neurology / bells palsy / prednisolone",
+    "Generate CTD section content for neurology / bells palsy / prednisolone",
     "What is the current status?",
-    "Re-extract fresh from the ICH index",
 ]
 
-with gr.Blocks(title="ICH CTD Structure Assistant", css=_CSS, theme=gr.themes.Soft()) as demo:
-    gr.Markdown(
-        "# ICH CTD Structure Assistant\n"
-        "Describe what you need in plain English — I'll handle the rest."
+
+def _update_upload_panel(state: dict):
+    """Show/hide and pre-populate the clinical data upload panel.
+
+    Called whenever the session state changes.  When the user has already
+    set a drug program via chat, the panel becomes visible and the
+    TA/Disease/Drug fields are auto-filled from state['content_program'].
+    """
+    prog = (state or {}).get("content_program")
+    if prog:
+        return (
+            gr.update(visible=True),
+            gr.update(value=prog.get("ta", "")),
+            gr.update(value=prog.get("dis", "")),
+            gr.update(value=prog.get("drug", "")),
+        )
+    return (
+        gr.update(visible=True),
+        gr.update(value=""),
+        gr.update(value=""),
+        gr.update(value=""),
     )
+
+_HEAD = """
+<script>
+(function() {
+    var html = document.documentElement;
+    html.classList.remove('dark');
+    html.style.colorScheme = 'light';
+    new MutationObserver(function() {
+        if (html.classList.contains('dark')) {
+            html.classList.remove('dark');
+            html.style.colorScheme = 'light';
+        }
+    }).observe(html, { attributes: true, attributeFilter: ['class'] });
+})();
+</script>
+"""
+
+_theme = gr.themes.Soft().set(
+    body_background_fill="white",
+    body_background_fill_dark="white",
+    body_text_color="#1a1a2e",
+    body_text_color_dark="#1a1a2e",
+    body_text_color_subdued="#444444",
+    body_text_color_subdued_dark="#444444",
+    background_fill_primary="white",
+    background_fill_primary_dark="white",
+    background_fill_secondary="#f5f8fd",
+    background_fill_secondary_dark="#f5f8fd",
+    block_background_fill="white",
+    block_background_fill_dark="white",
+    block_label_text_color="#1a1a2e",
+    block_label_text_color_dark="#1a1a2e",
+    block_title_text_color="#1a1a2e",
+    block_title_text_color_dark="#1a1a2e",
+    input_background_fill="white",
+    input_background_fill_dark="white",
+    input_placeholder_color="#888888",
+    input_placeholder_color_dark="#888888",
+    panel_background_fill="white",
+    panel_background_fill_dark="white",
+    code_background_fill="#eef3fb",
+    code_background_fill_dark="#eef3fb",
+)
+
+with gr.Blocks(title="Regulatory Authoring Platform") as demo:
+
+    with gr.Column(elem_classes=["rp-header"]):
+        gr.HTML(
+            "<h1>&#9878; Regulatory Authoring Platform</h1>"
+            "<p>AI-assisted authoring for ICH M4(R4) Common Technical Documents &mdash; "
+            "from structure setup to section-level content generation.</p>"
+        )
+
+    with gr.Row(elem_classes=["rp-badges"]):
+        for _badge in [
+            "📋 ICH M4 CTD Structure",
+            "📝 Section Content Generation",
+            "🔬 Clinical Data Integration",
+            "✅ Regulatory Validation",
+            "☁️ GCS Document Store",
+        ]:
+            gr.HTML(f'<span class="rp-badge">{_badge}</span>')
 
     _state_init     = gr.State(value={})
     _browser_session = gr.BrowserState("")  # UUID persisted in localStorage per browser
@@ -1115,7 +1687,7 @@ with gr.Blocks(title="ICH CTD Structure Assistant", css=_CSS, theme=gr.themes.So
     )
 
     msg_input = gr.Textbox(
-        placeholder="Type your message and press Enter…",
+        placeholder="Describe what you need — e.g. set up authoring for oncology / lung cancer / carboplatin",
         label="",
         lines=1,
         max_lines=4,
@@ -1123,18 +1695,42 @@ with gr.Blocks(title="ICH CTD Structure Assistant", css=_CSS, theme=gr.themes.So
         show_label=False,
     )
 
-    with gr.Row(elem_classes=["examples-row"]):
+    with gr.Row(elem_classes=["qa-row"]):
         for ex in _EXAMPLES:
             gr.Button(ex, size="sm").click(
                 fn=lambda m=ex: m,
                 outputs=msg_input,
             )
 
-    with gr.Accordion("⚙  Settings", open=False):
+    with gr.Accordion("⚙  Configuration", open=False):
         with gr.Row():
-            ich_url_input = gr.Textbox(label="ICH Index URL",             value=_DEFAULT_URL,    scale=3)
-            email_input   = gr.Textbox(label="Reviewer email (optional)", placeholder="reviewer@example.com", scale=2)
-            bucket_input  = gr.Textbox(label="GCS bucket",                value=_DEFAULT_BUCKET, scale=2)
+            ich_url_input = gr.Textbox(label="ICH Guidelines Index URL", value=_DEFAULT_URL,    scale=3)
+            email_input   = gr.Textbox(label="Compliance officer email",  placeholder="officer@example.com", scale=2)
+            bucket_input  = gr.Textbox(label="GCS document bucket",       value=_DEFAULT_BUCKET, scale=2)
+
+    with gr.Accordion("🔬  Clinical Data Upload", open=False, visible=True) as _upload_accordion:
+        gr.Markdown(
+            "Upload a clinical trial CSV for the currently active drug program. "
+            "The program must be configured via chat before uploading."
+        )
+        with gr.Row():
+            upload_ta   = gr.Textbox(label="Therapeutic Area",  placeholder="e.g. neurology",    scale=1)
+            upload_dis  = gr.Textbox(label="Disease",           placeholder="e.g. bells palsy",  scale=1)
+            upload_drug = gr.Textbox(label="Drug Name",         placeholder="e.g. prednisolone", scale=1)
+        with gr.Row():
+            upload_file = gr.File(
+                label="Clinical CSV file",
+                file_types=[".csv"],
+                scale=3,
+            )
+            upload_btn  = gr.Button("Upload & Register", variant="primary", scale=1)
+        upload_status = gr.Markdown(value="", label="")
+
+        upload_btn.click(
+            fn=_upload_clinical_csv,
+            inputs=[upload_file, upload_ta, upload_dis, upload_drug, bucket_input],
+            outputs=upload_status,
+        )
 
     def _on_load(bucket: str, browser_session: str):
         sid = browser_session or str(uuid.uuid4())
@@ -1143,6 +1739,12 @@ with gr.Blocks(title="ICH CTD Structure Assistant", css=_CSS, theme=gr.themes.So
 
     demo.load(fn=_on_load, inputs=[bucket_input, _browser_session],
               outputs=[chatbot, _state_init, _browser_session])
+
+    _state_init.change(
+        fn=_update_upload_panel,
+        inputs=[_state_init],
+        outputs=[_upload_accordion, upload_ta, upload_dis, upload_drug],
+    )
 
     _inputs  = [msg_input, chatbot, _state_init, ich_url_input, bucket_input, email_input]
     _outputs = [chatbot, _state_init, msg_input]
@@ -1161,4 +1763,5 @@ with gr.Blocks(title="ICH CTD Structure Assistant", css=_CSS, theme=gr.themes.So
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
-    demo.launch(server_name="0.0.0.0", server_port=port)
+    demo.launch(server_name="0.0.0.0", server_port=port,
+                css=_CSS, theme=_theme, head=_HEAD)

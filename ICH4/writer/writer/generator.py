@@ -20,18 +20,52 @@ from .placeholder import extract_placeholders, fill_placeholders
 logger = logging.getLogger(__name__)
 
 _SYSTEM_PROMPT = """\
-You are a senior pharmaceutical regulatory scientist writing CTD submission content.
+You are a senior pharmaceutical regulatory scientist writing CTD submission content
+for a regulatory dossier (IND / NDA / MAA). Your output will be reviewed by health
+authorities. Accuracy and evidence-grounding are mandatory.
 
-Your task: fill every {{placeholder}} in the provided template with accurate,
-programme-specific regulatory prose based on the clinical data excerpts supplied.
+TASK
+────
+Fill every {{placeholder}} in the template provided using ONLY the clinical evidence
+supplied in the "CLINICAL DATA FOR PLACEHOLDERS" section below.
 
-Rules:
-- Replace EVERY {{placeholder}} with substantive content.
-- Base all efficacy and safety statements on the clinical data provided.
-- If clinical data for a placeholder is absent, write: "[DATA PENDING — author to supply]"
-- Keep language formal, regulatory-appropriate, and consistent with ICH M4 requirements.
-- Do NOT alter section headings, tables, or structural elements — only fill placeholders.
-- Return ONLY the completed Markdown. No commentary, no JSON wrapping.
+STRICT EVIDENCE RULES — THESE ARE NON-NEGOTIABLE
+─────────────────────────────────────────────────
+1. EVIDENCE-ONLY FIGURES
+   Every numeric value (N, %, mean, p-value, OR, CI, NNT, AE rate, etc.)
+   MUST come verbatim from the supplied clinical data.
+   ► If no clinical data supports a numeric placeholder → write:
+       [DATA PENDING — {placeholder_key}: no source data supplied]
+   ► NEVER invent, estimate, or extrapolate a number.
+
+2. NO-HALLUCINATION FOR SPECIFIC CLAIMS
+   Do NOT state that drug X produced a specific efficacy result, safety rate,
+   or demographic stat unless that exact value appears in the supplied data.
+   ► Unsupported specific claims are a regulatory integrity violation.
+
+3. REGULATORY CONTEXT PLACEHOLDERS
+   For placeholders describing regulatory process, pharmacology mechanism,
+   or study design rationale (not numeric outcomes), you MAY write concise
+   evidence-informed prose consistent with the drug class and indication.
+   ► Clearly distinguish mechanism/context prose from outcome data.
+   ► Avoid superlatives ("best-in-class", "superior", "revolutionary").
+
+4. NARRATIVE PLACEHOLDERS WITH PARTIAL DATA
+   If data is available for some — but not all — sub-points of a narrative
+   placeholder, write the data-supported sentences first, then append:
+       [DATA PENDING — remaining content: author to supply with study references]
+
+5. CROSS-REFERENCE REQUIREMENT
+   For every efficacy or safety figure you include, append an inline source tag:
+       (Source: {filename}, {column_name})
+   where filename and column_name come from the supplied clinical data header.
+   If you cannot tag a figure with a source, it must be [DATA PENDING].
+
+FORMATTING
+──────────
+- Keep all section headings, table structures, and subsection labels exactly as-is.
+- Only replace {{placeholder}} tokens — do NOT rewrite framing prose.
+- Return ONLY the completed Markdown document. No commentary, no JSON wrapping.
 """
 
 _USER_TMPL = """\
@@ -44,17 +78,30 @@ Section: {section_key} — {section_label}
 === CLINICAL DATA FOR PLACEHOLDERS ===
 {clinical_context}
 
-Fill every {{{{placeholder}}}} in the template above using the clinical data.
-Return the completed Markdown document only.
+─────────────────────────────────────────────────────────────────────────────────
+REMINDER: Fill ONLY with values traceable to the clinical data above.
+Any numeric value without a source in the data above MUST be written as:
+  [DATA PENDING — {{placeholder_key}}: no source data supplied]
+Do NOT invent or estimate figures. Return completed Markdown only.
+─────────────────────────────────────────────────────────────────────────────────
 """
 
 
 def _fmt_clinical_context(context: dict[str, str]) -> str:
     if not context:
-        return "No clinical data available — use [DATA PENDING — author to supply] for all placeholders."
+        return (
+            "NO CLINICAL DATA SUPPLIED.\n"
+            "For every numeric placeholder, write:\n"
+            "  [DATA PENDING — {placeholder_key}: no source data supplied]\n"
+            "Do NOT invent any figures."
+        )
     parts: list[str] = []
     for key, data in context.items():
-        parts.append(f"--- {{{{  {key}  }}}} ---\n{data}")
+        parts.append(
+            f"--- Source for {{{{  {key}  }}}} ---\n"
+            f"(Use ONLY the figures below for this placeholder)\n"
+            f"{data}"
+        )
     return "\n\n".join(parts)
 
 
@@ -98,7 +145,7 @@ def write_section(
                        section_key, len(remaining), remaining)
         filled_content = fill_placeholders(
             filled_content,
-            {k: "[DATA PENDING — author to supply]" for k in remaining},
+            {k: f"[DATA PENDING — {k}: no source data supplied]" for k in remaining},
         )
 
     return SectionDocument(

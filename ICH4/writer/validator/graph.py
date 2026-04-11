@@ -13,6 +13,7 @@ from .nodes import (
     auto_fill_from_cross_sections,
     check_unfilled_placeholders,
     check_not_filled_markers,
+    check_ich_coverage,
     llm_deep_check,
     finalise,
 )
@@ -25,11 +26,13 @@ def build_graph(llm: ChatOpenAI) -> Any:
 
     Pipeline:
       extract_key_values
-        → check_consistency          (drug name, demographics, efficacy, safety)
+        → check_consistency              (drug name, demographics, efficacy, safety)
         → auto_fill_from_cross_sections  (fill DATA PENDING from consensus values)
         → check_unfilled_placeholders    (flag remaining DATA PENDING)
         → check_not_filled_markers       (flag NOT FILLED template markers)
-        → llm_deep_check                 (narrative coherence + any remaining gaps)
+        → check_ich_coverage             (ICH M4 mandatory element presence per section)
+        → llm_deep_check                 (benefit-risk alignment, claim support,
+                                          regulatory language, narrative coherence)
         → finalise
     """
     graph = StateGraph(ValidatorState)
@@ -39,6 +42,7 @@ def build_graph(llm: ChatOpenAI) -> Any:
     graph.add_node("auto_fill",                    auto_fill_from_cross_sections)
     graph.add_node("check_unfilled",               check_unfilled_placeholders)
     graph.add_node("check_not_filled",             check_not_filled_markers)
+    graph.add_node("check_ich_coverage",           partial(check_ich_coverage, llm=llm))
     graph.add_node("llm_deep_check",               partial(llm_deep_check, llm=llm))
     graph.add_node("finalise",                     finalise)
 
@@ -47,7 +51,8 @@ def build_graph(llm: ChatOpenAI) -> Any:
     graph.add_edge("check_consistency",    "auto_fill")
     graph.add_edge("auto_fill",            "check_unfilled")
     graph.add_edge("check_unfilled",       "check_not_filled")
-    graph.add_edge("check_not_filled",     "llm_deep_check")
+    graph.add_edge("check_not_filled",     "check_ich_coverage")
+    graph.add_edge("check_ich_coverage",   "llm_deep_check")
     graph.add_edge("llm_deep_check",       "finalise")
     graph.add_edge("finalise",             END)
 

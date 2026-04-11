@@ -1,0 +1,24 @@
+# CTD Structure API — FastAPI backend (no LLM — coordinator lives in ui/)
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.9
+
+# CoordinatorDecision Pydantic model (from ctd_structure/deploy/main.py)
+# Only the model definition is used here; LangGraph runner is in ui/
+pydantic>=2.0.0
+langchain-core>=0.2.0   # required by main.py imports at module level
+langchain-openai>=0.1.0 # required by main.py imports at module level
+langgraph>=0.1.0        # required by main.py imports at module level
+openai>=1.0.0
+
+# Clinical data ingestion (column mapping via LLM)
+# Comment out if the clinical/ package is not available at build time
+# langchain-core is already pulled in above
+
+# Google Cloud
+google-auth
+google-auth-httplib2
+google-cloud-storage
+google-cloud-pubsub
+
+typing-extensions

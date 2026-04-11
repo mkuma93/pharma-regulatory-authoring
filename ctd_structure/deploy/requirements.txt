@@ -1,6 +1,9 @@
 # Gradio demo
 gradio>=5.0.0
 
+# LLM column mapper (used by clinical/mapper.py)
+langchain-core>=0.2.0
+
 # LangGraph workflow + LLM intent classification
 langgraph>=0.1.0
 langchain-openai>=0.1.0

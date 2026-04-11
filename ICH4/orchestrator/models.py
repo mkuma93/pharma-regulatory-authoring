@@ -34,6 +34,31 @@ class OrchestratorRequest(BaseModel):
         default=True,
         description="Query the index service for ICH guideline context per module.",
     )
+    module_filter: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Restrict generation to these module keys (e.g. ['module5']). "
+            "Empty list = all modules."
+        ),
+    )
+    evidence_namespaces: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Per-program index namespaces to query for prior-pass evidence. "
+            "Format: '{base_ns}_{pass_id}', e.g. "
+            "'program_neurology_bells_palsy_prednisolone_module5'. "
+            "Evidence is injected into the template prompt to ground Module 2 "
+            "summaries in actual CSR content (ICH M4E(R2) evidence chain)."
+        ),
+    )
+    section_key_prefixes: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Only include sections whose key starts with one of these prefixes. "
+            "Empty = all sections in the active modules. Used to split Module 2 "
+            "into a 2.7 pass (Clinical Summary) and a 2.5/2.4/2.3 pass (Overviews)."
+        ),
+    )
 
 
 class OrchestratorResponse(BaseModel):

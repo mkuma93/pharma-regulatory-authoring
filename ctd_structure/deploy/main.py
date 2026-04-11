@@ -27,6 +27,7 @@ Public surface (used by app.py)
 from __future__ import annotations
 
 import os
+import re
 from typing import Literal
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -43,16 +44,20 @@ class IntentResult(BaseModel):
     Raw intent + entity extraction (understand node).
     Kept as a separate model so the decide node receives structured input.
     """
-    intent: Literal["extract", "approve", "disapprove", "copy", "write", "status", "help"] = Field(
+    intent: Literal["extract", "approve", "disapprove", "copy", "write", "status",
+                      "generate_template", "rewrite_section", "analyze_data", "help"] = Field(
         description=(
             "The user's intent:\n"
-            "  extract    — build/load the canonical ICH CTD folder tree\n"
-            "  approve    — accept the currently shown structure\n"
-            "  disapprove — reject or request changes to the structure\n"
-            "  copy       — scaffold the CTD structure for a specific drug program in GCS\n"
-            "  write      — generate / fill CTD section content\n"
-            "  status     — ask what is currently loaded or running\n"
-            "  help       — anything else / unclear"
+            "  extract           — build/load the canonical ICH CTD folder tree\n"
+            "  approve           — accept the currently shown structure\n"
+            "  disapprove        — reject or request changes to the structure\n"
+            "  copy              — scaffold the CTD structure for a specific drug program in GCS\n"
+            "  write             — generate / fill CTD section content (full pipeline)\n"
+            "  status            — ask what is currently loaded or running\n"
+            "  generate_template — generate ICH-grounded section templates only (no full write)\n"
+            "  rewrite_section   — regenerate one or more specific CTD sections\n"
+            "  analyze_data      — analyse clinical trial data / CSV for a program\n"
+            "  help              — anything else / unclear"
         )
     )
     force_reextract: bool = Field(
@@ -75,6 +80,21 @@ class IntentResult(BaseModel):
         default=None,
         description="For disapprove intent only: concise summary of the user's concern.",
     )
+    section_keys: list[str] = Field(
+        default_factory=list,
+        description=(
+            "For rewrite_section only: list of CTD section keys to rewrite, "
+            "e.g. ['2.5_clinical_overview', '5.3_clinical_study_reports']. "
+            "Empty list means all sections."
+        ),
+    )
+    module_filter: list[str] = Field(
+        default_factory=list,
+        description=(
+            "For generate_template only: restrict to specific module keys, "
+            "e.g. ['module5']. Empty list means all modules."
+        ),
+    )
 
 
 class CoordinatorDecision(BaseModel):
@@ -96,7 +116,8 @@ class CoordinatorDecision(BaseModel):
         description="'clarify' — ask user something; 'proceed' — run the action."
     )
     # ── resolved intent (always set) ─────────────────────────────────────────
-    intent: Literal["extract", "approve", "disapprove", "copy", "write", "status", "help"] = Field(
+    intent: Literal["extract", "approve", "disapprove", "copy", "write", "status",
+                    "generate_template", "rewrite_section", "analyze_data", "help"] = Field(
         description="The resolved intent to execute when outcome is 'proceed'."
     )
     # ── resolved program fields ───────────────────────────────────────────────
@@ -106,6 +127,8 @@ class CoordinatorDecision(BaseModel):
     # ── other extracted fields ────────────────────────────────────────────────
     force_reextract: bool = Field(default=False)
     feedback: str | None = Field(default=None)
+    section_keys: list[str] = Field(default_factory=list)
+    module_filter: list[str] = Field(default_factory=list)
     # ── coordinator reply (set when outcome == 'clarify') ─────────────────────
     reply: str | None = Field(
         default=None,
@@ -129,13 +152,20 @@ You are the understanding layer of an ICH M4(R4) CTD (Common Technical Document)
 regulatory assistant. Your only job is to extract what the user wants.
 
 Classify the message into one intent:
-  extract    — build/load the canonical ICH CTD folder tree from the ICH index
-  approve    — accept the currently shown CTD structure
-  disapprove — reject or request changes to the structure
-  copy       — scaffold the CTD folder structure for a specific drug program in GCS
-  write      — generate or fill the CTD section content for a program
-  status     — ask what is currently loaded or running in the background
-  help       — unclear or out of scope
+  extract           — build/load the canonical ICH CTD folder tree from the ICH index
+  approve           — accept the currently shown CTD structure
+  disapprove        — reject or request changes to the structure
+  copy              — scaffold the CTD folder structure for a specific drug program in GCS
+  write             — run the full CTD content generation pipeline for a program
+  status            — ask what is currently loaded or running in the background
+  generate_template — generate ICH-grounded section templates only (preview before writing)
+                      e.g. "show templates for module 5", "preview the CTD template"
+  rewrite_section   — regenerate one or more specific CTD section documents
+                      e.g. "rewrite section 2.5", "redo the clinical overview"
+  analyze_data      — analyse clinical trial data / uploaded CSV for a program
+                      e.g. "analyse the clinical data", "summarise trial results",
+                           "what does the data show for prednisolone?"
+  help              — unclear or out of scope
 
 Also extract (when present in the message):
   force_reextract     — user explicitly wants a fresh rebuild (re-extract, refresh, rebuild)
@@ -143,10 +173,13 @@ Also extract (when present in the message):
   disease_type        — e.g. lung cancer, bells palsy, hypertension
   drug_name           — e.g. carboplatin, prednisolone, lisinopril
   feedback            — for disapprove only: one-sentence summary of the concern
+  section_keys        — for rewrite_section only: list of CTD section keys, e.g. ['2.5_clinical_overview']
+  module_filter       — for generate_template only: list of module keys, e.g. ['module5']
 
-The current session context (what is already loaded) will be provided.
-Use it to disambiguate: if a structure is shown and user says "yes" → approve;
-if user says "this is wrong" → disapprove.
+IMPORTANT: messages often use a slash-separated triplet:
+  "<therapeutic_area> / <disease_type> / <drug_name>"
+  e.g. "oncology / lung cancer / carboplatin" → ta=oncology, disease=lung cancer, drug=carboplatin
+  Always extract all three fields from this pattern.
 """
 
 _DECIDE_SYSTEM = """\
@@ -167,27 +200,52 @@ extract:
   No prerequisites. Always proceed (unless force_reextract=false and a structure
   already exists — in that case proceed anyway, the handler will show the cached one).
 
-approve / disapprove:
-  PREREQUISITE: structure must exist (paths_loaded > 0).
-  If missing → clarify: ask the user to extract first.
+approve:
+  PREREQUISITE: paths_loaded > 0.
+  RULE: if paths_loaded > 0 → ALWAYS outcome=proceed. NEVER block on canonical_exists or approved.
+  If paths_loaded=0 → clarify: ask the user to extract the ICH structure first.
+  IMPORTANT: approval is the action that CREATES the canonical default.
+             It CANNOT and MUST NOT require canonical_exists=true as a prerequisite.
+             canonical_exists=false is the normal state BEFORE approval — it is not an error.
+
+disapprove:
+  PREREQUISITE: paths_loaded > 0.
+  If paths_loaded=0 → clarify: ask the user to extract first.
 
 copy (scaffold a program directory):
-  PREREQUISITE 1: structure must exist (paths_loaded > 0).
-  PREREQUISITE 2: structure must be approved.
-  PREREQUISITE 3: therapeutic_area, disease_type, drug_name must all be known.
-  If structure missing → clarify with full step sequence.
-  If not approved → clarify: ask user to approve first.
+  PREREQUISITE: therapeutic_area, disease_type, drug_name must all be known.
+  RULE: if all 3 fields are present → ALWAYS outcome=proceed. No other prerequisites.
+  NOTE: scaffolding always reads from the shared canonical default CTD structure in GCS.
+        Approval is NOT required. canonical_exists and session paths are irrelevant.
+        The action handler will check GCS at runtime and report any error.
   If any program field missing → clarify: ask only for the missing fields, warmly.
 
 write (generate content):
-  PREREQUISITE 1: structure must exist (paths_loaded > 0).
-  PREREQUISITE 2: structure must be approved.
-  PREREQUISITE 3: program scaffold must exist in GCS (program_scaffold_exists = true).
-  PREREQUISITE 4: therapeutic_area, disease_type, drug_name must all be known.
-  If structure missing → clarify with full 4-step sequence.
-  If not approved → clarify: ask to approve first.
-  If program fields known but scaffold missing → clarify: ask to scaffold first.
+  PREREQUISITE: therapeutic_area, disease_type, drug_name must all be known.
+  RULE: if all 3 fields are present → ALWAYS outcome=proceed. No other prerequisites.
+  NOTE: approval is NOT required. Scaffolding will be done automatically if needed.
+        The action handler will check GCS at runtime and report any error.
   If program fields missing → clarify: ask for the missing fields, warmly.
+
+generate_template (template preview only):
+  PREREQUISITE: therapeutic_area, disease_type, drug_name must all be known.
+  RULE: if all 3 fields are present → ALWAYS outcome=proceed.
+  NOTE: generates ICH-grounded section templates and stores them in GCS.
+        Does NOT trigger the content writing pipeline.
+  If program fields missing → clarify.
+
+rewrite_section (regenerate specific sections):
+  PREREQUISITE: therapeutic_area, disease_type, drug_name must all be known.
+  RULE: if all 3 fields are present → ALWAYS outcome=proceed.
+  NOTE: section_keys is optional — empty means rewrite all sections.
+  If program fields missing → clarify.
+
+analyze_data (clinical data analysis):
+  PREREQUISITE: therapeutic_area, disease_type, drug_name must all be known.
+  RULE: if all 3 fields are present → ALWAYS outcome=proceed.
+  NOTE: the analyst will read clinical CSV from GCS for the given program.
+        It does NOT require a prior write or template generation step.
+  If program fields missing → clarify.
 
 status / help:
   Always proceed.
@@ -239,6 +297,28 @@ def _decide_node(state: _CoordState) -> _CoordState:
             "What is your decision (clarify or proceed)?"
         )),
     ])
+    # Hard guardrail: approve/disapprove with paths loaded must always proceed.
+    # The LLM sometimes mis-routes these despite correct context; this override is deterministic.
+    _m = re.search(r"paths_loaded=(\d+)", state.get("workflow_context", ""))
+    _canonical_true = "canonical_exists=True" in state.get("workflow_context", "")
+    if (decision.outcome == "clarify"
+            and ir.intent in ("approve", "disapprove")
+            and _m and int(_m.group(1)) > 0):
+        decision = CoordinatorDecision(outcome="proceed", intent=ir.intent)
+
+    # Hard guardrail: copy/write/template/rewrite/analyze with all 3 fields must always
+    # proceed — the action handler does the real GCS check at runtime.
+    _has_all_fields = bool(ir.therapeutic_area and ir.disease_type and ir.drug_name)
+    if (decision.outcome == "clarify"
+            and ir.intent in ("copy", "write", "generate_template", "rewrite_section", "analyze_data")
+            and _has_all_fields):
+        decision = CoordinatorDecision(
+            outcome="proceed", intent=ir.intent,
+            therapeutic_area=ir.therapeutic_area,
+            disease_type=ir.disease_type,
+            drug_name=ir.drug_name,
+        )
+
     # Always propagate the extracted fields so app.py can use them even if
     # the LLM forgot to copy them into the CoordinatorDecision.
     if decision.therapeutic_area is None and ir.therapeutic_area:
@@ -251,6 +331,10 @@ def _decide_node(state: _CoordState) -> _CoordState:
         decision.force_reextract = ir.force_reextract
     if decision.feedback is None and ir.feedback:
         decision.feedback = ir.feedback
+    if not decision.section_keys and ir.section_keys:
+        decision.section_keys = ir.section_keys
+    if not decision.module_filter and ir.module_filter:
+        decision.module_filter = ir.module_filter
     return {"decision": decision}
 
 
@@ -288,8 +372,10 @@ def run_coordinator(message: str, session_state: dict) -> CoordinatorDecision:
     prog     = st.get("content_program") or {}
 
     # Build a rich but compact context string for the LLM
+    canonical_exists = st.get("canonical_exists", False)
     workflow_context = (
         f"paths_loaded={len(paths)}, "
+        f"canonical_exists={canonical_exists}, "
         f"approved={approved}, "
         f"bucket={st.get('bucket', 'unknown')}, "
         f"program_scaffold_exists={st.get('program_scaffold_exists', False)}, "

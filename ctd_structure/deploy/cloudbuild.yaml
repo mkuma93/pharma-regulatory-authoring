@@ -64,14 +64,13 @@ steps:
       - "gcloud auth configure-docker $_REGION-docker.pkg.dev --quiet"
 
   # 3. Build image
-  #    dir: ctd_structure so the Dockerfile COPY paths (relative to ctd_structure/)
-  #    resolve correctly even though the build context is the repo root.
+  #    Build context is the repo root so clinical/ and template/ (both at repo root)
+  #    are accessible. Dockerfile uses ctd_structure/-prefixed paths for those files.
   - name: "gcr.io/cloud-builders/docker"
-    dir: ctd_structure
     args:
       - build
       - -f
-      - deploy/Dockerfile
+      - ctd_structure/deploy/Dockerfile
       - -t
       - "$_REGION-docker.pkg.dev/$_PROJECT_ID/$_AR_REPO/$_SERVICE_NAME:$_TAG"
       - -t

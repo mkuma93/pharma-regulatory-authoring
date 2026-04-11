@@ -54,3 +54,6 @@ clinical/**/*.csv
 # Node / build artifacts
 node_modules/
 *.log
+
+# Office temp lock files
+~$*
