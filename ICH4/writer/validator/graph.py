@@ -14,6 +14,7 @@ from .nodes import (
     check_unfilled_placeholders,
     check_not_filled_markers,
     check_ich_coverage,
+    check_against_resolved,
     llm_deep_check,
     finalise,
 )
@@ -31,6 +32,7 @@ def build_graph(llm: ChatOpenAI) -> Any:
         → check_unfilled_placeholders    (flag remaining DATA PENDING)
         → check_not_filled_markers       (flag NOT FILLED template markers)
         → check_ich_coverage             (ICH M4 mandatory element presence per section)
+        → check_against_resolved         (verify written figures match /resolve ground truth)
         → llm_deep_check                 (benefit-risk alignment, claim support,
                                           regulatory language, narrative coherence)
         → finalise
@@ -43,28 +45,38 @@ def build_graph(llm: ChatOpenAI) -> Any:
     graph.add_node("check_unfilled",               check_unfilled_placeholders)
     graph.add_node("check_not_filled",             check_not_filled_markers)
     graph.add_node("check_ich_coverage",           partial(check_ich_coverage, llm=llm))
+    graph.add_node("check_against_resolved",       check_against_resolved)
     graph.add_node("llm_deep_check",               partial(llm_deep_check, llm=llm))
     graph.add_node("finalise",                     finalise)
 
-    graph.add_edge(START,                  "extract_key_values")
-    graph.add_edge("extract_key_values",   "check_consistency")
-    graph.add_edge("check_consistency",    "auto_fill")
-    graph.add_edge("auto_fill",            "check_unfilled")
-    graph.add_edge("check_unfilled",       "check_not_filled")
-    graph.add_edge("check_not_filled",     "check_ich_coverage")
-    graph.add_edge("check_ich_coverage",   "llm_deep_check")
-    graph.add_edge("llm_deep_check",       "finalise")
-    graph.add_edge("finalise",             END)
+    graph.add_edge(START,                      "extract_key_values")
+    graph.add_edge("extract_key_values",       "check_consistency")
+    graph.add_edge("check_consistency",        "auto_fill")
+    graph.add_edge("auto_fill",                "check_unfilled")
+    graph.add_edge("check_unfilled",           "check_not_filled")
+    graph.add_edge("check_not_filled",         "check_ich_coverage")
+    graph.add_edge("check_ich_coverage",       "check_against_resolved")
+    graph.add_edge("check_against_resolved",   "llm_deep_check")
+    graph.add_edge("llm_deep_check",           "finalise")
+    graph.add_edge("finalise",                 END)
 
     return graph.compile()
 
 
-def run_validator(documents: list, llm: ChatOpenAI) -> ValidationResult:
+def run_validator(
+    documents: list,
+    llm: ChatOpenAI,
+    resolved_values: dict[str, str] | None = None,
+) -> ValidationResult:
     """Execute the validator graph and return a `ValidationResult`.
 
     Args:
-        documents: list[SectionDocument] — written sections to validate.
-        llm:       ChatOpenAI instance shared with the writer.
+        documents:       list[SectionDocument] — written sections to validate.
+        llm:             ChatOpenAI instance shared with the writer.
+        resolved_values: Optional pre-computed ground-truth values from
+                         ``clinical-analyst /resolve``.  When provided, the
+                         ``check_against_resolved`` node verifies written
+                         figures against these values.
     """
     compiled = build_graph(llm)
 
@@ -74,6 +86,7 @@ def run_validator(documents: list, llm: ChatOpenAI) -> ValidationResult:
         messages=[],
         extracted_values={},
         canonical_values={},
+        resolved_values=resolved_values or {},
         drug_name_found="",
         passed=True,
         summary="",

@@ -114,13 +114,17 @@ def write_section(
     template_content: str,
     bucket_name: str,
     llm: ChatOpenAI,
+    resolved_values: dict[str, str] | None = None,
 ) -> SectionDocument:
     """Fill one template and return a SectionDocument with completed prose."""
     placeholders = extract_placeholders(template_content)
     logger.info("[writer] Section %s — %d placeholders: %s",
                 section_key, len(placeholders), placeholders)
 
-    clinical_ctx = build_clinical_context(bucket_name, program, placeholders, llm=llm)
+    clinical_ctx = build_clinical_context(
+        bucket_name, program, placeholders, llm=llm,
+        resolved_values=resolved_values,
+    )
 
     messages = [
         SystemMessage(content=_SYSTEM_PROMPT),

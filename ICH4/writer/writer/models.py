@@ -45,6 +45,13 @@ class WriterRequest(BaseModel):
         default=True,
         description="Run LangGraph cross-module consistency validator after writing.",
     )
+    resolved_values: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Pre-computed placeholder values from clinical-analyst /resolve. "
+            "Keys present here will not be re-dispatched to the hybrid analyst."
+        ),
+    )
 
 
 class WriterResponse(BaseModel):

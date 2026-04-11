@@ -70,8 +70,13 @@ def build_clinical_context(
     program: ProgramInfo,
     placeholder_keys: list[str],
     llm: ChatOpenAI | None = None,
+    resolved_values: dict[str, str] | None = None,
 ) -> dict[str, str]:
     """Return a mapping  placeholder_key → computed statistical summary string.
+
+    If *resolved_values* is provided (from ``clinical-analyst /resolve``),
+    those entries are returned as-is and the hybrid analyst is only dispatched
+    for keys that were NOT already resolved.
 
     For each CSV source in the manifest whose columns map to the requested
     placeholder_keys, loads the full DataFrame, runs the DataAnalyst agent to
@@ -81,9 +86,17 @@ def build_clinical_context(
     Falls back to raw row strings if no LLM is provided (test / offline mode).
     Returns empty dict if no manifest is found.
     """
+    # Start with pre-resolved values; hybrid analyst fills whatever is missing
+    context: dict[str, str] = dict(resolved_values or {})
+
+    # Only dispatch analyst for keys not already resolved upstream
+    remaining_keys = [k for k in placeholder_keys if k not in context]
+    if not remaining_keys:
+        return context
+
     manifest = load_clinical_manifest(bucket_name, program)
     if not manifest:
-        return {}
+        return context
 
     # Build lookup: placeholder_key → {column_name, gcs_path, description}
     placeholder_meta: dict[str, dict] = {}
@@ -92,7 +105,7 @@ def build_clinical_context(
         for mapping in source.get("column_mappings", []):
             pk = mapping.get("placeholder_key", "")
             cn = mapping.get("column_name", "")
-            if pk and cn and pk in placeholder_keys:
+            if pk and cn and pk in remaining_keys:
                 placeholder_meta[pk] = {
                     "column_name": cn,
                     "gcs_path": gcs_path,
@@ -101,7 +114,7 @@ def build_clinical_context(
                 }
 
     if not placeholder_meta:
-        return {}
+        return context
 
     # Group by CSV file so we load each file once
     file_groups: dict[str, dict[str, dict]] = {}

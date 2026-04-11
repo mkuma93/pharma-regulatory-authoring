@@ -75,6 +75,7 @@ def write(request: WriterRequest) -> WriterResponse:
                 template_content=template_content,
                 bucket_name=bucket_name,
                 llm=llm,
+                resolved_values=request.resolved_values or {},
             )
             doc.gcs_path = save_document(bucket_name, request.program, doc)
             documents.append(doc)
@@ -86,7 +87,11 @@ def write(request: WriterRequest) -> WriterResponse:
     validation: ValidationResult
     if request.run_validator and documents:
         try:
-            validation = run_validator(documents=documents, llm=llm)
+            validation = run_validator(
+                documents=documents,
+                llm=llm,
+                resolved_values=request.resolved_values or {},
+            )
         except Exception as exc:
             logger.warning("[write] Validator error: %s", exc)
             validation = ValidationResult(

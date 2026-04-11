@@ -33,6 +33,7 @@ import base64
 import json
 import logging
 import os
+import re
 from datetime import datetime, timezone
 
 import httpx
@@ -44,10 +45,21 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(name)s  %(messa
 
 app = FastAPI(title="ICH4 Content Worker", version="1.0.0")
 
-_ORCHESTRATOR_URL = os.environ.get("ORCHESTRATOR_URL", "").rstrip("/")
-_WRITER_URL       = os.environ.get("WRITER_URL", "").rstrip("/")
-_INDEX_URL        = os.environ.get("INDEX_URL", "").rstrip("/")
-_TIMEOUT          = float(os.environ.get("SERVICE_TIMEOUT", "600"))
+_ORCHESTRATOR_URL      = os.environ.get("ORCHESTRATOR_URL", "").rstrip("/")
+_WRITER_URL            = os.environ.get("WRITER_URL", "").rstrip("/")
+_INDEX_URL             = os.environ.get("INDEX_URL", "").rstrip("/")
+_CLINICAL_ANALYST_URL  = os.environ.get("CLINICAL_ANALYST_URL", "").rstrip("/")
+_TIMEOUT               = float(os.environ.get("SERVICE_TIMEOUT", "600"))
+
+_PLACEHOLDER_RE = re.compile(r"\{\{(\w+)\}\}")
+
+
+def _extract_placeholder_keys(templates: list[dict]) -> list[str]:
+    """Return unique {{placeholder}} keys found across all template contents."""
+    keys: set[str] = set()
+    for t in templates:
+        keys.update(_PLACEHOLDER_RE.findall(t.get("content", "")))
+    return sorted(keys)
 
 _gcs_client = storage.Client()
 
@@ -268,6 +280,54 @@ async def generate(request: Request):
                 pass_id, len(templates), bucket, prefix,
             )
 
+            # ── Step B.5: Clinical Analyst → pre-resolve placeholders ──────────
+            resolved_values: dict[str, str] = {}
+            if _CLINICAL_ANALYST_URL:
+                placeholder_keys = _extract_placeholder_keys(templates)
+                if placeholder_keys:
+                    _write_status(bucket, status_path, {
+                        "status":     "running",
+                        "run_id":     run_id,
+                        "step":       f"resolving_{pass_id}",
+                        "pass_label": pass_label,
+                    })
+                    try:
+                        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+                            analyst_aud = _service_audience(_CLINICAL_ANALYST_URL)
+                            ra = await client.post(
+                                f"{_CLINICAL_ANALYST_URL}/resolve",
+                                json={
+                                    "therapeutic_area": ta,
+                                    "disease_type":     dis,
+                                    "drug_name":        drug,
+                                    "bucket":           bucket,
+                                    "placeholder_keys": placeholder_keys,
+                                },
+                                headers=_oidc_headers(analyst_aud),
+                            )
+                            if ra.status_code == 200:
+                                resolved_values = ra.json().get("resolved_values", {})
+                                logger.info(
+                                    "[worker] Pass %s: analyst resolved %d/%d keys",
+                                    pass_id, len(resolved_values), len(placeholder_keys),
+                                )
+                            elif ra.status_code == 404:
+                                # No manifest yet — writer hybrid-analyst will handle it
+                                logger.info(
+                                    "[worker] Pass %s: no clinical manifest — skipping resolve",
+                                    pass_id,
+                                )
+                            else:
+                                logger.warning(
+                                    "[worker] Pass %s: analyst /resolve HTTP %s — continuing",
+                                    pass_id, ra.status_code,
+                                )
+                    except Exception as exc:
+                        logger.warning(
+                            "[worker] Pass %s: analyst resolve failed (non-fatal): %s",
+                            pass_id, exc,
+                        )
+
             # ── Step C: Writer ────────────────────────────────────────────────
             _write_status(bucket, status_path, {
                 "status":     "running",
@@ -286,9 +346,10 @@ async def generate(request: Request):
                             "disease_type":     dis,
                             "drug_name":        drug,
                         },
-                        "bucket_name":   bucket,
-                        "sections":      section_keys,
-                        "run_validator": pass_idx == total_passes - 1,
+                        "bucket_name":     bucket,
+                        "sections":        section_keys,
+                        "run_validator":   pass_idx == total_passes - 1,
+                        "resolved_values": resolved_values,
                     },
                     headers=_oidc_headers(writer_aud),
                 )

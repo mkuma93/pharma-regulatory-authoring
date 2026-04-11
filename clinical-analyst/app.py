@@ -29,12 +29,13 @@ import io
 import json
 import logging
 import os
-from typing import Any
+from typing import Annotated, Any
 
 import pandas as pd
 from fastapi import FastAPI, HTTPException
 from google.cloud import storage
 from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
@@ -57,6 +58,24 @@ app = FastAPI(
 
 
 # ── Request / Response models ─────────────────────────────────────────────────
+
+class ResolveRequest(BaseModel):
+    therapeutic_area: str
+    disease_type: str
+    drug_name: str
+    bucket: str | None = Field(default=None)
+    placeholder_keys: list[str] = Field(
+        default_factory=list,
+        description="Keys to resolve. Empty = resolve all keys found in manifest.",
+    )
+
+
+class ResolveResponse(BaseModel):
+    resolved_values: dict[str, str]
+    saved_path: str
+    keys_resolved: int
+    keys_failed: list[str] = Field(default_factory=list)
+
 
 class AnalyzeRequest(BaseModel):
     therapeutic_area: str
@@ -84,6 +103,204 @@ class AnalysisResult(BaseModel):
         default_factory=dict,
         description="Raw statistical summaries keyed by source filename.",
     )
+
+
+# ── Resolve: deterministic statistical tools (mirrors writer/data_analyst.py) ──
+
+@tool
+def compute_proportion(
+    data_json: Annotated[str, "JSON array of row dicts"],
+    column: Annotated[str, "Column to compute proportion for"],
+    positive_value: Annotated[str, "Value that counts as positive"],
+    group_by: Annotated[str, "Column to group by, or empty string"] = "",
+) -> str:
+    """Compute proportion (%) of rows where column == positive_value."""
+    rows = json.loads(data_json)
+    df = pd.DataFrame(rows)
+    if column not in df.columns:
+        return f"[column '{column}' not found]"
+    if group_by and group_by in df.columns:
+        lines: list[str] = []
+        for grp, sub in df.groupby(group_by):
+            n_pos = (sub[column].astype(str).str.strip() == str(positive_value)).sum()
+            n_tot = len(sub)
+            pct = 100 * n_pos / n_tot if n_tot else 0
+            lines.append(f"  {grp}: {pct:.1f}% ({n_pos}/{n_tot})")
+        return "\n".join(lines)
+    n_pos = (df[column].astype(str).str.strip() == str(positive_value)).sum()
+    n_tot = len(df)
+    pct = 100 * n_pos / n_tot if n_tot else 0
+    return f"{pct:.1f}% ({n_pos}/{n_tot})"
+
+
+@tool
+def compute_mean_sd(
+    data_json: Annotated[str, "JSON array of row dicts"],
+    column: Annotated[str, "Numeric column name"],
+    group_by: Annotated[str, "Column to group by, or empty string"] = "",
+) -> str:
+    """Compute mean ± SD of a numeric column, optionally by group."""
+    rows = json.loads(data_json)
+    df = pd.DataFrame(rows)
+    if column not in df.columns:
+        return f"[column '{column}' not found]"
+    df[column] = pd.to_numeric(df[column], errors="coerce")
+    if group_by and group_by in df.columns:
+        lines: list[str] = []
+        for grp, sub in df.groupby(group_by):
+            m, s = sub[column].mean(), sub[column].std()
+            lines.append(f"  {grp}: {m:.2f} ± {s:.2f} (n={sub[column].notna().sum()})")
+        return "\n".join(lines)
+    m, s = df[column].mean(), df[column].std()
+    return f"{m:.2f} ± {s:.2f} (n={df[column].notna().sum()})"
+
+
+@tool
+def compute_crosstab(
+    data_json: Annotated[str, "JSON array of row dicts"],
+    row_column: Annotated[str, "Column whose values become rows"],
+    col_column: Annotated[str, "Column whose values become columns"],
+) -> str:
+    """Cross-tabulate two categorical columns, return Markdown table."""
+    rows = json.loads(data_json)
+    df = pd.DataFrame(rows)
+    missing = [c for c in [row_column, col_column] if c not in df.columns]
+    if missing:
+        return f"[columns not found: {missing}]"
+    ct = pd.crosstab(df[row_column], df[col_column])
+    ct_pct = ct.div(ct.sum(axis=1), axis=0).mul(100).round(1)
+    col_headers = " | ".join(str(c) for c in ct.columns)
+    lines = [f"| {row_column} | {col_headers} |", "|" + "---|" * (len(ct.columns) + 1)]
+    for idx in ct.index:
+        cells = " | ".join(
+            f"{ct.loc[idx, c]} ({ct_pct.loc[idx, c]:.1f}%)" for c in ct.columns
+        )
+        lines.append(f"| {idx} | {cells} |")
+    return "\n".join(lines)
+
+
+@tool
+def compute_median_range(
+    data_json: Annotated[str, "JSON array of row dicts"],
+    column: Annotated[str, "Numeric column name"],
+    group_by: Annotated[str, "Column to group by, or empty string"] = "",
+) -> str:
+    """Compute median [min–max] of a numeric column, optionally by group."""
+    rows = json.loads(data_json)
+    df = pd.DataFrame(rows)
+    if column not in df.columns:
+        return f"[column '{column}' not found]"
+    df[column] = pd.to_numeric(df[column], errors="coerce")
+    if group_by and group_by in df.columns:
+        lines: list[str] = []
+        for grp, sub in df.groupby(group_by):
+            med, mn, mx = sub[column].median(), sub[column].min(), sub[column].max()
+            lines.append(f"  {grp}: {med:.1f} [{mn:.0f}\u2013{mx:.0f}] (n={sub[column].notna().sum()})")
+        return "\n".join(lines)
+    med, mn, mx = df[column].median(), df[column].min(), df[column].max()
+    return f"{med:.1f} [{mn:.0f}\u2013{mx:.0f}] (n={df[column].notna().sum()})"
+
+
+_RESOLVE_TOOLS    = [compute_proportion, compute_mean_sd, compute_crosstab, compute_median_range]
+_RESOLVE_TOOL_MAP = {t.name: t for t in _RESOLVE_TOOLS}
+_GROUP_HINTS_RESOLVE = ["treatment", "arm", "group", "intervention", "randomiz", "cohort", "stratum"]
+
+_RESOLVE_SYSTEM = """\
+You are a clinical data analyst. You have access to four statistical tools:
+  compute_proportion   – proportion / rate / recovery rate / response rate
+  compute_mean_sd      – mean ± SD of a numeric measurement
+  compute_crosstab     – cross-table of two categorical columns
+  compute_median_range – median [min–max] for skewed distributions
+
+Rules:
+- Call EXACTLY ONE tool per placeholder key listed below.
+- For proportions (rate, incidence, response) → compute_proportion.
+- For continuous measurements (score, age, weight) → compute_mean_sd or compute_median_range.
+- For two-way breakdowns → compute_crosstab.
+- The treatment/arm grouping column is: {group_col}.
+  Use it as group_by when clinically meaningful. If empty, omit group_by.
+- Only use column names from the "Dataset columns available" list.
+- The data_json must be a valid JSON array of row objects from the sample rows provided.
+- Do not invent or modify values.
+"""
+
+_RESOLVE_USER = """\
+Dataset columns available: {columns}
+
+Sample rows (up to 20):
+{sample_rows_json}
+
+For each placeholder below, call the appropriate tool to compute the value.
+Work through them one by one.
+
+Placeholders to compute:
+{placeholder_list}
+"""
+
+
+def _detect_group_col(df: pd.DataFrame) -> str:
+    for col in df.columns:
+        if any(h in col.lower() for h in _GROUP_HINTS_RESOLVE):
+            return col
+    return ""
+
+
+def _dispatch_tools(
+    df: pd.DataFrame,
+    placeholder_descriptions: dict[str, str],
+    llm: ChatOpenAI,
+) -> dict[str, str]:
+    """Dispatch tool-calling LLM to compute all placeholder values from df."""
+    if df.empty or not placeholder_descriptions:
+        return {}
+
+    group_col = _detect_group_col(df)
+    sample_json = df.head(20).to_json(orient="records", indent=2)
+    placeholder_list = "\n".join(
+        f"  - {k}: {v}" for k, v in placeholder_descriptions.items()
+    )
+
+    messages = [
+        SystemMessage(content=_RESOLVE_SYSTEM.format(
+            group_col=group_col if group_col else "(none detected — omit group_by)",
+        )),
+        HumanMessage(content=_RESOLVE_USER.format(
+            columns=list(df.columns),
+            sample_rows_json=sample_json,
+            placeholder_list=placeholder_list,
+        )),
+    ]
+
+    try:
+        response = llm.bind_tools(_RESOLVE_TOOLS).invoke(messages)
+    except Exception as exc:
+        logger.warning("[resolve] LLM dispatch failed: %s", exc)
+        return {}
+
+    full_data_json = df.to_json(orient="records")
+    results: dict[str, str] = {}
+
+    for tc in getattr(response, "tool_calls", []):
+        name, args = tc["name"], {**tc["args"], "data_json": full_data_json}
+        if name not in _RESOLVE_TOOL_MAP:
+            continue
+        try:
+            value = _RESOLVE_TOOL_MAP[name].invoke(args)
+        except Exception as exc:
+            logger.warning("[resolve] Tool %s failed: %s", name, exc)
+            continue
+        col = args.get("column") or args.get("row_column") or ""
+        col_l = col.lower()
+        matched = next(
+            (k for k, d in placeholder_descriptions.items()
+             if col_l in d.lower() or k.lower() in col_l),
+            next(iter(placeholder_descriptions), None),
+        )
+        if matched and matched not in results:
+            results[matched] = value
+            logger.info("[resolve] %s → %s", matched, str(value)[:80])
+
+    return results
 
 
 # ── GCS helpers ───────────────────────────────────────────────────────────────
@@ -304,6 +521,101 @@ def _run_analysis(
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.post("/resolve", response_model=ResolveResponse)
+def resolve(req: ResolveRequest) -> ResolveResponse:
+    """Pre-compute all {{placeholder}} values for a program before writing.
+
+    Reads the clinical manifest, dispatches LLM tool-calling once per CSV
+    source, and saves the resolved values to GCS as
+    ``{program_prefix}/analysis/placeholder_values.json``.
+
+    The content_worker calls this between the template step and every writer
+    pass so that all three passes (Module 5, 2.7, 2.5) use the same numbers.
+    """
+    bucket = req.bucket or _DEFAULT_BUCKET
+    if not bucket:
+        raise HTTPException(status_code=422, detail="bucket is required.")
+
+    prefix   = _program_prefix(req.therapeutic_area, req.disease_type, req.drug_name)
+    manifest = _load_manifest(bucket, prefix)
+
+    if not manifest:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"No clinical manifest found for "
+                f"{req.therapeutic_area}/{req.disease_type}/{req.drug_name}. "
+                "Upload clinical data first."
+            ),
+        )
+
+    filter_keys: set[str] | None = set(req.placeholder_keys) if req.placeholder_keys else None
+
+    # Build placeholder metadata from manifest column_mappings
+    placeholder_meta: dict[str, dict] = {}
+    for source in manifest.get("sources", []):
+        gcs_path = source.get("gcs_path", "")
+        for mapping in source.get("column_mappings", []):
+            pk = mapping.get("placeholder_key", "")
+            cn = mapping.get("column_name", "")
+            if pk and cn and (filter_keys is None or pk in filter_keys):
+                placeholder_meta[pk] = {
+                    "gcs_path":    gcs_path,
+                    "description": f"{mapping.get('role', '')} — column: {cn}",
+                }
+
+    saved_path = f"{prefix}/analysis/placeholder_values.json"
+
+    if not placeholder_meta:
+        _gcs_client().bucket(bucket).blob(saved_path).upload_from_string(
+            json.dumps({}), content_type="application/json"
+        )
+        return ResolveResponse(
+            resolved_values={}, saved_path=f"gs://{bucket}/{saved_path}",
+            keys_resolved=0,
+        )
+
+    # Group by CSV source so each file is loaded only once
+    file_groups: dict[str, dict[str, str]] = {}
+    for pk, meta in placeholder_meta.items():
+        file_groups.setdefault(meta["gcs_path"], {})[pk] = meta["description"]
+
+    llm_client = _llm()
+    resolved: dict[str, str] = {}
+
+    for gcs_path, ph_descriptions in file_groups.items():
+        df = _load_csv(bucket, gcs_path)
+        if df is None or df.empty:
+            logger.warning("[resolve] Skipping empty/missing CSV: %s", gcs_path)
+            continue
+        computed = _dispatch_tools(df, ph_descriptions, llm_client)
+        resolved.update(computed)
+        logger.info(
+            "[resolve] %s: resolved %d/%d keys",
+            gcs_path, len(computed), len(ph_descriptions),
+        )
+
+    keys_failed = [pk for pk in placeholder_meta if pk not in resolved]
+    if keys_failed:
+        logger.warning("[resolve] %d keys unresolved: %s", len(keys_failed), keys_failed)
+
+    try:
+        _gcs_client().bucket(bucket).blob(saved_path).upload_from_string(
+            json.dumps(resolved, indent=2), content_type="application/json"
+        )
+        logger.info("[resolve] Saved %d values to gs://%s/%s", len(resolved), bucket, saved_path)
+    except Exception as exc:
+        logger.error("[resolve] GCS save failed: %s", exc)
+        raise HTTPException(status_code=500, detail=f"Failed to save resolved values: {exc}") from exc
+
+    return ResolveResponse(
+        resolved_values=resolved,
+        saved_path=f"gs://{bucket}/{saved_path}",
+        keys_resolved=len(resolved),
+        keys_failed=keys_failed,
+    )
 
 
 @app.post("/analyze", response_model=AnalysisResult)

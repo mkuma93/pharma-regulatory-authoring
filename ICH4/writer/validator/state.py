@@ -28,6 +28,10 @@ class ValidatorState(BaseModel):
     # Consensus value per field (most common across sections)
     canonical_values: dict[str, str] = Field(default_factory=dict)
 
+    # Pre-computed ground-truth values from clinical-analyst /resolve
+    # {placeholder_key: computed_string}  e.g. {"recovery_rate": "71.2% (127/178)"}
+    resolved_values: dict[str, str] = Field(default_factory=dict)
+
     # Legacy compat
     drug_name_found: str = ""
 

@@ -550,6 +550,10 @@ def llm_deep_check(state: ValidatorState, llm: ChatOpenAI) -> dict:
         cv_text = ", ".join(f"{k}={v}" for k, v in state.canonical_values.items())
         digest += f"\n\nCross-section consensus values: {cv_text}"
 
+    if state.resolved_values:
+        rv_text = "\n".join(f"  {k}: {v}" for k, v in state.resolved_values.items())
+        digest += f"\n\nGround-truth values (from clinical data — must match written text):\n{rv_text}"
+
     messages = [
         SystemMessage(content=_CONSISTENCY_SYSTEM),
         HumanMessage(content=f"Section excerpts:\n\n{digest}"),
