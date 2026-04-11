@@ -1,153 +1,181 @@
 # pharma-regulatory-authoring
 
-LLM-powered platform for ICH M4 CTD (Common Technical Document) regulatory authoring. Automates the generation, population, and cross-module validation of pharmaceutical submission documents using clinical trial data and ICH guidelines.
+LLM-powered platform for ICH M4(R4) CTD (Common Technical Document) regulatory authoring. Automates folder structure generation, clinical data integration, section content generation, and cross-module validation using ICH guidelines and real trial data.
 
 ---
 
 ## Architecture
 
 ```
-                        ┌─────────────────────┐
-                        │   clinical data CSV  │
-                        │  (uploaded per drug) │
-                        └────────┬────────────┘
-                                 │ POST /clinical-data/upload
-                                 ▼
-┌──────────────┐     ┌─────────────────────┐     ┌──────────────────┐
-│  ICH4 Index  │────▶│  ICH4 Template      │────▶│  ICH4 Writer     │
-│  (guidelines)│     │  (section templates)│     │  (doc generation)│
-└──────────────┘     └─────────────────────┘     └──────────┬───────┘
-                                                             │
-                     ┌───────────────────────────────────────▼──────┐
-                     │              ICH4 Content Worker              │
-                     │         (Pub/Sub orchestration)               │
-                     └───────────────────────────────────────────────┘
+User (browser)
+     │
+     ▼
+┌────────────────────────────────────────┐
+│           reguatory-ui                 │
+│  Gradio chat shell + LangGraph         │
+│  coordinator (intent classification)   │
+└──────┬──────────┬───────────┬──────────┘
+       │          │           │
+       ▼          ▼           ▼
+┌──────────┐ ┌──────────┐ ┌──────────────────┐
+│ ctd-api  │ │ich4-orch.│ │clinical-analyst  │
+│ FastAPI  │ │FastAPI   │ │FastAPI           │
+│ (struct) │ │(template)│ │(CSV stats + LLM) │
+└──────────┘ └────┬─────┘ └──────────────────┘
+                  │
+            ┌─────▼──────┐
+            │ ich4-writer │
+            │ FastAPI     │
+            │ (doc gen +  │
+            │  validator) │
+            └─────┬───────┘
+                  │ Pub/Sub
+            ┌─────▼──────────────┐
+            │ ich4-content-worker│
+            │ (Pub/Sub consumer) │
+            └────────────────────┘
+                  │
+            ┌─────▼──────┐
+            │ ich4-index  │
+            │ (ICH guide- │
+            │  lines RAG) │
+            └────────────┘
 ```
 
-### Services
-
-| Service | Path | Cloud Run | Description |
-|---|---|---|---|
-| **ICH4 Index** | `ICH4/index/` | `ich4-index` | Semantic search over ICH guidelines (LlamaIndex + GCS) |
-| **ICH4 Template** | `ICH4/template/` | `ich4-template` | LLM-powered CTD section template generation with rich few-shot examples |
-| **ICH4 Writer** | `ICH4/writer/` | `ich4-writer` | Fills templates with clinical data; includes Data Analyst Agent and cross-module validator |
-| **ICH4 Content Worker** | `ICH4/content_worker/` | `ich4-content-worker` | Pub/Sub-driven orchestration across template → writer pipeline |
-| **ICH4 Orchestrator** | `ICH4/orchestrator/` | `ich4-orchestrator` | End-to-end job orchestration |
-| **CTD Structure** | `ctd_structure/` | `ctd-structure` | ICH M4 folder scaffold generator |
+All services are **Cloud Run** (stateless). Session state and documents live in **GCS**.
 
 ---
 
-## Key Features
+## Services
 
-### Clinical Data Upload
-Upload a CSV (any schema) for a specific drug/program:
+| Service | Directory | Cloud Run name | Port | Role |
+|---|---|---|---|---|
+| **UI** | `ui/` | `reguatory-ui` | 8080 | Gradio chat + LangGraph coordinator |
+| **CTD API** | `ctd_structure/api/` | `ctd-api` | 8081 | CTD structure, scaffold, Pub/Sub dispatch |
+| **ICH4 Orchestrator** | `ICH4/orchestrator/` | `ich4-orchestrator` | 8082 | End-to-end template generation jobs |
+| **ICH4 Writer** | `ICH4/writer/` | `ich4-writer` | 8083 | Section writing, data analyst, validator |
+| **Clinical Analyst** | `clinical-analyst/` | `clinical-analyst` | 8084 | Clinical CSV analysis (pandas + GPT-4o) |
+| **ICH4 Content Worker** | `ICH4/content_worker/` | `ich4-content-worker` | — | Pub/Sub-driven pipeline worker |
+| **ICH4 Index** | `ICH4/index/` | `ich4-index` | 8080 | Semantic search over ICH guidelines (RAG) |
+| **ICH4 Template** | `ICH4/template/` | `ich4-template` | 8080 | ICH-grounded section template generator |
+
+> `ctd_structure/deploy/app.py` — legacy monolith (being deprecated; replaced by `ui/` + `ctd_structure/api/`)
+
+---
+
+## Intent Routing
+
+The `reguatory-ui` coordinator classifies every user message into one of these intents and routes it to the correct downstream service:
+
+| Intent | Downstream call | Description |
+|---|---|---|
+| `extract` | `POST ctd-api/extract` | Publish extraction job to Pub/Sub; builds ICH M4 folder hierarchy |
+| `approve` | `POST ctd-api/approve` | Commit folder structure as shared canonical template in GCS |
+| `disapprove` | `POST ctd-api/disapprove` | Enter feedback loop for targeted ICH re-query |
+| `copy` | `POST ctd-api/copy` | Scaffold canonical template into a program directory |
+| `write` | `POST ctd-api/write` | Publish content-generation job to Pub/Sub |
+| `status` | `GET ctd-api/status_query` | Human-readable extraction + content job status |
+| `generate_template` | `POST ich4-orchestrator/generate` | Preview ICH-grounded templates for a program (no write) |
+| `rewrite_section` | `POST ich4-writer/write` | Regenerate specific CTD section documents |
+| `analyze_data` | `POST clinical-analyst/analyze` | Statistical + narrative analysis of clinical CSV data |
+| `clarify` / `help` | _(handled in UI, no API call)_ | Coordinator asks for more info or shows help |
+
+---
+
+## GCS Layout
+
 ```
-POST /clinical-data/upload
-  file               = trial.csv
-  therapeutic_area   = neurology
-  disease_type       = bells_palsy
-  drug_name          = prednisolone
-  bucket_name        = my-gcs-bucket
-```
-The LLM mapper automatically identifies column roles, CTD section keys, and `{{placeholder}}` names and stores a `manifest.json` alongside the CSV in GCS. Each drug gets its own isolated path:
-```
-gs://bucket/therapeutic-area/neurology/bells_palsy/prednisolone/
-  clinical_data/
-    trial.csv
-    manifest.json
+gs://pharma-reguatory-author-life-science/
+├── ctd_structure/
+│   ├── ctd/                              # Canonical ICH M4 folder template (.keep markers)
+│   └── users/{session_id}/
+│       ├── session_state.json
+│       ├── extraction_status.json
+│       └── ctd/                          # Per-user draft structure
+└── therapeutic-area/
+    └── {ta}/{disease}/{drug}/
+        ├── ctd/                          # Scaffolded program folder structure
+        ├── clinical_data/
+        │   ├── {trial}.csv
+        │   └── manifest.json             # Column mappings + CTD section keys
+        ├── templates/                    # ICH-grounded section templates
+        ├── documents/                    # Generated CTD section documents
+        └── content_status/
+            └── latest.json              # Content generation job status
 ```
 
-### Data Analyst Agent (Option C — Hybrid)
-Sits between raw CSV data and the writer LLM. Four deterministic pandas tools, dispatched by LLM:
+---
 
-| Tool | Output example |
+## Key Components
+
+### LangGraph Coordinator (`ui/main.py`, shared by UI)
+Two-node graph: `understand` → `decide`.
+- **understand**: classifies intent + extracts slots (ta, disease, drug, section_keys, module_filter)
+- **decide**: checks prerequisites; returns `outcome=clarify` if anything is missing, `outcome=proceed` otherwise
+
+### CTD API (`ctd_structure/api/api_app.py`)
+Pure action executor. Every endpoint returns:
+```json
+{ "reply": "<markdown for chat>", "state_patch": { "<key>": "<value>" } }
+```
+`state_patch` is merged into `gr.State` in the UI — this is how e.g. `folder_paths`, `content_program`, and `awaiting_feedback` propagate back to the browser session.
+
+### Clinical Analyst (`clinical-analyst/app.py`)
+Reads clinical CSV from GCS via `manifest.json`, computes per-column pandas stats, then calls GPT-4o for a structured narrative:
+- `POST /analyze` — demographics, efficacy, safety, benefit-risk synthesis
+- `POST /query` — free-form Q&A over the data
+
+### Data Analyst Agent (`ICH4/writer/writer/data_analyst.py`)
+Four deterministic pandas tools dispatched by LLM (no free code generation):
+
+| Tool | Example output |
 |---|---|
-| `compute_proportion` | `71.2% (127/178)` or by-group table |
+| `compute_proportion` | `71.2% (127/178)` |
 | `compute_mean_sd` | `2.1 ± 0.8 (n=178)` |
-| `compute_crosstab` | Markdown table (treatment × outcome counts) |
+| `compute_crosstab` | Markdown table |
 | `compute_median_range` | `57.5 [40–77] (n=8)` |
 
-No free Python code is generated — the LLM only dispatches to pre-coded tools.
-
-### Cross-Module Validator
-LangGraph-based consistency checker that runs after writing. Catches:
-- Drug name mismatches across sections
-- Demographic inconsistencies (warning)
-- Efficacy stat discrepancies (error)
-- Unfilled `{{placeholders}}` / `[DATA PENDING]` markers
-
-### ICH4 Index
-Semantic search over ICH M4 guidelines (E3, E9, M4, M4E, M4Q, M4S, S6, S7A, S9) using LlamaIndex + OpenAI embeddings, stored in GCS. Powers the context injection step during template generation.
+### Cross-Module Validator (`ICH4/writer/validator/`)
+LangGraph graph that runs after writing. Catches drug name mismatches, demographic inconsistencies, efficacy stat discrepancies, and unfilled `{{placeholder}}` markers across modules.
 
 ---
 
 ## GCP Infrastructure
 
-- **Project**: `pharma-reguatory-author`
-- **Region**: `us-central1`
-- **Services**: Cloud Run (all microservices)
-- **Storage**: GCS buckets per service
-- **Secrets**: Secret Manager (`OPENAI_API_KEY`, `LLAMA_CLOUD_API_KEY`)
-- **Messaging**: Pub/Sub (`ctd-extraction-push` topic/subscription)
-
----
-
-## Local Development
-
-### Prerequisites
-- Python 3.12+
-- `gcloud` CLI authenticated
-- OpenAI API key
-
-### Run a service locally
-
-```bash
-# Writer service
-cd ICH4/writer
-pip install -r requirements.txt
-OPENAI_API_KEY=sk-... GCP_PROJECT_ID=pharma-reguatory-author \
-  python3 -m uvicorn api.app:app --host 127.0.0.1 --port 8080
-
-# Template service
-cd ICH4/template
-pip install -r requirements.txt
-OPENAI_API_KEY=sk-... GCP_PROJECT_ID=pharma-reguatory-author \
-  python3 -m uvicorn api.app:app --host 127.0.0.1 --port 8081
-```
-
-### Run tests
-
-```bash
-# Writer (68 tests)
-cd ICH4/writer && python3 -m pytest tests/ -v
-
-# Template
-cd ICH4/template && python3 -m pytest tests/ -v
-
-# Index
-cd ICH4/index && python3 -m pytest tests/ -v
-```
+| Resource | Value |
+|---|---|
+| Project | `pharma-reguatory-author` |
+| Region | `us-central1` |
+| Compute | Cloud Run (all services, min-instances=0) |
+| Storage | GCS bucket `pharma-reguatory-author-life-science` |
+| Messaging | Pub/Sub topics: `ctd-extraction`, `ich4-content-generation` |
+| Secrets | Secret Manager: `OPENAI_API_KEY` |
+| Registry | Artifact Registry `us-central1-docker.pkg.dev/pharma-reguatory-author/cloud-run-source-deploy` |
 
 ---
 
 ## Deploy
 
-Each service has its own deploy script:
+Each service has its own `cloudbuild.yaml`. Submit from the **repo root**:
 
 ```bash
-# CTD Structure service
-cd ctd_structure/deploy && bash tasks.sh deploy
+# UI (Gradio + coordinator)
+gcloud builds submit . --config=ui/cloudbuild.yaml
+
+# CTD API (structure backend)
+gcloud builds submit . --config=ctd_structure/api/cloudbuild.yaml
+
+# Clinical Analyst
+gcloud builds submit . --config=clinical-analyst/cloudbuild.yaml
 
 # ICH4 Index
-cd ICH4/index && bash deploy.sh
+gcloud builds submit . --config=ICH4/index/cloudbuild.yaml
 
 # ICH4 Writer
-cd ICH4/writer && bash deploy.sh
+gcloud builds submit . --config=ICH4/writer/cloudbuild.yaml  # (see ICH4/writer/deploy.sh)
 
-# Rebuild ICH4 knowledge index
-cd ICH4/index
-set -a && source config/.env && set +a
-python3 scripts/build_index.py
+# ICH4 Orchestrator
+gcloud builds submit . --config=ICH4/orchestrator/cloudbuild.yaml
 ```
 
 ---
@@ -156,30 +184,39 @@ python3 scripts/build_index.py
 
 ```
 life-science/
+├── ui/                         # Gradio UI + LangGraph coordinator
+│   ├── app.py                  # Gradio shell, intent routing, API calls
+│   ├── main.py                 # LangGraph coordinator (understand → decide)
+│   ├── Dockerfile
+│   └── cloudbuild.yaml
+├── ctd_structure/
+│   ├── api/                    # FastAPI action backend (CTD operations)
+│   │   ├── api_app.py
+│   │   ├── Dockerfile
+│   │   └── cloudbuild.yaml
+│   ├── deploy/                 # Legacy monolith (being deprecated)
+│   ├── scaffold.py             # GCS folder marker writer
+│   └── structure.py            # ICH M4 structure extractor + refiner
+├── clinical-analyst/           # Clinical data analysis service
+│   ├── app.py
+│   ├── Dockerfile
+│   └── cloudbuild.yaml
 ├── ICH4/
-│   ├── index/           # Semantic search over ICH guidelines
-│   ├── template/        # CTD section template generator
-│   ├── writer/          # Document writer + validator + data analyst
-│   │   ├── writer/
-│   │   │   ├── clinical_uploader.py   # CSV upload + LLM mapper
-│   │   │   ├── clinical_reader.py     # Manifest → analyst → writer context
-│   │   │   ├── data_analyst.py        # 4 pandas tools + LLM dispatcher
-│   │   │   ├── generator.py           # Section writer
-│   │   │   └── models.py
-│   │   ├── validator/                 # LangGraph cross-module validator
-│   │   └── api/routes/
-│   │       ├── write.py               # POST /write
-│   │       ├── validate.py            # POST /validate
-│   │       └── upload.py              # POST /clinical-data/upload
-│   ├── orchestrator/    # End-to-end job orchestration
-│   └── content_worker/  # Pub/Sub worker
-├── ctd_structure/       # ICH M4 folder scaffold generator
-├── clinical/            # CSV → CTD column mapper models
-└── config/              # Shared settings
+│   ├── index/                  # ICH guidelines RAG (LlamaIndex + GCS)
+│   ├── template/               # ICH-grounded template generator
+│   ├── writer/                 # Document writer + data analyst + validator
+│   ├── orchestrator/           # End-to-end job orchestrator
+│   └── content_worker/         # Pub/Sub consumer worker
+├── clinical/                   # Clinical CSV → CTD column mapper
+├── config/                     # Shared settings
+├── Findings/                   # Presentation assets
+└── tests/
+    ├── test_ctd_structure/
+    └── test_knowledge/
 ```
 
 ---
 
 ## Clinical Data Privacy
 
-Patient-level CSV files are **not committed** to this repository (excluded via `.gitignore`). Upload them at runtime via `POST /clinical-data/upload` — they are stored securely in your GCS bucket under the program/drug path.
+Patient-level CSV files are **not committed** to this repository (excluded via `.gitignore`). Upload them at runtime via the **🔬 Clinical Data Upload** panel in the UI, or directly via `POST ctd-api/upload_clinical`. Files are stored in GCS under `therapeutic-area/{ta}/{disease}/{drug}/clinical_data/`.
