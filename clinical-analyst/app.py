@@ -29,11 +29,13 @@ import io
 import json
 import logging
 import os
+import uuid
+from datetime import datetime, timezone
 from typing import Annotated, Any
 
 import pandas as pd
-from fastapi import FastAPI, HTTPException
-from google.cloud import storage
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from google.cloud import pubsub_v1, storage
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
@@ -44,9 +46,12 @@ logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-_DEFAULT_BUCKET = os.environ.get("GCS_BUCKET", "pharma-reguatory-author-life-science")
-_LLM_MODEL      = os.environ.get("LLM_MODEL", "gpt-4o-mini")
-_MAX_ROWS       = int(os.environ.get("MAX_ANALYSIS_ROWS", "1000"))
+_DEFAULT_BUCKET         = os.environ.get("GCS_BUCKET", "pharma-reguatory-author-life-science")
+_LLM_MODEL              = os.environ.get("LLM_MODEL", "gpt-4o-mini")
+_MAX_ROWS               = int(os.environ.get("MAX_ANALYSIS_ROWS", "1000"))
+_GCP_PROJECT            = os.environ.get("GCP_PROJECT_ID", "pharma-reguatory-author")
+_CONTENT_PUBSUB_TOPIC   = os.environ.get("CONTENT_PUBSUB_TOPIC", "ich4-content-generation")
+_CONTENT_STATUS_TIMEOUT = int(os.environ.get("CONTENT_STATUS_TIMEOUT_SECONDS", str(30 * 60)))
 
 # ── FastAPI app ───────────────────────────────────────────────────────────────
 
@@ -647,6 +652,223 @@ def query(req: QueryRequest) -> AnalysisResult:
         bucket_name=bucket,
         question=req.question,
         query_mode=True,
+    )
+
+
+# ── Content generation trigger + status ──────────────────────────────────────
+#
+# These endpoints were previously part of ctd-structure/api (out of scope there).
+# Clinical-analyst owns:
+#   • Checking whether clinical data is present before generating content
+#   • Publishing the content-generation job to Pub/Sub
+#   • Reading back the content-generation status written by content_worker
+
+
+class TriggerRequest(BaseModel):
+    session_id: str
+    bucket: str | None = Field(default=None)
+    therapeutic_area: str
+    disease_type: str
+    drug_name: str
+    force_no_clinical: bool = Field(
+        default=False,
+        description="Proceed even when no clinical manifest is found.",
+    )
+    state: dict = Field(default_factory=dict)
+
+
+class ActionResponse(BaseModel):
+    """Standard reply + state-patch shape used across all services."""
+    reply: str
+    state_patch: dict = Field(default_factory=dict)
+
+
+def _publish_content_generation(
+    bucket: str, ta: str, dis: str, drug: str, session_id: str
+) -> str:
+    run_id    = str(uuid.uuid4())
+    publisher = pubsub_v1.PublisherClient()
+    topic     = publisher.topic_path(_GCP_PROJECT, _CONTENT_PUBSUB_TOPIC)
+    payload   = json.dumps({
+        "bucket":     bucket,
+        "session_id": session_id,
+        "run_id":     run_id,
+        "program": {
+            "therapeutic_area": ta,
+            "disease_type":     dis,
+            "drug_name":        drug,
+        },
+    }).encode()
+    publisher.publish(topic, payload).result(timeout=10)
+    return run_id
+
+
+def _summarise_clinical_manifest(manifest: dict) -> str:
+    sources = manifest.get("sources", [])
+    if not sources:
+        return "_(manifest found but no datasets registered)_"
+    lines = [f"📋 **{len(sources)} clinical dataset(s) registered:**\n"]
+    for src in sources:
+        cols    = src.get("column_mappings", [])
+        secs    = src.get("ctd_section_keys", [])
+        sec_str = ", ".join(sorted(secs)[:5]) or "—"
+        lines.append(
+            f"- **{src.get('filename', '?')}** — {src.get('study_type', '?')} study "
+            f"({len(cols)} mapped columns → CTD sections: {sec_str})"
+        )
+        endpoints = [f"`{m['placeholder_key']}`" for m in cols[:6]]
+        if endpoints:
+            more = f" + {len(cols) - 6} more" if len(cols) > 6 else ""
+            lines.append(f"  Endpoints mapped: {', '.join(endpoints)}{more}")
+    return "\n".join(lines)
+
+
+def _load_content_status(bucket: str, ta: str, dis: str, drug: str) -> dict:
+    prefix  = f"{_program_prefix(ta, dis, drug)}/content_status/"
+    bkt_obj = _gcs_client().bucket(bucket)
+    try:
+        raw = bkt_obj.blob(f"{prefix}latest.json").download_as_text()
+        job = json.loads(raw)
+    except Exception:
+        job = None
+    if job is None:
+        try:
+            blobs = sorted(
+                bkt_obj.list_blobs(prefix=prefix),
+                key=lambda b: b.updated or b.time_deleted,
+                reverse=True,
+            )
+            for blob in blobs:
+                if blob.name.endswith(".json"):
+                    job = json.loads(blob.download_as_text())
+                    break
+        except Exception:
+            pass
+    if job is None:
+        return {}
+    if job.get("status") == "running":
+        updated_at = job.get("updated_at")
+        if updated_at:
+            try:
+                age = (datetime.now(timezone.utc) -
+                       datetime.fromisoformat(updated_at)).total_seconds()
+                if age > _CONTENT_STATUS_TIMEOUT:
+                    return {"status": "timed_out", "age_minutes": round(age / 60)}
+            except Exception:
+                pass
+    return job
+
+
+@app.post("/trigger", response_model=ActionResponse)
+def trigger(req: TriggerRequest) -> ActionResponse:
+    """Trigger CTD content generation for a drug program.
+
+    1. If ``force_no_clinical`` is False, verifies clinical data is loaded.
+       Returns a confirmation prompt when data is missing.
+    2. Publishes a message to the ``ich4-content-generation`` Pub/Sub topic.
+    3. Returns reply text + state_patch for the chat UI.
+
+    Moved here from ``ctd-structure/api`` where it was out of scope.
+    """
+    bucket = (req.bucket or _DEFAULT_BUCKET).strip()
+    if not bucket:
+        raise HTTPException(status_code=422, detail="bucket is required.")
+
+    ta   = req.therapeutic_area.strip()
+    dis  = req.disease_type.strip()
+    drug = req.drug_name.strip()
+
+    if not req.force_no_clinical:
+        manifest = _load_manifest(bucket, _program_prefix(ta, dis, drug))
+        if not manifest or not manifest.get("sources"):
+            return ActionResponse(
+                reply=(
+                    f"⚠️ **No clinical data found** for **{ta} / {dis} / {drug}**.\n\n"
+                    "Without clinical data, all `{{placeholder}}` values will appear as "
+                    "`{{placeholder}} [NOT FILLED]` and will need manual editing.\n\n"
+                    "**Options:**\n"
+                    "- Say **yes, proceed** to generate content with empty placeholders.\n"
+                    "- Say **cancel** to stop and upload clinical data first."
+                ),
+                state_patch={
+                    "awaiting_write_confirm": {"ta": ta, "dis": dis, "drug": drug},
+                },
+            )
+        summary = _summarise_clinical_manifest(manifest)
+        msg_prefix = f"{summary}\n\n✅ Content generation will use this real clinical data. Queuing now…\n\n"
+    else:
+        msg_prefix = "⚠️ Proceeding without clinical data — placeholders will appear as `[NOT FILLED]`.\n\n"
+
+    try:
+        run_id = _publish_content_generation(bucket, ta, dis, drug, req.session_id)
+    except Exception as exc:
+        logger.error("[trigger] Pub/Sub publish failed: %s", exc)
+        raise HTTPException(status_code=500, detail=f"Failed to queue content job: {exc}") from exc
+
+    patch = {
+        "awaiting_write_confirm": None,
+        "content_run_id":  run_id,
+        "content_program": {"ta": ta, "dis": dis, "drug": drug},
+    }
+    return ActionResponse(
+        reply=(
+            f"{msg_prefix}"
+            f"⏳ Content generation queued for **{ta} / {dis} / {drug}** (run `{run_id[:8]}…`).\n\n"
+            "The worker will:\n"
+            "1. Query ICH guidelines (index service)\n"
+            "2. Load the clinical datasets listed above\n"
+            "3. Generate section templates and fill placeholders with real data\n"
+            "4. Validate all CTD sections\n\n"
+            "This usually takes 5–10 minutes. Ask me **content status** to check progress."
+        ),
+        state_patch=patch,
+    )
+
+
+@app.get("/content_status", response_model=ActionResponse)
+def content_status(
+    ta: str, dis: str, drug: str,
+    bucket: str = _DEFAULT_BUCKET,
+) -> ActionResponse:
+    """Return current content-generation status for a program."""
+    job    = _load_content_status(bucket, ta, dis, drug)
+    status = job.get("status")
+
+    if status == "running":
+        pass_label = job.get("pass_label", "")
+        pass_num   = job.get("pass_number", "")
+        total      = job.get("total_passes", 3)
+        step_info  = f"Pass {pass_num}/{total}: **{pass_label}**" if pass_label else "Initialising…"
+        return ActionResponse(
+            reply=(
+                f"⏳ **Content generation is running** — {step_info}\n\n"
+                "Ask me **status** again in a minute to check progress."
+            ),
+            state_patch={},
+        )
+    if status == "done":
+        return ActionResponse(
+            reply=(
+                "✅ **Content generation is complete.** "
+                "All three passes (Module 5 → 2.7 → 2.5 overviews) finished successfully.\n\n"
+                "Say **generate content** to regenerate with updated clinical data."
+            ),
+            state_patch={"content_run_id": None},
+        )
+    if status == "failed":
+        return ActionResponse(
+            reply=(
+                f"❌ **Content generation failed** — {job.get('error', 'unknown')}\n\n"
+                "Say **generate content** to re-run."
+            ),
+            state_patch={"content_run_id": None},
+        )
+    return ActionResponse(
+        reply=(
+            f"No content generation job has been queued yet for **{ta} / {dis} / {drug}**.\n\n"
+            "Say **generate content** to start the 3-pass pipeline."
+        ),
+        state_patch={},
     )
 
 

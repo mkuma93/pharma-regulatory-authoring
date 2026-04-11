@@ -19,7 +19,7 @@ Routing table
   intent == "approve"    → POST ctd-api/approve
   intent == "disapprove" → POST ctd-api/disapprove
   intent == "copy"       → POST ctd-api/copy
-  intent == "write"      → POST ctd-api/write
+  intent == "write"      → POST clinical-analyst/trigger
   intent == "status"     → GET  ctd-api/status_query
   clarify / help         → handled directly (coordinator already has the reply)
 
@@ -186,7 +186,7 @@ def chat(message: str, history: list, state: dict, bucket: str, reviewer_email: 
 
     history.append({"role": "user", "content": message})
 
-    # ── Short-circuit: disapproval feedback loop ──────────────────────────────
+    # ── Short-circuit: disapproval feedback loop ──────────────────────────────#
     _EXTRACT_KW = ("re-extract", "reextract", "re extract", "extract", "rebuild", "refresh")
     _ESCAPE_KW  = ("generate", "content", "status", "copy", "write", "approve",
                    "scaffold", "set up", "setup", "template", "analyse", "analyze",
@@ -222,7 +222,7 @@ def chat(message: str, history: list, state: dict, bucket: str, reviewer_email: 
         if any(msg_lower.startswith(w) for w in _YES):
             history.append({"role": "assistant", "content": "_Queuing…_"})
             yield history, state, gr.update(value="")
-            result = _ctd_post("/write", {
+            result = _analyst_post("/trigger", {
                 "session_id":        session_id,
                 "bucket":            bkt,
                 "therapeutic_area":  ta_p,
@@ -301,7 +301,7 @@ def chat(message: str, history: list, state: dict, bucket: str, reviewer_email: 
         })
 
     elif intent == "write":
-        result = _ctd_post("/write", {
+        result = _analyst_post("/trigger", {
             "session_id":              session_id,
             "bucket":                  bkt,
             "therapeutic_area":        decision.therapeutic_area,
@@ -526,9 +526,9 @@ def _upload_clinical_csv(csv_file, ta: str, dis: str, drug: str, bucket: str) ->
     try:
         with open(local_path, "rb") as f:
             resp = requests.post(
-                f"{_CTD_API_URL.rstrip('/')}/upload_clinical",
-                data={"ta": ta, "dis": dis, "drug": drug, "bucket": bkt},
-                files={"csv_file": (os.path.basename(local_path), f, "text/csv")},
+                f"{_ICH4_WRITER_URL.rstrip('/')}/clinical-data/upload",
+                data={"therapeutic_area": ta, "disease_type": dis, "drug_name": drug, "bucket_name": bkt},
+                files={"file": (os.path.basename(local_path), f, "text/csv")},
                 timeout=120,
             )
         resp.raise_for_status()

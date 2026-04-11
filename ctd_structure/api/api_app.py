@@ -14,12 +14,12 @@ Endpoints
   POST /disapprove       → set awaiting_feedback state
   POST /refine           → re-query ICH index for feedback-targeted repair
   POST /copy             → scaffold program folder in GCS
-  POST /write            → publish content-generation job to Pub/Sub
   GET  /status_query     → extraction + content status as a reply string
   GET  /status           → raw extraction + content status dicts (for auto-poll)
   GET  /session          → load session state + folder paths
-  POST /upload_clinical  → register a clinical CSV for a program
   GET  /health           → liveness probe
+
+  Content generation triggering and clinical CSV upload live in clinical-analyst.
 """
 from __future__ import annotations
 
@@ -30,8 +30,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Literal
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 # ── Path bootstrap ────────────────────────────────────────────────────────────
@@ -126,17 +125,6 @@ class CopyRequest(BaseModel):
     therapeutic_area: str
     disease_type: str
     drug_name: str
-    state: dict = {}
-
-
-class WriteRequest(BaseModel):
-    session_id: str
-    bucket: str = _DEFAULT_BUCKET
-    therapeutic_area: str
-    disease_type: str
-    drug_name: str
-    program_scaffold_exists: bool = False
-    force_no_clinical: bool = False  # True when user confirmed to proceed without clinical data
     state: dict = {}
 
 
@@ -308,15 +296,6 @@ def _check_program_exists(bucket: str, ta: str, dis: str, drug: str) -> bool:
         return False
 
 
-def _load_clinical_manifest(bucket: str, ta: str, dis: str, drug: str) -> dict | None:
-    path = f"{_program_prefix(ta, dis, drug)}/clinical_data/manifest.json"
-    try:
-        raw = _gcs_client.bucket(bucket).blob(path).download_as_text()
-        return json.loads(raw)
-    except Exception:
-        return None
-
-
 def _publish_extraction(bucket: str, ich_url: str,
                         reviewer_email: str | None, session_id: str) -> str:
     run_id    = str(uuid.uuid4())
@@ -333,25 +312,6 @@ def _publish_extraction(bucket: str, ich_url: str,
     return run_id
 
 
-def _publish_content_generation(bucket: str, ta: str, dis: str,
-                                  drug: str, session_id: str) -> str:
-    run_id    = str(uuid.uuid4())
-    publisher = pubsub_v1.PublisherClient()
-    topic     = publisher.topic_path(_GCP_PROJECT, _CONTENT_PUBSUB_TOPIC)
-    payload   = json.dumps({
-        "bucket":    bucket,
-        "session_id": session_id,
-        "run_id":    run_id,
-        "program": {
-            "therapeutic_area": ta,
-            "disease_type":     dis,
-            "drug_name":        drug,
-        },
-    }).encode()
-    publisher.publish(topic, payload).result(timeout=10)
-    return run_id
-
-
 def _fmt_tree_paths(paths: list[str]) -> str:
     lines = []
     for p in paths:
@@ -361,32 +321,12 @@ def _fmt_tree_paths(paths: list[str]) -> str:
     n_mod = sum(1 for p in paths if p.count("/") == 2)
     n_sec = sum(1 for p in paths if p.count("/") == 3)
     n_sub = sum(1 for p in paths if p.count("/") == 4)
-    lines.append(f"\n{n_mod} modules · {n_sec} sections · {n_sub} subsections  ({len(paths)} total paths)")
+    lines.append(f"\n{n_mod} modules \u00b7 {n_sec} sections \u00b7 {n_sub} subsections  ({len(paths)} total paths)")
     return "\n".join(lines)
 
 
-def _summarise_clinical_manifest(manifest: dict) -> str:
-    sources = manifest.get("sources", [])
-    if not sources:
-        return "_(manifest found but no datasets registered)_"
-    lines = [f"📋 **{len(sources)} clinical dataset(s) registered:**\n"]
-    for src in sources:
-        cols    = src.get("column_mappings", [])
-        secs    = src.get("ctd_section_keys", [])
-        sec_str = ", ".join(sorted(secs)[:5]) or "—"
-        lines.append(
-            f"- **{src.get('filename', '?')}** — {src.get('study_type', '?')} study "
-            f"({len(cols)} mapped columns → CTD sections: {sec_str})"
-        )
-        endpoints = [f"`{m['placeholder_key']}`" for m in cols[:6]]
-        if endpoints:
-            more = f" + {len(cols) - 6} more" if len(cols) > 6 else ""
-            lines.append(f"  Endpoints mapped: {', '.join(endpoints)}{more}")
-    return "\n".join(lines)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Internal: action handlers  (moved verbatim from app.py's _do_* functions)
+# # ═══════════════════════════════════════════════════════════════════════════════
+# Internal: action handlers  (scoped to CTD scaffolding only)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _handle_extract(state: dict, bucket: str, reviewer_email: str | None,
@@ -622,65 +562,6 @@ def _handle_copy(decision: CoordinatorDecision, state: dict, bucket: str) -> tup
     )
 
 
-def _handle_write(decision: CoordinatorDecision, state: dict, bucket: str) -> tuple[str, dict]:
-    ta         = decision.therapeutic_area.strip()
-    dis        = decision.disease_type.strip()
-    drug       = decision.drug_name.strip()
-    session_id = state.get("session_id", "default")
-
-    # Auto-scaffold if needed
-    if not state.get("program_scaffold_exists"):
-        canonical_paths = _load_canonical_paths(bucket)
-        if not canonical_paths:
-            return (
-                "❌ No default CTD structure has been established yet.\n\n"
-                "Say **extract** to build it, then **approve** to publish it.",
-                {},
-            )
-        try:
-            scaffolded_base = f"{_GCS_PROGRAMS}/{_slug(ta)}/{_slug(dis)}/{_slug(drug)}/ctd"
-            scaffold_in_gcs(_get_bucket(bucket), scaffolded_base, canonical_paths)
-            state = {**state, "program_scaffold_exists": True}
-        except Exception as exc:
-            return f"❌ Auto-scaffold failed: {exc}", {}
-
-    manifest = _load_clinical_manifest(bucket, ta, dis, drug)
-    if not manifest or not manifest.get("sources"):
-        patch = {
-            "awaiting_write_confirm": {"ta": ta, "dis": dis, "drug": drug},
-        }
-        return (
-            f"⚠️ **No clinical data found** for **{ta} / {dis} / {drug}**.\n\n"
-            "Without clinical data, all `{{placeholder}}` values will appear as "
-            "`{{placeholder}} [NOT FILLED]` and will need manual editing.\n\n"
-            "**Options:**\n"
-            "- Say **yes, proceed** to generate content with empty placeholders.\n"
-            "- Say **cancel** to stop and upload clinical data first.",
-            patch,
-        )
-
-    summary = _summarise_clinical_manifest(manifest)
-    run_id  = _publish_content_generation(bucket, ta, dis, drug, session_id)
-    patch = {
-        "content_run_id":  run_id,
-        "content_program": {"ta": ta, "dis": dis, "drug": drug},
-    }
-    _save_session_state(bucket, {**state, **patch})
-    return (
-        f"{summary}\n\n"
-        "✅ Content generation will use this real clinical data to fill in all placeholder values. "
-        f"Queuing now…\n\n"
-        f"⏳ Content generation queued for **{ta} / {dis} / {drug}** (run `{run_id[:8]}…`).\n\n"
-        "The worker will:\n"
-        "1. Query ICH guidelines (index service)\n"
-        "2. Load the clinical datasets listed above\n"
-        "3. Generate section templates and fill placeholders with real data\n"
-        "4. Validate all CTD sections\n\n"
-        "This usually takes 5–10 minutes. Ask me **content status** to check progress.",
-        patch,
-    )
-
-
 def _handle_status(state: dict, bucket: str, msg_lower: str) -> tuple[str, dict]:
     session_id = state.get("session_id", "default")
     job        = _load_extraction_status(bucket, session_id)
@@ -830,44 +711,6 @@ def copy(req: CopyRequest) -> ActionResponse:
     return ActionResponse(reply=reply, state_patch=patch)
 
 
-@app.post("/write", response_model=ActionResponse)
-def write(req: WriteRequest) -> ActionResponse:
-    state = {
-        **req.state,
-        "session_id":              req.session_id,
-        "program_scaffold_exists": req.program_scaffold_exists,
-    }
-    if req.force_no_clinical:
-        run_id = _publish_content_generation(
-            req.bucket, req.therapeutic_area, req.disease_type, req.drug_name, req.session_id
-        )
-        patch = {
-            "awaiting_write_confirm": None,
-            "content_run_id":  run_id,
-            "content_program": {"ta": req.therapeutic_area, "dis": req.disease_type, "drug": req.drug_name},
-        }
-        _save_session_state(req.bucket, {**state, **patch})
-        ta, dis, drug = req.therapeutic_area, req.disease_type, req.drug_name
-        return ActionResponse(
-            reply=(
-                f"⏳ Content generation queued for **{ta} / {dis} / {drug}** "
-                f"(run `{run_id[:8]}…`).\n\n"
-                "⚠️ Placeholder values will appear as `{{key}} [NOT FILLED]` — "
-                "edit manually after generation, or register clinical data and regenerate.\n\n"
-                "Ask me **content status** to check progress."
-            ),
-            state_patch=patch,
-        )
-    decision = CoordinatorDecision(
-        outcome="proceed", intent="write",
-        therapeutic_area=req.therapeutic_area,
-        disease_type=req.disease_type,
-        drug_name=req.drug_name,
-    )
-    reply, patch = _handle_write(decision, state, req.bucket)
-    return ActionResponse(reply=reply, state_patch=patch)
-
-
 @app.get("/status_query", response_model=ActionResponse)
 def status_query(
     session_id: str,
@@ -916,48 +759,6 @@ def get_session(session_id: str, bucket: str = _DEFAULT_BUCKET):
         "content_program": session.get("content_program"),
         "content_run_id":  session.get("content_run_id"),
     }
-
-
-@app.post("/upload_clinical")
-async def upload_clinical(
-    csv_file: UploadFile = File(...),
-    ta:     str = Form(...),
-    dis:    str = Form(...),
-    drug:   str = Form(...),
-    bucket: str = Form(_DEFAULT_BUCKET),
-):
-    """Register an uploaded clinical CSV for a drug program."""
-    if not _CLINICAL_AVAILABLE:
-        raise HTTPException(status_code=501, detail="Clinical ingestion package not available.")
-
-    import tempfile, shutil
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tmp:
-        shutil.copyfileobj(csv_file.file, tmp)
-        tmp_path = tmp.name
-
-    try:
-        program  = _ProgramInfo(therapeutic_area=ta, disease_type=dis, drug_name=drug)
-        manifest = _register_csv(
-            bucket_name=bucket,
-            program=program,
-            local_csv_path=tmp_path,
-            api_key=os.environ.get("OPENAI_API_KEY"),
-        )
-        sources = manifest.sources
-        src     = sources[-1] if sources else None
-        return {
-            "status":   "ok",
-            "filename": src.filename if src else csv_file.filename,
-            "columns":  len(src.column_mappings) if src else 0,
-            "sections": src.ctd_section_keys if src else [],
-            "total_sources": len(sources),
-        }
-    finally:
-        import os as _os
-        try:
-            _os.unlink(tmp_path)
-        except Exception:
-            pass
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
