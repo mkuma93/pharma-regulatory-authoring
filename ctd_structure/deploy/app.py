@@ -90,9 +90,10 @@ def _gcs_user_ctd_prefix(session_id: str) -> str:
 def _content_status_path(ta: str, dis: str, drug: str, session_id: str = "") -> str:
     def _slug(s: str) -> str:
         return s.strip().lower().replace(" ", "_")
+    suffix = session_id.strip() if session_id and session_id.strip() else "latest"
     return (
         f"{_GCS_PROGRAMS}/{_slug(ta)}/{_slug(dis)}/{_slug(drug)}"
-        f"/content_status/latest.json"
+        f"/content_status/{suffix}.json"
     )
 
 def _publish_content_generation(
@@ -528,9 +529,9 @@ def _refresh_state_from_gcs(state: dict, bucket: str) -> dict:
     if prog and not st.get("program_scaffold_exists"):
         exists = _check_program_exists(
             bkt,
-            prog.get("ta", ""),
-            prog.get("dis", ""),
-            prog.get("drug", ""),
+            prog.get("therapeutic_area", ""),
+            prog.get("disease_type", ""),
+            prog.get("drug_name", ""),
         )
         if exists:
             st = {**st, "program_scaffold_exists": True}
@@ -837,9 +838,9 @@ def _do_copy(intent: CoordinatorDecision, state: dict, bucket: str, history: lis
         **st,
         "program_scaffold_exists": True,
         "canonical_exists": True,
-        "content_program": {"ta": intent.therapeutic_area.strip(),
-                             "dis": intent.disease_type.strip(),
-                             "drug": intent.drug_name.strip()},
+        "content_program": {"therapeutic_area": intent.therapeutic_area.strip(),
+                             "disease_type": intent.disease_type.strip(),
+                             "drug_name": intent.drug_name.strip()},
     }
     history.append({
         "role": "assistant",
@@ -912,7 +913,7 @@ def _do_write(intent: CoordinatorDecision, state: dict, bucket: str, history: li
         # No data — ask for confirmation before proceeding with empty placeholders.
         st_pending = {
             **st,
-            "awaiting_write_confirm": {"ta": ta, "dis": dis, "drug": drug},
+            "awaiting_write_confirm": {"therapeutic_area": ta, "disease_type": dis, "drug_name": drug},
             "bucket": bkt,
         }
         history.append({"role": "assistant", "content": (
@@ -948,7 +949,7 @@ def _do_write(intent: CoordinatorDecision, state: dict, bucket: str, history: li
     new_state = {
         **st,
         "content_run_id": run_id,
-        "content_program": {"ta": ta, "dis": dis, "drug": drug},
+        "content_program": {"therapeutic_area": ta, "disease_type": dis, "drug_name": drug},
         "bucket": bkt,
     }
     history.append({"role": "assistant", "content": (
@@ -1012,9 +1013,9 @@ def chat(
     # and waits for the user to say "yes, proceed" or "cancel".
     if (state or {}).get("awaiting_write_confirm"):
         pending  = state["awaiting_write_confirm"]
-        ta_p     = pending.get("ta", "")
-        dis_p    = pending.get("dis", "")
-        drug_p   = pending.get("drug", "")
+        ta_p     = pending.get("therapeutic_area", "")
+        dis_p    = pending.get("disease_type", "")
+        drug_p   = pending.get("drug_name", "")
         _YES     = ("yes", "proceed", "go ahead", "ok", "sure", "continue", "confirm")
         _NO      = ("no", "cancel", "stop", "skip")
         if any(_msg_lower.startswith(w) for w in _YES):
@@ -1025,7 +1026,7 @@ def chat(
                 new_state = {
                     **st_p,
                     "content_run_id": run_id,
-                    "content_program": {"ta": ta_p, "dis": dis_p, "drug": drug_p},
+                    "content_program": {"therapeutic_area": ta_p, "disease_type": dis_p, "drug_name": drug_p},
                     "bucket": bkt,
                 }
                 history.append({"role": "assistant", "content": (
@@ -1095,6 +1096,43 @@ def chat(
         history, state = _do_write(decision, state, bkt, history)
         yield history, state, gr.update(value="")
 
+    elif intent == "rewrite_section":
+        # Re-run the full 3-pass pipeline for the programme — same as write.
+        # (Targeted single-section re-runs are not yet supported; the 3-pass DAG
+        # is idempotent and safe to restart.)
+        history, state = _do_write(decision, state, bkt, history)
+        yield history, state, gr.update(value="")
+
+    elif intent == "analyze_data":
+        ta_a   = (decision.therapeutic_area or "").strip()
+        dis_a  = (decision.disease_type or "").strip()
+        drug_a = (decision.drug_name or "").strip()
+        if ta_a and dis_a and drug_a:
+            manifest = _load_clinical_manifest(bkt, ta_a, dis_a, drug_a)
+            if manifest and manifest.get("sources"):
+                summary = _summarise_clinical_manifest(manifest)
+                reply_a = (
+                    f"{summary}\n\n"
+                    "📊 To run a full statistical analysis, ask me:\n\n"
+                    "- *Give me a clinical summary for this program*\n"
+                    "- *What is the recovery rate for this study?*\n\n"
+                    "Or use the **🔬 Clinical Data Upload** panel to upload or update a CSV."
+                )
+            else:
+                reply_a = (
+                    f"⚠️ No clinical data found for **{ta_a} / {dis_a} / {drug_a}**.\n\n"
+                    "Use the **🔬 Clinical Data Upload** panel to upload a clinical trial CSV "
+                    "and register it against this program first."
+                )
+        else:
+            reply_a = (
+                "To analyse clinical data I need to know which program you mean.\n\n"
+                "Please tell me the **therapeutic area**, **disease**, and **drug** — "
+                "for example: *analyse data for neurology / bells palsy / prednisolone*."
+            )
+        history.append({"role": "assistant", "content": reply_a})
+        yield history, state, gr.update(value="")
+
     elif intent == "status":
         st       = state or {}
         paths    = st.get("folder_paths", [])
@@ -1107,7 +1145,7 @@ def chat(
         _asking_content = "content" in _msg_lower
         prog = st.get("content_program")
         if prog:
-            ta_c, dis_c, drug_c = prog.get("ta", ""), prog.get("dis", ""), prog.get("drug", "")
+            ta_c, dis_c, drug_c = prog.get("therapeutic_area", ""), prog.get("disease_type", ""), prog.get("drug_name", "")
             cjob   = _load_content_status(bkt_st, ta_c, dis_c, drug_c, session_id)
             cstatus = cjob.get("status")
             if cstatus == "running":
@@ -1339,7 +1377,7 @@ def _auto_poll(history: list, state: dict):
     # ── (B) Content-generation poll ──────────────────────────────────────────
     prog = st.get("content_program")
     if prog and st.get("content_run_id"):
-        ta, dis, drug = prog.get("ta", ""), prog.get("dis", ""), prog.get("drug", "")
+        ta, dis, drug = prog.get("therapeutic_area", ""), prog.get("disease_type", ""), prog.get("drug_name", "")
         job    = _load_content_status(bkt, ta, dis, drug, session_id)
         status = job.get("status")
         if status == "done":
@@ -1600,9 +1638,9 @@ def _update_upload_panel(state: dict):
     if prog:
         return (
             gr.update(visible=True),
-            gr.update(value=prog.get("ta", "")),
-            gr.update(value=prog.get("dis", "")),
-            gr.update(value=prog.get("drug", "")),
+            gr.update(value=prog.get("therapeutic_area", "")),
+            gr.update(value=prog.get("disease_type", "")),
+            gr.update(value=prog.get("drug_name", "")),
         )
     return (
         gr.update(visible=True),

@@ -9,3 +9,8 @@ uvicorn[standard]>=0.30.0
 pydantic>=2.0.0
 pydantic-settings>=2.3.0
 python-dotenv>=1.0.0
+
+# === GCP auth (OIDC tokens for Cloud Run service-to-service calls) ===
+google-auth>=2.29.0
+google-auth-httplib2
+requests>=2.32.0

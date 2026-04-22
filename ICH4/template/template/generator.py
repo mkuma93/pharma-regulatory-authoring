@@ -20,6 +20,7 @@ Key difference from the root ICH4/index version:
 from __future__ import annotations
 
 import json
+import logging
 import os
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -29,6 +30,8 @@ from clinical.models import ClinicalDataManifest
 from ctd_structure.structure import CTDStructureOutput
 
 from .models import ProgramInfo, SectionTemplate
+
+logger = logging.getLogger(__name__)
 
 # ── Per-module expert personas ────────────────────────────────────────────────
 
@@ -101,7 +104,7 @@ _SYSTEM_RULES = """\
 When generating templates:
 - Follow ICH M4 guidelines (M4E for efficacy, M4Q for quality, M4S for safety).
 - Write content that is specific to the drug, indication, and therapeutic area provided.
-- Use {placeholder} syntax for information the document author must supply.
+- Use {{placeholder}} syntax for information the document author must supply.
 - Where ICH M4 requirements are provided in the prompt, use them verbatim — do not \
   invent requirements from training memory.
 - Where requirements are marked [NOT RETRIEVED], preserve that flag so the author \
@@ -512,9 +515,15 @@ def _build_prior_evidence_block(prior_evidence: dict[str, str] | None) -> str:
         _SEP,
     ]
     for ns, text in prior_evidence.items():
-        # Derive a human-readable label from namespace suffix
+        # Derive a human-readable label from namespace suffix.
         # Namespace format: program_{ta}_{dis}_{drug}_{pass_id}
-        pass_id = ns.rsplit("_", 1)[-1]
+        # pass_id may be multi-word (e.g. module2_clinical_summary) — find the
+        # first part that starts with "module" to avoid truncating at the last _.
+        parts = ns.split("_")
+        pass_id = next(
+            ("_".join(parts[i:]) for i, p in enumerate(parts) if p.startswith("module")),
+            parts[-1],
+        )
         label = pass_id.replace("_", " ").title()
         lines.append(f"\n[Evidence source: {label}]")
         lines.append(text.strip())
@@ -676,9 +685,10 @@ def generate_program_templates(
                 )
 
         except Exception as exc:
-            print(
-                f"[template.generator] Warning: failed to generate templates "
-                f"for {module.key}: {exc}"
+            logger.error(
+                "[template.generator] Failed to generate templates for %s: %s",
+                module.key, exc, exc_info=True,
             )
+            raise
 
     return all_templates

@@ -4,6 +4,9 @@ gradio>=5.0.0
 # HTTP client — calls ctd-api and future service APIs
 requests
 
+# OIDC tokens for service-to-service auth (Cloud Run)
+google-auth>=2.0.0
+
 # Coordinator (LangGraph: understand intent + decide + route)
 langgraph>=0.1.0
 langchain-openai>=0.1.0

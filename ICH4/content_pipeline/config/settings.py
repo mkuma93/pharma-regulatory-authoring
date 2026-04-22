@@ -15,8 +15,12 @@ class Settings(BaseSettings):
         description="Base URL of the ICH4 index (RAG) service",
     )
     template_service_url: str = Field(
-        default="http://localhost:8082",
+        default="https://ich4-template-811317821863.us-central1.run.app",
         description="Base URL of the ICH4 template generation service",
+    )
+    clinical_analyst_service_url: str = Field(
+        default="",
+        description="Base URL of the clinical-analyst service (optional; enables placeholder pre-resolution)",
     )
 
     # HTTP timeout for calls to internal services (seconds)

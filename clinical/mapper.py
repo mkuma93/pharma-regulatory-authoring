@@ -69,11 +69,34 @@ Task
                                 "treatment_group" | "study_metadata" | "pharmacokinetics" | "other"
      ctd_section_keys – list of ICH M4 short section keys (e.g. ["5.3.5.1", "2.7.3"])
      placeholder_key  – snake_case name for {{placeholder}} use in templates
+     positive_value   – for categorical/binary columns: the value that represents a POSITIVE
+                        outcome (e.g. "Yes", "Recovered", "1", "Complete Response").
+                        Look at the sample values to determine the positive class.
+                        Set to null for continuous/numeric columns (age, score, weight, etc.)
 
    Skip columns that carry no regulatory meaning (e.g. row IDs, internal codes with no
    CTD relevance).
 
-3. Set the top-level ctd_section_keys as the sorted union of all column ctd_section_keys.
+3. MANDATORY: After the per-column mappings, append additional entries for these
+   standard ICH CTD Section 2.5 narrative placeholder keys.  You MUST include all
+   eight entries below — they are required for the regulatory writing pipeline to
+   function.  Map each to the single most representative column from the dataset:
+
+     "efficacy_overview"          → primary efficacy outcome column
+     "primary_efficacy_endpoint"  → primary efficacy outcome column
+     "number_of_efficacy_trials"  → treatment_group or any study-design column
+     "total_safety_n"             → patient/subject ID column (or closest equivalent)
+     "number_of_safety_trials"    → treatment_group or any study-design column
+     "safety_overview"            → best safety column; if none, use primary efficacy column
+     "benefit_risk_conclusions"   → primary efficacy outcome column
+     "product_development_rationale" → primary efficacy outcome column
+
+   For every aggregate entry set:
+     - role            → same role as the source column
+     - ctd_section_keys → ["2.5"]
+     - positive_value  → null
+
+4. Set the top-level ctd_section_keys as the sorted union of all column ctd_section_keys.
 
 Return a JSON object with exactly this shape:
 {{
@@ -85,7 +108,15 @@ Return a JSON object with exactly this shape:
       "column_name": "...",
       "role": "...",
       "ctd_section_keys": ["..."],
-      "placeholder_key": "..."
+      "placeholder_key": "...",
+      "positive_value": "Yes"
+    }},
+    {{
+      "column_name": "...",
+      "role": "demographics",
+      "ctd_section_keys": ["..."],
+      "placeholder_key": "...",
+      "positive_value": null
     }}
   ],
   "ctd_section_keys": ["..."]

@@ -80,11 +80,25 @@ def load_manifest(bucket_name: str, program: ProgramInfo) -> ClinicalDataManifes
 def save_manifest(bucket_name: str, manifest: ClinicalDataManifest) -> str:
     """Persist the manifest JSON to GCS.
 
+    Before overwriting manifest.json the current version is copied to
+    manifest_snapshot.json so the clinical-analyst /schema-diff endpoint can
+    detect which placeholder keys changed between uploads.
+
     Returns:
         Bucket-relative GCS path where the manifest was written.
     """
     bkt      = _gcs().bucket(bucket_name)
-    gcs_path = f"{_clinical_prefix(manifest.program)}/manifest.json"
+    prefix   = _clinical_prefix(manifest.program)
+    gcs_path = f"{prefix}/manifest.json"
+
+    # Save current manifest as snapshot before overwriting it
+    existing_blob = bkt.blob(gcs_path)
+    try:
+        if existing_blob.exists():
+            bkt.copy_blob(existing_blob, bkt, f"{prefix}/manifest_snapshot.json")
+    except Exception:
+        pass  # Non-fatal — first upload has no snapshot to preserve
+
     bkt.blob(gcs_path).upload_from_string(
         manifest.model_dump_json(indent=2),
         content_type="application/json",

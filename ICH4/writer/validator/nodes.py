@@ -497,7 +497,78 @@ def check_ich_coverage(state: ValidatorState, llm: ChatOpenAI) -> dict:
     return {"issues": issues}
 
 
-# ── Node 7: LLM deep check ────────────────────────────────────────────────────
+# ── Node 7: check_against_resolved ───────────────────────────────────────────
+
+def check_against_resolved(state: ValidatorState) -> dict:
+    """Verify written documents' extracted values match pre-resolved ground-truth.
+
+    Compares canonical_values (consensus extracted from written text) against
+    resolved_values (ground truth computed by clinical-analyst /resolve from the
+    raw clinical CSV).  Mismatches are flagged as errors; resolved keys not found
+    in any written section are flagged as warnings so authors know figures are
+    missing.
+
+    When resolved_values is empty the node is a no-op.
+    """
+    issues: list[ValidationIssue] = []
+    resolved = state.resolved_values
+    canonical = state.canonical_values
+
+    if not resolved:
+        return {"issues": issues}
+
+    for key, expected in resolved.items():
+        found = canonical.get(key)
+        if found is None:
+            issues.append(ValidationIssue(
+                severity="warning",
+                section_key="cross-module",
+                message=(
+                    f"Ground-truth value for '{key}' ({expected}) was not found in any "
+                    "written section — confirm figures are referenced in the appropriate "
+                    "CTD sections."
+                ),
+            ))
+            continue
+
+        if found == expected:
+            continue
+
+        # Numeric proximity — small rounding differences down-graded to info
+        try:
+            diff = abs(float(found) - float(expected))
+            relative = diff / max(abs(float(expected)), 1e-9)
+            if relative < 0.02:
+                continue  # ≤2% — likely rounding, acceptable
+            if relative < 0.05:
+                issues.append(ValidationIssue(
+                    severity="info",
+                    section_key="cross-module",
+                    message=(
+                        f"Minor rounding difference for '{key}': "
+                        f"written '{found}', ground truth '{expected}'. "
+                        "Please review."
+                    ),
+                ))
+                continue
+        except ValueError:
+            pass  # non-numeric (e.g. drug name) — fall through to error
+
+        issues.append(ValidationIssue(
+            severity="error",
+            section_key="cross-module",
+            message=(
+                f"Value mismatch for '{key}': written documents state '{found}' but "
+                f"ground-truth value (from clinical data) is '{expected}'. "
+                "Verify and align figures across all CTD sections."
+            ),
+        ))
+
+    logger.info("[validator] check_against_resolved: %d issue(s) found.", len(issues))
+    return {"issues": issues}
+
+
+# ── Node 8: LLM deep check ────────────────────────────────────────────────────
 
 _CONSISTENCY_SYSTEM = """\
 You are a senior regulatory reviewer doing a cross-module semantic consistency audit.

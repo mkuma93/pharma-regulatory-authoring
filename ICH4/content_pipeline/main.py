@@ -1,12 +1,15 @@
 """
-ICH4 Orchestrator — FastAPI application.
+ICH4 Content Pipeline — FastAPI application.
 
-Aggregates two isolated services into a single endpoint:
+Scope: ICH4 content generation only.
+Aggregates two backend services into a single /generate endpoint:
 
-  1. index-service     →  POST /index/query      (ICH guideline context per module)
-  2. template-service  →  POST /generate         (LLM template generation + GCS clinical fetch)
+  1. index-service     →  POST /index/query  (ICH guideline context per module)
+  2. template-service  →  POST /generate     (LLM template generation + GCS clinical fetch)
 
-Gradio (ctd_structure/deploy/app.py) calls this service only.
+This service does NOT make routing decisions between features (CTD scaffolding,
+content generation, data analysis). Global intent routing is handled by
+ui/coordinator.py in the Gradio UI layer.
 
 Endpoints:
   GET  /health     — liveness probe
@@ -16,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from urllib.parse import urlparse
 
 import httpx
 from fastapi import FastAPI, HTTPException
@@ -23,12 +27,32 @@ from fastapi import FastAPI, HTTPException
 from config.settings import settings
 from models import OrchestratorRequest, OrchestratorResponse, SectionTemplate
 
+
+# ── OIDC helpers (Cloud Run service-to-service auth) ──────────────────────────
+
+def _service_audience(base_url: str) -> str:
+    """Extract scheme+host from a URL to use as OIDC audience."""
+    p = urlparse(base_url)
+    return f"{p.scheme}://{p.netloc}"
+
+
+def _oidc_headers(audience: str) -> dict[str, str]:
+    """Return Authorization header with an OIDC token for Cloud Run service calls."""
+    try:
+        from google.auth.transport.requests import Request as AuthRequest
+        from google.oauth2.id_token import fetch_id_token
+        token = fetch_id_token(AuthRequest(), audience)
+        return {"Authorization": f"Bearer {token}"}
+    except Exception as exc:
+        logger.warning("[pipeline] Could not obtain OIDC token for %s: %s", audience, exc)
+        return {}
+
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
-    title="ICH4 Orchestrator",
+    title="ICH4 Content Pipeline",
     version="1.0.0",
-    description="Coordinates index, template, and clinical services for CTD template generation.",
+    description="Aggregates ICH index and template services for CTD content generation.",
 )
 
 # ── ICH module query template (same as template/generator._ICH_MODULE_QUERY_TMPL) ──
@@ -76,6 +100,7 @@ _DEFAULT_EVIDENCE_QUERIES: dict[str, str] = {
 async def _fetch_ich_context(
     client: httpx.AsyncClient,
     module: dict,
+    headers: dict[str, str],
 ) -> tuple[str, str | None]:
     """Query the index service for one module. Returns (module_key, answer | None)."""
     question = _ICH_MODULE_QUERY_TMPL.format(
@@ -84,7 +109,8 @@ async def _fetch_ich_context(
     try:
         r = await client.post(
             f"{settings.index_service_url}/index/query",
-            json={"question": question, "ctd_module": module["ctd_filter"]},
+            json={"question": question},
+            headers=headers,
             timeout=settings.timeout_seconds,
         )
         if r.status_code == 200:
@@ -103,6 +129,9 @@ def health():
 async def generate(body: OrchestratorRequest) -> OrchestratorResponse:
     """Coordinate index and template services to generate CTD templates."""
 
+    index_headers    = _oidc_headers(_service_audience(settings.index_service_url))
+    template_headers = _oidc_headers(_service_audience(settings.template_service_url))
+
     async with httpx.AsyncClient() as client:
 
         # ── Determine active modules (apply module_filter if set) ──────────────
@@ -117,7 +146,7 @@ async def generate(body: OrchestratorRequest) -> OrchestratorResponse:
 
         if body.include_ich_context:
             for module in active_modules:
-                tasks.append(_fetch_ich_context(client, module))
+                tasks.append(_fetch_ich_context(client, module, index_headers))
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -148,6 +177,7 @@ async def generate(body: OrchestratorRequest) -> OrchestratorResponse:
                     r = await client.post(
                         f"{settings.index_service_url}/index/query",
                         json={"question": question, "program_namespace": ns},
+                        headers=index_headers,
                         timeout=settings.timeout_seconds,
                     )
                     if r.status_code == 200:
@@ -175,12 +205,14 @@ async def generate(body: OrchestratorRequest) -> OrchestratorResponse:
             "include_clinical_data": body.include_clinical_data,
             "section_key_prefixes": body.section_key_prefixes,
             "prior_evidence": prior_evidence if prior_evidence else None,
+            "bucket": body.bucket,
         }
 
         try:
             r = await client.post(
                 f"{settings.template_service_url}/generate",
                 json=payload,
+                headers=template_headers,
                 timeout=settings.timeout_seconds,
             )
             r.raise_for_status()
@@ -197,9 +229,54 @@ async def generate(body: OrchestratorRequest) -> OrchestratorResponse:
 
         data = r.json()
 
+    # ── Step 3: Pre-resolve template placeholders via clinical-analyst ────────
+    # This is the right place to resolve because we just built the templates and
+    # know exactly which {{keys}} they contain. The worker receives resolved_values
+    # in the response and passes them straight to the writer — no separate B.5 call.
+    resolved_values: dict[str, str] = {}
+    analyst_url = settings.clinical_analyst_service_url.rstrip("/")
+    if analyst_url and body.bucket:
+        placeholder_keys: set[str] = set()
+        _ph_re = __import__("re").compile(r"\{\{(\w+)\}\}")
+        for tmpl in data.get("templates", []):
+            placeholder_keys.update(_ph_re.findall(tmpl.get("content", "")))
+
+        if placeholder_keys:
+            analyst_headers = _oidc_headers(_service_audience(analyst_url))
+            try:
+                async with httpx.AsyncClient() as analyst_client:
+                    ra = await analyst_client.post(
+                        f"{analyst_url}/resolve",
+                        headers=analyst_headers,
+                        json={
+                            "therapeutic_area": body.program.therapeutic_area,
+                            "disease_type":     body.program.disease_type,
+                            "drug_name":        body.program.drug_name,
+                            "bucket":           body.bucket,
+                            "placeholder_keys": sorted(placeholder_keys),
+                        },
+                        timeout=settings.timeout_seconds,
+                    )
+                    if ra.status_code == 200:
+                        resolved_values = ra.json().get("resolved_values", {})
+                        logger.info(
+                            "[orchestrator] Pre-resolved %d/%d placeholder keys",
+                            len(resolved_values), len(placeholder_keys),
+                        )
+                    elif ra.status_code == 404:
+                        logger.info("[orchestrator] No clinical manifest — skipping /resolve")
+                    else:
+                        logger.warning(
+                            "[orchestrator] clinical-analyst /resolve HTTP %s — continuing",
+                            ra.status_code,
+                        )
+            except Exception as exc:
+                logger.warning("[orchestrator] /resolve failed (non-fatal): %s", exc)
+
     return OrchestratorResponse(
         templates=[SectionTemplate(**t) for t in data["templates"]],
         modules_generated=data["modules_generated"],
         ich_index_used=data["ich_index_used"],
         clinical_data_used=data["clinical_data_used"],
+        resolved_values=resolved_values,
     )

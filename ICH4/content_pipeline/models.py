@@ -26,6 +26,10 @@ class SectionTemplate(BaseModel):
 class OrchestratorRequest(BaseModel):
     """Body for POST /generate."""
     program: ProgramInfo
+    bucket: str = Field(
+        default="",
+        description="GCS bucket name; forwarded to clinical-analyst for placeholder pre-resolution.",
+    )
     include_clinical_data: bool = Field(
         default=True,
         description="Attempt to load clinical manifest from the clinical service.",
@@ -67,3 +71,7 @@ class OrchestratorResponse(BaseModel):
     modules_generated: list[str]
     ich_index_used: bool
     clinical_data_used: bool
+    resolved_values: dict[str, str] = Field(
+        default_factory=dict,
+        description="Pre-resolved placeholder values from clinical-analyst /resolve.",
+    )

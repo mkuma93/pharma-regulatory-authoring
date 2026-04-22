@@ -18,25 +18,27 @@ print(d)
 
 PROJECT_ID="${PROJECT_ID:-$(_yaml_get gcp.project_id)}"
 REGION="${REGION:-$(_yaml_get gcp.region)}"
-SERVICE_NAME="${SERVICE_NAME:-ich4-orchestrator}"
+SERVICE_NAME="${SERVICE_NAME:-ich4-content-pipeline}"
 AR_REPO="${AR_REPO:-$(_yaml_get cloudrun.ar_repo)}"
 
 # Service URLs — set these after deploying the index and template services
 INDEX_SERVICE_URL="${INDEX_SERVICE_URL:-https://ich4-index-811317821863.us-central1.run.app}"
 TEMPLATE_SERVICE_URL="${TEMPLATE_SERVICE_URL:-}"
+CLINICAL_ANALYST_SERVICE_URL="${CLINICAL_ANALYST_SERVICE_URL:-https://ich4-clinical-analyst-811317821863.us-central1.run.app}"
 
 if [[ -z "${TEMPLATE_SERVICE_URL}" ]]; then
   echo "[ERROR] Set TEMPLATE_SERVICE_URL before deploying."
-  echo "  Export it or set in ICH4/orchestrator/config/.env"
+  echo "  Export it or set in ICH4/content_pipeline/config/.env"
   exit 1
 fi
 
-echo "=== ICH4 Orchestrator — Deploy to Cloud Run ==="
+echo "=== ICH4 Content Pipeline — Deploy to Cloud Run ==="
 echo "  Project          : ${PROJECT_ID}"
 echo "  Region           : ${REGION}"
 echo "  Service          : ${SERVICE_NAME}"
 echo "  Index URL        : ${INDEX_SERVICE_URL}"
 echo "  Template URL     : ${TEMPLATE_SERVICE_URL}"
+echo "  Clinical analyst : ${CLINICAL_ANALYST_SERVICE_URL:-<not set — placeholder resolution disabled>}"
 echo ""
 
 command -v gcloud &>/dev/null || { echo "[ERROR] gcloud CLI not found."; exit 1; }
@@ -55,7 +57,7 @@ echo "[3/3] Submitting build and deploy to Cloud Build..."
 gcloud builds submit "${REPO_ROOT}" \
   --config="${SCRIPT_DIR}/cloudbuild.yaml" \
   --project="${PROJECT_ID}" \
-  --substitutions="_PROJECT_ID=${PROJECT_ID},_REGION=${REGION},_SERVICE_NAME=${SERVICE_NAME},_AR_REPO=${AR_REPO},_INDEX_SERVICE_URL=${INDEX_SERVICE_URL},_TEMPLATE_SERVICE_URL=${TEMPLATE_SERVICE_URL}"
+  --substitutions="_PROJECT_ID=${PROJECT_ID},_REGION=${REGION},_SERVICE_NAME=${SERVICE_NAME},_AR_REPO=${AR_REPO},_INDEX_SERVICE_URL=${INDEX_SERVICE_URL},_TEMPLATE_SERVICE_URL=${TEMPLATE_SERVICE_URL},_CLINICAL_ANALYST_SERVICE_URL=${CLINICAL_ANALYST_SERVICE_URL}"
 
 echo ""
 echo "=== Deploy complete ==="

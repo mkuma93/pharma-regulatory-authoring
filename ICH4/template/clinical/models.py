@@ -14,15 +14,7 @@ from template.models import ProgramInfo
 
 class ColumnMapping(BaseModel):
     column_name: str = Field(..., description="Exact CSV column header name")
-    role: Literal[
-        "efficacy_endpoint",
-        "safety_endpoint",
-        "demographics",
-        "treatment_group",
-        "study_metadata",
-        "pharmacokinetics",
-        "other",
-    ] = Field(..., description="Regulatory role of this column in a CTD submission")
+    role: str = Field(..., description="Regulatory role of this column in a CTD submission")
     ctd_section_keys: list[str] = Field(
         ...,
         description="ICH M4 CTD section keys where this column's data belongs",
@@ -30,6 +22,13 @@ class ColumnMapping(BaseModel):
     placeholder_key: str = Field(
         ...,
         description="Snake-case identifier used as {{placeholder}} in CTD templates",
+    )
+    positive_value: str | None = Field(
+        default=None,
+        description=(
+            "For categorical/binary columns: the value that counts as a positive outcome "
+            "(e.g. 'Yes', 'Recovered', '1'). None for numeric columns."
+        ),
     )
 
 

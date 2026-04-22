@@ -25,19 +25,22 @@ Endpoints
 """
 from __future__ import annotations
 
+import ast
 import io
 import json
 import logging
 import os
+import re
+import threading
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Annotated, Any
+from typing import Any, Callable
 
 import pandas as pd
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from google.cloud import pubsub_v1, storage
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
@@ -53,12 +56,46 @@ _GCP_PROJECT            = os.environ.get("GCP_PROJECT_ID", "pharma-reguatory-aut
 _CONTENT_PUBSUB_TOPIC   = os.environ.get("CONTENT_PUBSUB_TOPIC", "ich4-content-generation")
 _CONTENT_STATUS_TIMEOUT = int(os.environ.get("CONTENT_STATUS_TIMEOUT_SECONDS", str(30 * 60)))
 
-# ── FastAPI app ───────────────────────────────────────────────────────────────
+
+def _load_secret(project: str, secret_name: str) -> str | None:
+    """Fetch the latest version of a secret from GCP Secret Manager."""
+    try:
+        from google.cloud import secretmanager
+        client = secretmanager.SecretManagerServiceClient()
+        name   = f"projects/{project}/secrets/{secret_name}/versions/latest"
+        resp   = client.access_secret_version(request={"name": name})
+        return resp.payload.data.decode("utf-8").strip()
+    except Exception as exc:
+        logger.warning("[startup] Could not fetch secret %s: %s", secret_name, exc)
+        return None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    if _GCP_PROJECT:
+        logger.info("[startup] GCP_PROJECT_ID=%s — loading secrets from Secret Manager.", _GCP_PROJECT)
+        openai_key = os.environ.get("OPENAI_API_KEY") or _load_secret(_GCP_PROJECT, "OPENAI_API_KEY")
+        if not openai_key:
+            raise RuntimeError("[startup] OPENAI_API_KEY not found in env or Secret Manager.")
+        os.environ["OPENAI_API_KEY"] = openai_key
+        logger.info("[startup] OPENAI_API_KEY present.")
+    else:
+        if not os.environ.get("OPENAI_API_KEY"):
+            raise RuntimeError("[startup] OPENAI_API_KEY is required but not set.")
+        logger.info("[startup] Using local env for secrets.")
+    # Load persisted extension functions from GCS into _COMPUTATION_MAP
+    if _DEFAULT_BUCKET:
+        _load_extensions(_DEFAULT_BUCKET)
+    yield
+
+
+# ── FastAPI app ────────────────────────────────────────────────────────────
 
 app = FastAPI(
     title="Clinical Analyst Service",
     version="1.0.0",
     description="Clinical data analysis and Q&A for regulatory authoring.",
+    lifespan=lifespan,
 )
 
 
@@ -80,6 +117,11 @@ class ResolveResponse(BaseModel):
     saved_path: str
     keys_resolved: int
     keys_failed: list[str] = Field(default_factory=list)
+    keys_suggested: dict[str, str] = Field(
+        default_factory=dict,
+        description="Keys where a new computation type was needed. "
+                    "Value is the suggestion or rejection reason.",
+    )
 
 
 class AnalyzeRequest(BaseModel):
@@ -110,202 +152,577 @@ class AnalysisResult(BaseModel):
     )
 
 
-# ── Resolve: deterministic statistical tools (mirrors writer/data_analyst.py) ──
+# ── Planner / Executor ───────────────────────────────────────────────────────
+#
+# Architecture: LLM outputs structured intent only (closed vocabulary).
+#               Deterministic executor owns all pandas logic — no code from LLM.
+#               Range validator catches semantic errors post-execution.
+#
+# Computation vocabulary (the ONLY things the LLM may request):
+#   proportion    – categorical column, proportion of rows matching a positive value
+#   mean_sd       – numeric column, mean ± SD
+#   median_range  – numeric column, median [min–max]
+#   row_count     – total row count, no column needed
+#   unique_count  – distinct non-null values in a column
 
-@tool
-def compute_proportion(
-    data_json: Annotated[str, "JSON array of row dicts"],
-    column: Annotated[str, "Column to compute proportion for"],
-    positive_value: Annotated[str, "Value that counts as positive"],
-    group_by: Annotated[str, "Column to group by, or empty string"] = "",
-) -> str:
-    """Compute proportion (%) of rows where column == positive_value."""
-    rows = json.loads(data_json)
-    df = pd.DataFrame(rows)
-    if column not in df.columns:
-        return f"[column '{column}' not found]"
-    if group_by and group_by in df.columns:
-        lines: list[str] = []
-        for grp, sub in df.groupby(group_by):
-            n_pos = (sub[column].astype(str).str.strip() == str(positive_value)).sum()
-            n_tot = len(sub)
-            pct = 100 * n_pos / n_tot if n_tot else 0
-            lines.append(f"  {grp}: {pct:.1f}% ({n_pos}/{n_tot})")
-        return "\n".join(lines)
-    n_pos = (df[column].astype(str).str.strip() == str(positive_value)).sum()
-    n_tot = len(df)
-    pct = 100 * n_pos / n_tot if n_tot else 0
-    return f"{pct:.1f}% ({n_pos}/{n_tot})"
+_NARRATIVE_SUFFIXES = (
+    "_overview", "_conclusions", "_rationale", "_summary",
+    "_description", "_profile", "_narrative",
+    "_endpoint", "_timepoint", "_indication", "_wording",
+    "_conclusion", "_population", "_criteria", "_label",
+)
+
+# Keys whose prefix pattern signals a multi-group derived stat (NNT, ARR, HR, OR …).
+# These are forced to "suggest" even if the planner tries a simple builtin.
+_DERIVED_STAT_PREFIXES = ("nnt_", "arr_", "rrr_", "hratio_", "oratio_", "hr_",
+                          "or_", "rr_", "ci_", "km_")
+
+# ── Computation registry ──────────────────────────────────────────────────────
+# All executor functions share signature: (df: pd.DataFrame, step: dict) -> str
+# "step" is the planner JSON object with keys: computation, column, positive_value, etc.
+
+def _exec_proportion(df: pd.DataFrame, step: dict) -> str:
+    col, pos = step["column"], step["positive_value"]
+    pct = df[col].eq(pos).mean() * 100
+    n   = int(df[col].eq(pos).sum())
+    return f"{pct:.1f}% ({n}/{len(df)})"
+
+def _exec_mean_sd(df: pd.DataFrame, step: dict) -> str:
+    s = pd.to_numeric(df[step["column"]], errors="coerce")
+    valid_n = int(s.notna().sum())
+    if valid_n == 0:
+        raise ValueError(f"column '{step['column']}' has no numeric values")
+    return f"{s.mean():.1f} \u00b1 {s.std():.1f} (n={valid_n})"
+
+def _exec_median_range(df: pd.DataFrame, step: dict) -> str:
+    s = pd.to_numeric(df[step["column"]], errors="coerce")
+    valid_n = int(s.notna().sum())
+    if valid_n == 0:
+        raise ValueError(f"column '{step['column']}' has no numeric values")
+    return (f"{s.median():.1f} [{s.min():.0f}\u2013{s.max():.0f}]"
+            f" (n={valid_n})")
+
+def _exec_row_count(df: pd.DataFrame, step: dict) -> str:
+    return str(len(df))
+
+def _exec_unique_count(df: pd.DataFrame, step: dict) -> str:
+    return str(df[step["column"]].nunique())
+
+# Mutable registry — extended at startup + at runtime by generated functions
+_COMPUTATION_MAP: dict[str, Callable] = {
+    "proportion":   _exec_proportion,
+    "mean_sd":      _exec_mean_sd,
+    "median_range": _exec_median_range,
+    "row_count":    _exec_row_count,
+    "unique_count": _exec_unique_count,
+}
+_COMPUTATION_MAP_LOCK = threading.Lock()
+
+# Built-in types that cannot be overwritten by generated functions
+_BUILTIN_COMPUTATIONS = frozenset(_COMPUTATION_MAP.keys())
+
+# "suggest" is not executable — it signals a missing computation type
+_ALLOWED_COMPUTATIONS = _BUILTIN_COMPUTATIONS | {"suggest"}
+
+_GROUP_HINTS_RESOLVE = [
+    "treatment", "arm", "group", "intervention", "randomiz", "cohort", "stratum"
+]
+
+# ── Range rules ───────────────────────────────────────────────────────────────
+_RANGE_RULES: dict[str, tuple[float, float]] = {
+    "proportion":   (0.0,  100.0),
+    "mean_sd":      (-1e9,  1e9),
+    "median_range": (-1e9,  1e9),
+    "row_count":    (1.0,   1e7),
+    "unique_count": (1.0,   1e5),
+}
+
+# ── Extension module (persisted to GCS) ──────────────────────────────────────
+_EXTENSION_GCS_PATH  = "system/computed_extensions.py"
+_EXT_MODULE_LOCK     = threading.Lock()
+_EXT_MODULE_HEADER   = '''\
+"""Auto-generated clinical computation extensions.
+Generated by clinical-analyst service. Do not edit manually.
+Each function signature: (df: pd.DataFrame, step: dict) -> str
+"""
+import re
+import numpy as np
+import pandas as pd
+
+_REGISTRY: dict = {}
+'''
+_AST_ALLOWED_ATTRS = {
+    # pandas Series / DataFrame methods
+    "eq", "ne", "gt", "lt", "ge", "le", "mean", "sum", "std", "min", "max",
+    "median", "count", "nunique", "value_counts", "groupby", "apply",
+    "dropna", "notna", "isna", "fillna", "astype", "str", "dt",
+    "to_numeric", "reset_index", "rename", "head", "tail", "copy",
+    # numpy
+    "sqrt", "log", "exp", "abs", "round", "nan", "inf",
+    # builtins kept in safe eval context
+    "len", "int", "float", "str", "round", "range", "enumerate",
+}
 
 
-@tool
-def compute_mean_sd(
-    data_json: Annotated[str, "JSON array of row dicts"],
-    column: Annotated[str, "Numeric column name"],
-    group_by: Annotated[str, "Column to group by, or empty string"] = "",
-) -> str:
-    """Compute mean ± SD of a numeric column, optionally by group."""
-    rows = json.loads(data_json)
-    df = pd.DataFrame(rows)
-    if column not in df.columns:
-        return f"[column '{column}' not found]"
-    df[column] = pd.to_numeric(df[column], errors="coerce")
-    if group_by and group_by in df.columns:
-        lines: list[str] = []
-        for grp, sub in df.groupby(group_by):
-            m, s = sub[column].mean(), sub[column].std()
-            lines.append(f"  {grp}: {m:.2f} ± {s:.2f} (n={sub[column].notna().sum()})")
-        return "\n".join(lines)
-    m, s = df[column].mean(), df[column].std()
-    return f"{m:.2f} ± {s:.2f} (n={df[column].notna().sum()})"
+def _ast_safe(code: str) -> str | None:
+    """Return error message if code is structurally unsafe, else None."""
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as exc:
+        return f"SyntaxError: {exc}"
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            # Only pandas / numpy / re allowed
+            names = (
+                [a.name for a in node.names]
+                if isinstance(node, ast.Import)
+                else [node.module or ""]
+            )
+            for nm in names:
+                if nm and nm.split(".")[0] not in ("pandas", "pd", "numpy", "np", "re"):
+                    return f"Forbidden import: {nm}"
+        if isinstance(node, ast.Attribute):
+            if node.attr.startswith("__"):
+                return f"Dunder attribute access forbidden: {node.attr}"
+    return None
 
 
-@tool
-def compute_crosstab(
-    data_json: Annotated[str, "JSON array of row dicts"],
-    row_column: Annotated[str, "Column whose values become rows"],
-    col_column: Annotated[str, "Column whose values become columns"],
-) -> str:
-    """Cross-tabulate two categorical columns, return Markdown table."""
-    rows = json.loads(data_json)
-    df = pd.DataFrame(rows)
-    missing = [c for c in [row_column, col_column] if c not in df.columns]
-    if missing:
-        return f"[columns not found: {missing}]"
-    ct = pd.crosstab(df[row_column], df[col_column])
-    ct_pct = ct.div(ct.sum(axis=1), axis=0).mul(100).round(1)
-    col_headers = " | ".join(str(c) for c in ct.columns)
-    lines = [f"| {row_column} | {col_headers} |", "|" + "---|" * (len(ct.columns) + 1)]
-    for idx in ct.index:
-        cells = " | ".join(
-            f"{ct.loc[idx, c]} ({ct_pct.loc[idx, c]:.1f}%)" for c in ct.columns
-        )
-        lines.append(f"| {idx} | {cells} |")
-    return "\n".join(lines)
+def _load_extensions(bucket: str) -> None:
+    """Load and exec the extension module from GCS, registering functions."""
+    try:
+        blob = _gcs_client().bucket(bucket).blob(_EXTENSION_GCS_PATH)
+        if not blob.exists():
+            logger.info("[ext] No extension module found at %s — starting fresh", _EXTENSION_GCS_PATH)
+            return
+        code = blob.download_as_text()
+        ns: dict = {"pd": pd}
+        exec(compile(code, _EXTENSION_GCS_PATH, "exec"), ns)  # noqa: S102
+        registry: dict = ns.get("_REGISTRY", {})
+        with _COMPUTATION_MAP_LOCK:
+            _COMPUTATION_MAP.update(registry)
+        logger.info("[ext] Loaded %d extension function(s): %s",
+                    len(registry), list(registry.keys()))
+    except Exception as exc:
+        logger.warning("[ext] Failed to load extension module: %s", exc)
 
 
-@tool
-def compute_median_range(
-    data_json: Annotated[str, "JSON array of row dicts"],
-    column: Annotated[str, "Numeric column name"],
-    group_by: Annotated[str, "Column to group by, or empty string"] = "",
-) -> str:
-    """Compute median [min–max] of a numeric column, optionally by group."""
-    rows = json.loads(data_json)
-    df = pd.DataFrame(rows)
-    if column not in df.columns:
-        return f"[column '{column}' not found]"
-    df[column] = pd.to_numeric(df[column], errors="coerce")
-    if group_by and group_by in df.columns:
-        lines: list[str] = []
-        for grp, sub in df.groupby(group_by):
-            med, mn, mx = sub[column].median(), sub[column].min(), sub[column].max()
-            lines.append(f"  {grp}: {med:.1f} [{mn:.0f}\u2013{mx:.0f}] (n={sub[column].notna().sum()})")
-        return "\n".join(lines)
-    med, mn, mx = df[column].median(), df[column].min(), df[column].max()
-    return f"{med:.1f} [{mn:.0f}\u2013{mx:.0f}] (n={df[column].notna().sum()})"
+def _persist_extension(fn_name: str, comp_type: str, fn_code: str, bucket: str) -> None:
+    """Append a new function to the GCS extension module and hot-register it."""
+    with _EXT_MODULE_LOCK:
+        try:
+            blob = _gcs_client().bucket(bucket).blob(_EXTENSION_GCS_PATH)
+            current = blob.download_as_text() if blob.exists() else _EXT_MODULE_HEADER
+            entry = (
+                f"\n# ── Generated {datetime.now(timezone.utc).date()} ─────────\n"
+                f"{fn_code}\n"
+                f'_REGISTRY["{comp_type}"] = {fn_name}\n'
+            )
+            updated = current + entry
+            blob.upload_from_string(updated, content_type="text/plain")
+            logger.info("[ext] Persisted extension '%s' to GCS", comp_type)
+        except Exception as exc:
+            logger.warning("[ext] GCS persist failed for '%s': %s", comp_type, exc)
+            return
+
+    # Hot-register in memory
+    ns: dict = {"pd": pd}
+    try:
+        exec(compile(fn_code, "<generated>", "exec"), ns)  # noqa: S102
+        fn = ns.get(fn_name)
+        if fn:
+            with _COMPUTATION_MAP_LOCK:
+                _COMPUTATION_MAP[comp_type] = fn
+            logger.info("[ext] Hot-registered '%s'", comp_type)
+    except Exception as exc:
+        logger.warning("[ext] Hot-register failed for '%s': %s", comp_type, exc)
 
 
-_RESOLVE_TOOLS    = [compute_proportion, compute_mean_sd, compute_crosstab, compute_median_range]
-_RESOLVE_TOOL_MAP = {t.name: t for t in _RESOLVE_TOOLS}
-_GROUP_HINTS_RESOLVE = ["treatment", "arm", "group", "intervention", "randomiz", "cohort", "stratum"]
+# ── Code generator + validator ────────────────────────────────────────────────
 
-_RESOLVE_SYSTEM = """\
-You are a clinical data analyst. You have access to four statistical tools:
-  compute_proportion   – proportion / rate / recovery rate / response rate
-  compute_mean_sd      – mean ± SD of a numeric measurement
-  compute_crosstab     – cross-table of two categorical columns
-  compute_median_range – median [min–max] for skewed distributions
+_CODEGEN_SYSTEM = """\
+You are an expert clinical data scientist writing a Python function.
+
+Write ONE Python function with this exact signature:
+  def {fn_name}(df: pd.DataFrame, step: dict) -> str:
 
 Rules:
-- Call EXACTLY ONE tool per placeholder key listed below.
-- For proportions (rate, incidence, response) → compute_proportion.
-- For continuous measurements (score, age, weight) → compute_mean_sd or compute_median_range.
-- For two-way breakdowns → compute_crosstab.
-- The treatment/arm grouping column is: {group_col}.
-  Use it as group_by when clinically meaningful. If empty, omit group_by.
-- Only use column names from the "Dataset columns available" list.
-- The data_json must be a valid JSON array of row objects from the sample rows provided.
-- Do not invent or modify values.
+- Use ONLY pandas (pd) and numpy (np) — no other imports inside the function.
+- The function receives:
+    df   — a pandas DataFrame with the columns listed below
+    step — a dict with at least: "key", "computation", "column"
+           (and any extra fields the caller passes, e.g. "time_column", "event_column")
+- Return a concise human-readable string (e.g. "12.3 months [2–48]").
+- Do NOT print, log, or raise exceptions — return an error string instead.
+- Do NOT read files, make network calls, or access global state.
+- Include a one-line docstring describing what is computed.
+- Return ONLY the function definition — no explanation, no markdown fences.
 """
 
-_RESOLVE_USER = """\
-Dataset columns available: {columns}
+_CODEGEN_USER = """\
+Computation needed: {suggestion}
 
-Sample rows (up to 20):
-{sample_rows_json}
+Dataset schema:
+{schema_json}
 
-For each placeholder below, call the appropriate tool to compute the value.
-Work through them one by one.
+The step dict will include: {step_fields}
 
-Placeholders to compute:
+Write the function named: {fn_name}
+"""
+
+_CODEVALIDATOR_SYSTEM = """\
+You are an adversarial code reviewer for clinical statistics.
+Review the Python function below.
+
+Check for:
+1. Statistical correctness — does the logic match the described computation?
+2. Correct pandas/numpy API usage — no deprecated or wrong methods.
+3. Edge cases handled — empty series, all-NaN, zero division.
+4. No security issues — no exec, eval, open, import inside body, __dunder__ access.
+5. Return type — must return a string in all code paths.
+6. Not redundant with builtins — if the code is merely computing a simple proportion,
+   mean, median, or count of a single column, reject it and explain which builtin to use
+   instead (proportion / mean_sd / median_range / row_count / unique_count).
+
+Respond with ONLY a JSON object:
+  {{"approved": true, "reason": "brief positive note"}}
+  {{"approved": false, "reason": "specific problem found"}}
+"""
+
+
+def _derive_fn_name(comp_type: str) -> str:
+    safe = re.sub(r"[^a-z0-9_]", "_", comp_type.lower())
+    return f"_ext_{safe}"
+
+
+def _generate_extension_code(
+    suggestion: str,
+    step: dict,
+    schema: list[dict],
+    llm: ChatOpenAI,
+) -> str | None:
+    """Ask LLM to write a new executor function. Returns source code or None."""
+    comp_type = step.get("computation", "")
+    fn_name   = _derive_fn_name(comp_type)
+    step_fields = ", ".join(f'"{k}"' for k in step if k != "data_json")
+
+    try:
+        response = llm.invoke([
+            SystemMessage(content=_CODEGEN_SYSTEM.format(fn_name=fn_name)),
+            HumanMessage(content=_CODEGEN_USER.format(
+                suggestion=suggestion,
+                schema_json=json.dumps(schema, indent=2),
+                step_fields=step_fields,
+                fn_name=fn_name,
+            )),
+        ])
+        return str(response.content).strip()
+    except Exception as exc:
+        logger.warning("[ext] Code generation failed: %s", exc)
+        return None
+
+
+def _validate_extension_code(code: str, llm: ChatOpenAI) -> tuple[bool, str]:
+    """Have a second LLM instance review the generated code. Returns (approved, reason)."""
+    # AST structural check first — fast and free
+    ast_err = _ast_safe(code)
+    if ast_err:
+        return False, f"AST check failed: {ast_err}"
+
+    try:
+        response = llm.invoke([
+            SystemMessage(content=_CODEVALIDATOR_SYSTEM),
+            HumanMessage(content=code),
+        ])
+        raw = str(response.content).strip()
+        # Strip markdown fences if present
+        raw = re.sub(r"^```[a-z]*\n?|```$", "", raw, flags=re.MULTILINE).strip()
+        verdict = json.loads(raw)
+        return bool(verdict.get("approved")), str(verdict.get("reason", ""))
+    except Exception as exc:
+        return False, f"validator error: {exc}"
+
+
+# ── Planner prompt ────────────────────────────────────────────────────────────
+
+_PLANNER_SYSTEM = """\
+You are a clinical data analyst planner. Your ONLY job is to produce a JSON array
+describing HOW to compute each placeholder value from the dataset schema.
+
+Allowed computation types (use ONLY these exact strings):
+  "proportion"   – fraction of rows where a categorical column equals a specific value.
+                   Requires: column (string), positive_value (exact string from sample_values).
+  "mean_sd"      – mean ± standard deviation of a numeric column.
+                   Requires: column (numeric).
+  "median_range" – median [min–max] of a numeric column.
+                   Requires: column (numeric).
+  "row_count"    – total number of rows. No column needed.
+  "unique_count" – count of distinct non-null values in a column.
+                   Requires: column (string or categorical).
+  "suggest"      – LAST RESORT ONLY. Use when none of the above types can produce the
+                   result (e.g. NNT, hazard ratio, conditional proportion, regression).
+                   Requires: column (best candidate), suggestion (one sentence describing
+                   exactly what statistical computation is needed and why).
+
+Output format — a JSON array, one object per computable placeholder:
+[
+  {{"key": "<placeholder_key>", "computation": "<type>", "column": "<exact_column_name>",
+    "positive_value": "<exact_value_from_sample_values>"}},
+  {{"key": "<other_key>", "computation": "suggest", "column": "<column>",
+    "suggestion": "<description of needed computation>"}}
+]
+
+BUILTIN PREFERENCE RULES (ALWAYS prefer a builtin before using "suggest"):
+- Key ends in _percent, _rate, _proportion, or means "recovery", "response", "incidence"
+  → use "proportion" (pick the right column and positive_value from sample_values).
+- Key is a score, age, weight, or other continuous numeric measure
+  → use "mean_sd" or "median_range" (examine column dtype — numeric → mean_sd).
+- Key is a count of subjects or events
+  → use "row_count" (no column needed).
+- Key is "number of X" where X is a categorical treatment/group
+  → use "unique_count".
+- "suggest" is ONLY valid when the computation genuinely requires arithmetic across
+  multiple columns, conditional filtering by group, or a derived statistic not
+  expressible as a single column summary (e.g. NNT, ARR, odds ratio, Kaplan-Meier).
+
+Additional rules:
+- Use ONLY column names from the schema provided. Never invent column names.
+- For "proportion": positive_value MUST be copied verbatim from the sample_values list.
+- For "row_count": omit "column" and "positive_value" fields entirely.
+- Skip placeholders describing free-text narratives (ends in _overview, _conclusions,
+  _rationale, _summary, _description, _profile, _narrative, _endpoint, _timepoint,
+  _indication, _wording, _conclusion, _population, _criteria, _label).
+- If you cannot map a placeholder to any builtin, use "suggest" — never skip silently.
+- Return ONLY the JSON array, no explanation, no markdown fences.
+"""
+
+_PLANNER_USER = """\
+Dataset schema:
+{schema_json}
+
+Placeholders to plan (key → description):
 {placeholder_list}
 """
 
 
-def _detect_group_col(df: pd.DataFrame) -> str:
+def _build_schema(df: pd.DataFrame) -> list[dict]:
+    """Build a column schema with dtype and up to 5 sample distinct values."""
+    schema = []
     for col in df.columns:
-        if any(h in col.lower() for h in _GROUP_HINTS_RESOLVE):
-            return col
-    return ""
+        dtype = str(df[col].dtype)
+        if df[col].dtype == object:
+            sample_vals = df[col].dropna().unique()[:5].tolist()
+            kind = "categorical"
+        else:
+            sample_vals = []
+            kind = "numeric"
+        schema.append({"column": col, "dtype": dtype, "kind": kind,
+                        "sample_values": sample_vals})
+    return schema
 
 
-def _dispatch_tools(
+def _validate_plan_step(step: dict, df_columns: set[str]) -> str | None:
+    """Return an error string if the step is structurally invalid, else None."""
+    computation = step.get("computation", "")
+    column      = step.get("column", "")
+    if computation not in _ALLOWED_COMPUTATIONS:
+        return f"unknown computation '{computation}'"
+    if computation == "suggest":
+        return None
+    if computation != "row_count":
+        if not column:
+            return "missing column"
+        if column not in df_columns:
+            return f"column '{column}' not in dataset"
+    if computation == "proportion" and not step.get("positive_value"):
+        return "proportion requires positive_value"
+    return None
+
+
+def _execute_step(step: dict, df: pd.DataFrame) -> str:
+    """Look up and call the registered executor for the computation type."""
+    comp = step["computation"]
+    fn = _COMPUTATION_MAP.get(comp)
+    if fn is None:
+        raise ValueError(f"no executor registered for '{comp}'")
+    return fn(df, step)
+
+
+def _validate_result(key: str, computation: str, value: str) -> bool:
+    """Post-execution range check — returns False when value looks implausible."""
+    rules = _RANGE_RULES.get(computation)
+    if rules is None:
+        return True
+    lo, hi = rules
+    m = re.search(r"[-+]?\d+(?:\.\d+)?", value)
+    if not m:
+        return False
+    num = float(m.group())
+    if not (lo <= num <= hi):
+        logger.warning("[resolve] %s range check failed: %s not in [%s, %s]",
+                       key, num, lo, hi)
+        return False
+    return True
+
+
+def _plan_and_execute(
     df: pd.DataFrame,
-    placeholder_descriptions: dict[str, str],
+    placeholder_meta: dict[str, dict],
     llm: ChatOpenAI,
-) -> dict[str, str]:
-    """Dispatch tool-calling LLM to compute all placeholder values from df."""
-    if df.empty or not placeholder_descriptions:
-        return {}
+    bucket: str,
+) -> tuple[dict[str, str], dict[str, str]]:
+    """LLM plans intent → executor runs it → range validator checks.
 
-    group_col = _detect_group_col(df)
-    sample_json = df.head(20).to_json(orient="records", indent=2)
+    Returns (resolved, suggested).
+    """
+    if df.empty or not placeholder_meta:
+        return {}, {}
+
+    computable_meta = {
+        k: v for k, v in placeholder_meta.items()
+        if not any(k.lower().endswith(sfx) for sfx in _NARRATIVE_SUFFIXES)
+    }
+    if not computable_meta:
+        return {}, {}
+
+    schema       = _build_schema(df)
+    schema_json  = json.dumps(schema, indent=2)
     placeholder_list = "\n".join(
-        f"  - {k}: {v}" for k, v in placeholder_descriptions.items()
+        f"  {k}: {v['description']}" for k, v in computable_meta.items()
     )
 
-    messages = [
-        SystemMessage(content=_RESOLVE_SYSTEM.format(
-            group_col=group_col if group_col else "(none detected — omit group_by)",
-        )),
-        HumanMessage(content=_RESOLVE_USER.format(
-            columns=list(df.columns),
-            sample_rows_json=sample_json,
-            placeholder_list=placeholder_list,
-        )),
-    ]
+    try:
+        raw = str(llm.invoke([
+            SystemMessage(content=_PLANNER_SYSTEM),
+            HumanMessage(content=_PLANNER_USER.format(
+                schema_json=schema_json, placeholder_list=placeholder_list,
+            )),
+        ]).content).strip()
+    except Exception as exc:
+        logger.warning("[resolve] planner LLM failed: %s", exc)
+        return {}, {}
 
     try:
-        response = llm.bind_tools(_RESOLVE_TOOLS).invoke(messages)
+        plan: list[dict] = json.loads(raw)
+        if not isinstance(plan, list):
+            raise ValueError("not a list")
     except Exception as exc:
-        logger.warning("[resolve] LLM dispatch failed: %s", exc)
-        return {}
+        logger.warning("[resolve] bad planner JSON: %s | raw: %s", exc, raw[:200])
+        return {}, {}
 
-    full_data_json = df.to_json(orient="records")
-    results: dict[str, str] = {}
+    df_columns = set(df.columns)
+    results:   dict[str, str] = {}
+    suggested: dict[str, str] = {}
 
-    for tc in getattr(response, "tool_calls", []):
-        name, args = tc["name"], {**tc["args"], "data_json": full_data_json}
-        if name not in _RESOLVE_TOOL_MAP:
+    for step in plan:
+        key = step.get("key", "")
+        if not key or key not in computable_meta or key in results:
             continue
+
+        err = _validate_plan_step(step, df_columns)
+        if err:
+            logger.warning("[resolve] step rejected '%s': %s", key, err)
+            suggested[key] = f"[plan rejected] {err}"
+            continue
+
+        # ── derived-stat guard: override builtin with suggest for NNT/ARR/HR etc. ──
+        if step["computation"] != "suggest" and any(
+            key.lower().startswith(pfx) for pfx in _DERIVED_STAT_PREFIXES
+        ):
+            logger.info("[resolve] forcing suggest for derived stat key '%s'", key)
+            step["computation"] = "suggest"
+            if not step.get("suggestion"):
+                step["suggestion"] = (
+                    f"Compute {key} — a derived multi-group statistic "
+                    f"(e.g. NNT/ARR/HR/OR) using the clinical trial columns."
+                )
+
+        # ── suggest path: generate → validate → persist → hot-register ────
+        if step["computation"] == "suggest":
+            suggestion = step.get("suggestion", "(no description)")
+            comp_type  = re.sub(r"[^a-z0-9_]", "_", key.lower())
+
+            if comp_type not in _COMPUTATION_MAP:
+                code = _generate_extension_code(suggestion, step, schema, llm)
+                if code:
+                    approved, reason = _validate_extension_code(code, llm)
+                    if approved:
+                        _persist_extension(_derive_fn_name(comp_type), comp_type, code, bucket)
+                    else:
+                        logger.warning("[ext] Rejected '%s': %s", comp_type, reason)
+                        # If validator says to use a builtin, reroute — but only for
+                        # simple keys, never for derived multi-group stats.
+                        is_derived = any(
+                            key.lower().startswith(pfx) for pfx in _DERIVED_STAT_PREFIXES
+                        )
+                        rerouted = False
+                        if not is_derived:
+                            for builtin in _BUILTIN_COMPUTATIONS:
+                                if builtin in reason.lower():
+                                    logger.info(
+                                        "[ext] Rerouting '%s' → builtin '%s'", key, builtin
+                                    )
+                                    step["computation"] = builtin
+                                    rerouted = True
+                                    break
+                        if not rerouted:
+                            suggested[key] = (
+                                f"[needs new function] {suggestion} — rejected: {reason}"
+                            )
+                            continue
+                else:
+                    suggested[key] = f"[needs new function] {suggestion}"
+                    continue
+
+            if comp_type in _COMPUTATION_MAP:
+                step["computation"] = comp_type
+            elif step["computation"] not in _BUILTIN_COMPUTATIONS:
+                suggested[key] = f"[needs new function] {suggestion}"
+                continue
+
+        # ── manifest positive_value wins for proportion ────────────────────
+        if step.get("computation") == "proportion":
+            pv = computable_meta[key].get("positive_value")
+            if pv:
+                step["positive_value"] = pv
+            elif not step.get("positive_value"):
+                # Infer positive_value from column sample_values: prefer "Yes" / "Female" /
+                # "Male" / first sample; fall back to first categorical sample value.
+                col = step.get("column", "")
+                key_lower = key.lower()
+                if col in df.columns:
+                    samples = df[col].dropna().unique().tolist()
+                    preferred = None
+                    if "yes" in [str(s).lower() for s in samples]:
+                        preferred = next(s for s in samples if str(s).lower() == "yes")
+                    elif "female" in key_lower and any(str(s).lower() == "female" for s in samples):
+                        preferred = next(s for s in samples if str(s).lower() == "female")
+                    elif "male" in key_lower and any(str(s).lower() == "male" for s in samples):
+                        preferred = next(s for s in samples if str(s).lower() == "male")
+                    else:
+                        preferred = samples[0] if samples else None
+                    if preferred is not None:
+                        step["positive_value"] = str(preferred)
+
         try:
-            value = _RESOLVE_TOOL_MAP[name].invoke(args)
+            value = _execute_step(step, df)
         except Exception as exc:
-            logger.warning("[resolve] Tool %s failed: %s", name, exc)
+            logger.warning("[resolve] execution failed '%s': %s", key, exc)
+            suggested[key] = f"[execution error] {exc}"
             continue
-        col = args.get("column") or args.get("row_column") or ""
-        col_l = col.lower()
-        matched = next(
-            (k for k, d in placeholder_descriptions.items()
-             if col_l in d.lower() or k.lower() in col_l),
-            next(iter(placeholder_descriptions), None),
-        )
-        if matched and matched not in results:
-            results[matched] = value
-            logger.info("[resolve] %s → %s", matched, str(value)[:80])
 
-    return results
+        if not _validate_result(key, step["computation"], value):
+            logger.warning("[resolve] range check failed '%s': %s", key, value)
+            suggested[key] = f"[range check failed] computed: {value}"
+            continue
+
+        results[key] = value
+        logger.info("[resolve] %s → %s", key, value[:80])
+
+    unresolved = [k for k in computable_meta if k not in results and k not in suggested]
+    if unresolved:
+        logger.warning("[resolve] %d unresolved: %s", len(unresolved), unresolved)
+
+    return results, suggested
 
 
 # ── GCS helpers ───────────────────────────────────────────────────────────────
@@ -516,7 +933,7 @@ def _run_analysis(
         reply=narrative,
         stats=all_stats,
         state_patch={
-            "content_program": {"ta": ta, "dis": dis, "drug": drug},
+            "content_program": {"therapeutic_area": ta, "disease_type": dis, "drug_name": drug},
         },
     )
 
@@ -560,15 +977,31 @@ def resolve(req: ResolveRequest) -> ResolveResponse:
 
     # Build placeholder metadata from manifest column_mappings
     placeholder_meta: dict[str, dict] = {}
-    for source in manifest.get("sources", []):
+    sources = manifest.get("sources", [])
+    for source in sources:
         gcs_path = source.get("gcs_path", "")
         for mapping in source.get("column_mappings", []):
             pk = mapping.get("placeholder_key", "")
             cn = mapping.get("column_name", "")
             if pk and cn and (filter_keys is None or pk in filter_keys):
                 placeholder_meta[pk] = {
-                    "gcs_path":    gcs_path,
-                    "description": f"{mapping.get('role', '')} — column: {cn}",
+                    "gcs_path":      gcs_path,
+                    "description":   f"{mapping.get('role', '')} — column: {cn}",
+                    "positive_value": mapping.get("positive_value"),  # from manifest
+                }
+
+    # Schema-only inference: for requested keys absent from manifest, let the
+    # planner try to derive them from the CSV schema (computation="suggest" likely).
+    if filter_keys:
+        first_gcs_path = next(
+            (s.get("gcs_path", "") for s in sources if s.get("gcs_path")), ""
+        )
+        for pk in filter_keys:
+            if pk not in placeholder_meta and first_gcs_path:
+                placeholder_meta[pk] = {
+                    "gcs_path":      first_gcs_path,
+                    "description":   f"Inferred — no manifest entry; derive from CSV schema",
+                    "positive_value": None,
                 }
 
     saved_path = f"{prefix}/analysis/placeholder_values.json"
@@ -583,26 +1016,29 @@ def resolve(req: ResolveRequest) -> ResolveResponse:
         )
 
     # Group by CSV source so each file is loaded only once
-    file_groups: dict[str, dict[str, str]] = {}
+    file_groups: dict[str, dict[str, dict]] = {}
     for pk, meta in placeholder_meta.items():
-        file_groups.setdefault(meta["gcs_path"], {})[pk] = meta["description"]
+        file_groups.setdefault(meta["gcs_path"], {})[pk] = meta
 
-    llm_client = _llm()
-    resolved: dict[str, str] = {}
+    llm_client   = _llm()
+    resolved:     dict[str, str] = {}
+    all_suggested: dict[str, str] = {}
 
-    for gcs_path, ph_descriptions in file_groups.items():
+    for gcs_path, ph_meta in file_groups.items():
         df = _load_csv(bucket, gcs_path)
         if df is None or df.empty:
             logger.warning("[resolve] Skipping empty/missing CSV: %s", gcs_path)
             continue
-        computed = _dispatch_tools(df, ph_descriptions, llm_client)
-        resolved.update(computed)
+        comp, sugg = _plan_and_execute(df, ph_meta, llm_client, bucket)
+        resolved.update(comp)
+        all_suggested.update(sugg)
         logger.info(
-            "[resolve] %s: resolved %d/%d keys",
-            gcs_path, len(computed), len(ph_descriptions),
+            "[resolve] %s: resolved %d/%d keys, %d suggested",
+            gcs_path, len(comp), len(ph_meta), len(sugg),
         )
 
-    keys_failed = [pk for pk in placeholder_meta if pk not in resolved]
+    keys_failed = [pk for pk in placeholder_meta
+                   if pk not in resolved and pk not in all_suggested]
     if keys_failed:
         logger.warning("[resolve] %d keys unresolved: %s", len(keys_failed), keys_failed)
 
@@ -620,6 +1056,7 @@ def resolve(req: ResolveRequest) -> ResolveResponse:
         saved_path=f"gs://{bucket}/{saved_path}",
         keys_resolved=len(resolved),
         keys_failed=keys_failed,
+        keys_suggested=all_suggested,
     )
 
 
@@ -778,6 +1215,27 @@ def trigger(req: TriggerRequest) -> ActionResponse:
     dis  = req.disease_type.strip()
     drug = req.drug_name.strip()
 
+    # ── Prerequisite: program CTD folder must exist in GCS ───────────────────────
+    # The scaffold step (ctd-api /copy) creates {prefix}/ctd/.keep blobs. If none
+    # exist, the CTD structure has not been copied for this program yet.
+    prefix = _program_prefix(ta, dis, drug)
+    ctd_prefix = f"{prefix}/ctd/"
+    ctd_blobs = list(_gcs_client().bucket(bucket).list_blobs(prefix=ctd_prefix, max_results=1))
+    if not ctd_blobs:
+        return ActionResponse(
+            reply=(
+                f"⚠️ **Program folder not scaffolded** for **{ta} / {dis} / {drug}**.
+\n"
+                "Content generation requires the CTD folder structure to be set up first.\n\n"
+                "**Steps to fix:**\n"
+                "1. Make sure the default ICH CTD structure has been **built and approved**\n"
+                "2. Say **set up authoring for "
+                f"`{ta} / {dis} / {drug}`** to scaffold the program folder\n"
+                "3. Then say **generate content** again."
+            ),
+            state_patch={},
+        )
+
     if not req.force_no_clinical:
         manifest = _load_manifest(bucket, _program_prefix(ta, dis, drug))
         if not manifest or not manifest.get("sources"):
@@ -791,7 +1249,7 @@ def trigger(req: TriggerRequest) -> ActionResponse:
                     "- Say **cancel** to stop and upload clinical data first."
                 ),
                 state_patch={
-                    "awaiting_write_confirm": {"ta": ta, "dis": dis, "drug": drug},
+                    "awaiting_write_confirm": {"therapeutic_area": ta, "disease_type": dis, "drug_name": drug},
                 },
             )
         summary = _summarise_clinical_manifest(manifest)
@@ -808,7 +1266,7 @@ def trigger(req: TriggerRequest) -> ActionResponse:
     patch = {
         "awaiting_write_confirm": None,
         "content_run_id":  run_id,
-        "content_program": {"ta": ta, "dis": dis, "drug": drug},
+        "content_program": {"therapeutic_area": ta, "disease_type": dis, "drug_name": drug},
     }
     return ActionResponse(
         reply=(
@@ -869,6 +1327,99 @@ def content_status(
             "Say **generate content** to start the 3-pass pipeline."
         ),
         state_patch={},
+    )
+
+
+# ── Schema-evolution diff ─────────────────────────────────────────────────────
+
+
+class SchemaDiffRequest(BaseModel):
+    therapeutic_area: str
+    disease_type: str
+    drug_name: str
+    bucket: str | None = Field(default=None)
+
+
+class SchemaDiffResponse(BaseModel):
+    added_placeholders: list[str] = Field(default_factory=list)
+    changed_placeholders: list[str] = Field(default_factory=list)
+    removed_placeholders: list[str] = Field(default_factory=list)
+    affected_sections: list[str] = Field(default_factory=list)
+    has_changes: bool = False
+
+
+def _extract_placeholder_map(manifest: dict) -> dict[str, dict]:
+    """Extract {placeholder_key: {role, ctd_section_keys}} from a manifest."""
+    result: dict[str, dict] = {}
+    for source in manifest.get("sources", []):
+        for cm in source.get("column_mappings", []):
+            pk = cm.get("placeholder_key", "")
+            if pk:
+                result[pk] = {
+                    "role":             cm.get("role", ""),
+                    "ctd_section_keys": sorted(cm.get("ctd_section_keys", [])),
+                }
+    return result
+
+
+@app.post("/schema-diff", response_model=SchemaDiffResponse)
+def schema_diff(req: SchemaDiffRequest) -> SchemaDiffResponse:
+    """Compare the current manifest against its last snapshot.
+
+    Returns which placeholder keys were added, changed, or removed since the
+    previous CSV upload, along with the affected CTD sections.  The content_worker
+    calls this after an upload to decide whether a schema-patch re-write pass is
+    needed.  When no snapshot exists (first upload) the response reports
+    ``has_changes=False``.
+    """
+    bucket = req.bucket or _DEFAULT_BUCKET
+    if not bucket:
+        raise HTTPException(status_code=422, detail="bucket is required.")
+
+    prefix   = _program_prefix(req.therapeutic_area, req.disease_type, req.drug_name)
+    manifest = _load_manifest(bucket, prefix)
+    if not manifest:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"No clinical manifest found for "
+                f"{req.therapeutic_area}/{req.disease_type}/{req.drug_name}."
+            ),
+        )
+
+    snap_path = f"{prefix}/clinical_data/manifest_snapshot.json"
+    try:
+        snap_blob = _gcs_client().bucket(bucket).blob(snap_path)
+        if not snap_blob.exists():
+            # First upload — no previous schema to compare against
+            return SchemaDiffResponse()
+        snapshot = json.loads(snap_blob.download_as_bytes())
+    except Exception as exc:
+        logger.warning("[schema-diff] Could not load snapshot: %s", exc)
+        return SchemaDiffResponse()
+
+    current_map  = _extract_placeholder_map(manifest)
+    snapshot_map = _extract_placeholder_map(snapshot)
+
+    added   = sorted(pk for pk in current_map  if pk not in snapshot_map)
+    removed = sorted(pk for pk in snapshot_map if pk not in current_map)
+    changed = sorted(
+        pk for pk in current_map
+        if pk in snapshot_map and current_map[pk] != snapshot_map[pk]
+    )
+
+    affected: set[str] = set()
+    for pk in added + changed:
+        affected.update(current_map[pk]["ctd_section_keys"])
+    for pk in removed:
+        affected.update(snapshot_map[pk]["ctd_section_keys"])
+
+    return SchemaDiffResponse(
+        added_placeholders=added,
+        changed_placeholders=changed,
+        removed_placeholders=removed,
+        affected_sections=sorted(affected),
+        has_changes=bool(added or changed or removed),
     )
 
 

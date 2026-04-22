@@ -92,8 +92,15 @@ def run_validator(
         summary="",
     )
 
-    final_state: ValidatorState = compiled.invoke(initial_state)
+    final_state = compiled.invoke(initial_state)
 
+    # LangGraph .invoke() returns a plain dict, not the typed state object
+    if isinstance(final_state, dict):
+        return ValidationResult(
+            passed=final_state.get("passed", True),
+            issues=final_state.get("issues", []),
+            summary=final_state.get("summary", ""),
+        )
     return ValidationResult(
         passed=final_state.passed,
         issues=final_state.issues,

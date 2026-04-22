@@ -45,15 +45,35 @@ _here = os.path.dirname(os.path.abspath(__file__))
 if _here not in sys.path:
     sys.path.insert(0, _here)
 
-from main import CoordinatorDecision, run_coordinator  # LangGraph coordinator
+from coordinator import CoordinatorDecision, run_coordinator  # global UI coordinator
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
 _CTD_API_URL             = os.environ.get("CTD_API_URL", "http://localhost:8081")
-_ICH4_ORCHESTRATOR_URL   = os.environ.get("ICH4_ORCHESTRATOR_URL", "http://localhost:8082")
 _ICH4_WRITER_URL         = os.environ.get("ICH4_WRITER_URL", "http://localhost:8083")
 _CLINICAL_ANALYST_URL    = os.environ.get("CLINICAL_ANALYST_URL", "http://localhost:8084")
 _DEFAULT_BUCKET          = os.environ.get("GCS_BUCKET", "pharma-reguatory-author-life-science")
+
+# ── OIDC helper ───────────────────────────────────────────────────────────────
+
+def _oidc_headers(base_url: str) -> dict[str, str]:
+    """Return Authorization header with a service-account OIDC token.
+
+    Audience is the base URL of the target Cloud Run service (no path).
+    Falls back to empty dict (unauthenticated) when running locally without
+    ADC/metadata server — prevents dev-loop breakage.
+    """
+    try:
+        from google.auth.transport.requests import Request as AuthRequest
+        from google.oauth2.id_token import fetch_id_token
+        # Strip path — Cloud Run audience is always the service root URL
+        from urllib.parse import urlparse
+        p = urlparse(base_url)
+        audience = f"{p.scheme}://{p.netloc}"
+        token = fetch_id_token(AuthRequest(), audience)
+        return {"Authorization": f"Bearer {token}"}
+    except Exception:
+        return {}
 
 # ── API client helpers ────────────────────────────────────────────────────────
 
@@ -61,7 +81,7 @@ def _ctd_post(path: str, payload: dict, timeout: int = 60) -> dict:
     """POST to ctd-api and return parsed JSON. Returns error reply on failure."""
     url = f"{_CTD_API_URL.rstrip('/')}{path}"
     try:
-        resp = requests.post(url, json=payload, timeout=timeout)
+        resp = requests.post(url, json=payload, headers=_oidc_headers(_CTD_API_URL), timeout=timeout)
         resp.raise_for_status()
         return resp.json()
     except Exception as exc:
@@ -73,7 +93,19 @@ def _ctd_get(path: str, params: dict, timeout: int = 30) -> dict:
     url = f"{_CTD_API_URL.rstrip('/')}{path}"
     try:
         resp = requests.get(url, params={k: v for k, v in params.items() if v is not None},
-                            timeout=timeout)
+                            headers=_oidc_headers(_CTD_API_URL), timeout=timeout)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception:
+        return {}
+
+
+def _writer_get(path: str, params: dict, timeout: int = 30) -> dict:
+    """GET from ich4-writer and return parsed JSON. Returns {} on failure."""
+    url = f"{_ICH4_WRITER_URL.rstrip('/')}{path}"
+    try:
+        resp = requests.get(url, params={k: v for k, v in params.items() if v is not None},
+                            headers=_oidc_headers(_ICH4_WRITER_URL), timeout=timeout)
         resp.raise_for_status()
         return resp.json()
     except Exception:
@@ -84,7 +116,7 @@ def _ich4_post(base_url: str, path: str, payload: dict, timeout: int = 300) -> d
     """POST to an ICH4 service (orchestrator or writer). Returns error reply on failure."""
     url = f"{base_url.rstrip('/')}{path}"
     try:
-        resp = requests.post(url, json=payload, timeout=timeout)
+        resp = requests.post(url, json=payload, headers=_oidc_headers(base_url), timeout=timeout)
         resp.raise_for_status()
         return resp.json()
     except Exception as exc:
@@ -95,7 +127,7 @@ def _analyst_post(path: str, payload: dict, timeout: int = 120) -> dict:
     """POST to the clinical-analyst service. Returns error reply on failure."""
     url = f"{_CLINICAL_ANALYST_URL.rstrip('/')}{path}"
     try:
-        resp = requests.post(url, json=payload, timeout=timeout)
+        resp = requests.post(url, json=payload, headers=_oidc_headers(_CLINICAL_ANALYST_URL), timeout=timeout)
         resp.raise_for_status()
         return resp.json()
     except Exception as exc:
@@ -128,14 +160,15 @@ def _initial_state(bucket: str, browser_session: str):
     paths    = data.get("folder_paths", [])
     approved = data.get("approved", False)
     state = {
-        "session_id":       sid,
-        "bucket":           bkt,
-        "folder_paths":     paths,
-        "approved":         approved,
-        "canonical_exists": data.get("canonical_exists", False),
-        "ctd_output":       data.get("ctd_output"),
-        "content_program":  data.get("content_program"),
-        "content_run_id":   data.get("content_run_id"),
+        "session_id":               sid,
+        "bucket":                   bkt,
+        "folder_paths":             paths,
+        "approved":                 approved,
+        "canonical_exists":         data.get("canonical_exists", False),
+        "program_scaffold_exists":  data.get("program_scaffold_exists", False),
+        "ctd_output":               data.get("ctd_output"),
+        "content_program":          data.get("content_program"),
+        "content_run_id":           data.get("content_run_id"),
     }
 
     if paths:
@@ -177,6 +210,8 @@ def chat(message: str, history: list, state: dict, bucket: str, reviewer_email: 
     2. Run coordinator → CoordinatorDecision.
     3. If clarify/help → reply directly (no API call).
     4. If proceed → route to the correct API endpoint.
+
+    Returns a single tuple (no streaming/SSE) so IAP proxying works correctly.
     """
     history    = list(history or [])
     state      = state or {}
@@ -186,7 +221,7 @@ def chat(message: str, history: list, state: dict, bucket: str, reviewer_email: 
 
     history.append({"role": "user", "content": message})
 
-    # ── Short-circuit: disapproval feedback loop ──────────────────────────────#
+    # ── Short-circuit: disapproval feedback loop ──────────────────────────────
     _EXTRACT_KW = ("re-extract", "reextract", "re extract", "extract", "rebuild", "refresh")
     _ESCAPE_KW  = ("generate", "content", "status", "copy", "write", "approve",
                    "scaffold", "set up", "setup", "template", "analyse", "analyze",
@@ -195,8 +230,6 @@ def chat(message: str, history: list, state: dict, bucket: str, reviewer_email: 
     is_escape  = any(kw in msg_lower for kw in _ESCAPE_KW)
 
     if state.get("awaiting_feedback") and not is_extract and not is_escape:
-        history.append({"role": "assistant", "content": "_Thinking…_"})
-        yield history, state, gr.update(value="")
         result = _ctd_post("/refine", {
             "session_id":     session_id,
             "bucket":         bkt,
@@ -204,10 +237,9 @@ def chat(message: str, history: list, state: dict, bucket: str, reviewer_email: 
             "prior_feedback": state.get("disapproval_feedback", "") or "",
             "ctd_output":     state.get("ctd_output"),
         })
-        history[-1] = {"role": "assistant", "content": result.get("reply", "_(no reply)_")}
+        history.append({"role": "assistant", "content": result.get("reply", "_(no reply)_")})
         state = {**state, **result.get("state_patch", {})}
-        yield history, state, gr.update(value="")
-        return
+        return history, state, gr.update(value="")
 
     if state.get("awaiting_feedback") and (is_extract or is_escape):
         state = {**state, "awaiting_feedback": False}
@@ -215,13 +247,11 @@ def chat(message: str, history: list, state: dict, bucket: str, reviewer_email: 
     # ── Short-circuit: awaiting write confirmation (no clinical data) ─────────
     if state.get("awaiting_write_confirm"):
         pending = state["awaiting_write_confirm"]
-        ta_p, dis_p, drug_p = pending.get("ta", ""), pending.get("dis", ""), pending.get("drug", "")
+        ta_p, dis_p, drug_p = pending.get("therapeutic_area", ""), pending.get("disease_type", ""), pending.get("drug_name", "")
         _YES = ("yes", "proceed", "go ahead", "ok", "sure", "continue", "confirm")
         _NO  = ("no", "cancel", "stop", "skip")
 
         if any(msg_lower.startswith(w) for w in _YES):
-            history.append({"role": "assistant", "content": "_Queuing…_"})
-            yield history, state, gr.update(value="")
             result = _analyst_post("/trigger", {
                 "session_id":        session_id,
                 "bucket":            bkt,
@@ -231,10 +261,9 @@ def chat(message: str, history: list, state: dict, bucket: str, reviewer_email: 
                 "force_no_clinical": True,
                 "state":             state,
             })
-            history[-1] = {"role": "assistant", "content": result.get("reply", "_(no reply)_")}
+            history.append({"role": "assistant", "content": result.get("reply", "_(no reply)_")})
             state = {**state, **result.get("state_patch", {})}
-            yield history, state, gr.update(value="")
-            return
+            return history, state, gr.update(value="")
 
         elif any(msg_lower.startswith(w) for w in _NO):
             history.append({"role": "assistant", "content": (
@@ -242,30 +271,35 @@ def chat(message: str, history: list, state: dict, bucket: str, reviewer_email: 
                 "Register a clinical CSV for this program first, then say **generate content** again."
             )})
             state = {**state, "awaiting_write_confirm": None}
-            yield history, state, gr.update(value="")
-            return
+            return history, state, gr.update(value="")
         else:
             state = {**state, "awaiting_write_confirm": None}
 
-    # ── Show thinking indicator while coordinator runs ────────────────────────
-    history.append({"role": "assistant", "content": "_Thinking…_"})
-    yield history, state, gr.update(value="")
-
     # ── Coordinator: understand intent + check prerequisites ──────────────────
     decision: CoordinatorDecision = run_coordinator(message, state)
-    history.pop()  # remove placeholder
 
     # ── Clarify: coordinator composes the reply — no downstream API call ──────
     if decision.outcome == "clarify":
         history.append({"role": "assistant", "content": decision.reply or "Could you clarify what you need?"})
-        yield history, state, gr.update(value="")
-        return
+        return history, state, gr.update(value="")
+
+    # ── Workflow pre-flight helper ─────────────────────────────────────────────
+    # Reusable state checks used across multiple intents.
+    _canonical_ready   = state.get("approved") or state.get("canonical_exists")
+    _prog_state        = state.get("content_program") or state.get("ctd_program") or {}
+    _scaffold_ready    = state.get("program_scaffold_exists") or bool(_prog_state)
+
+    def _guide(msg: str):
+        """Append a guidance reply and return early from chat()."""
+        history.append({"role": "assistant", "content": msg})
+        return history, {**state}, gr.update(value="")
 
     # ── Proceed: route to the correct API ────────────────────────────────────
     intent = decision.intent
     result: dict = {}
 
     if intent == "extract":
+        # No pre-requisite — this is always step 1
         result = _ctd_post("/extract", {
             "session_id":     session_id,
             "bucket":         bkt,
@@ -274,6 +308,16 @@ def chat(message: str, history: list, state: dict, bucket: str, reviewer_email: 
         })
 
     elif intent == "approve":
+        # Prerequisite: a CTD structure must have been extracted (folder_paths exist)
+        if not state.get("folder_paths"):
+            return _guide(
+                "⚠️ **Nothing to approve yet.**\n\n"
+                "The workflow starts by building the ICH CTD structure:\n\n"
+                "**Step 1** → Say **build the ICH CTD structure** — I'll query the ICH M4 guidelines "
+                "index and assemble the module → section → subsection hierarchy.\n\n"
+                "Once extracted you can review it and say **approve** to publish it as the default template.\n\n"
+                "> ⏳ Structure build takes 3–8 minutes."
+            )
         result = _ctd_post("/approve", {
             "session_id":       session_id,
             "bucket":           bkt,
@@ -285,12 +329,35 @@ def chat(message: str, history: list, state: dict, bucket: str, reviewer_email: 
         })
 
     elif intent == "disapprove":
+        # Prerequisite: a CTD structure must exist to disapprove
+        if not state.get("folder_paths") and not _canonical_ready:
+            return _guide(
+                "⚠️ **No CTD structure to reject.**\n\n"
+                "Say **build the ICH CTD structure** first to extract a structure you can review."
+            )
         result = _ctd_post("/disapprove", {
             "session_id": session_id,
             "feedback":   decision.feedback,
         })
 
     elif intent == "copy":
+        # Prerequisite 1: canonical template must be approved
+        if not _canonical_ready:
+            return _guide(
+                "⚠️ **No default CTD template approved yet.**\n\n"
+                "Before setting up a program folder, publish the default template:\n\n"
+                "1. Say **build the ICH CTD structure** — extracts the full module hierarchy (3–8 min)\n"
+                "2. Review the tree, then say **approve** to publish it as the shared default\n\n"
+                "Once approved, I can scaffold any number of program folders instantly."
+            )
+        # Prerequisite 2: must know which program to scaffold
+        if not decision.therapeutic_area or not decision.disease_type or not decision.drug_name:
+            return _guide(
+                "⚠️ **I need the program details to scaffold a folder.**\n\n"
+                "Please specify the therapeutic area, disease, and drug:\n\n"
+                "> *set up authoring for `<therapeutic_area> / <disease> / <drug>`*\n\n"
+                "Example: *set up authoring for neurology / bells palsy / prednisolone*"
+            )
         result = _ctd_post("/copy", {
             "session_id":       session_id,
             "bucket":           bkt,
@@ -301,72 +368,87 @@ def chat(message: str, history: list, state: dict, bucket: str, reviewer_email: 
         })
 
     elif intent == "write":
+        _ta   = decision.therapeutic_area or _prog_state.get("therapeutic_area", "")
+        _dis  = decision.disease_type     or _prog_state.get("disease_type", "")
+        _drug = decision.drug_name        or _prog_state.get("drug_name", "")
+
+        # Prerequisite 1: CTD structure must be approved / canonical exists
+        if not _canonical_ready:
+            return _guide(
+                "⚠️ **No approved CTD structure found.**\n\n"
+                "Content generation requires a published ICH CTD template. Here's the full workflow:\n\n"
+                "1. Say **build the ICH CTD structure** — extracts the ICH M4 hierarchy (3–8 min)\n"
+                "2. Say **approve** — publishes it as the shared default template\n"
+                "3. Say **set up authoring for `<area> / <disease> / <drug>`** — scaffolds a program folder\n"
+                "4. Upload the clinical CSV via the sidebar\n"
+                "5. Say **generate content** — starts the AI content generation pipeline"
+            )
+        # Prerequisite 2: program folder must be scaffolded
+        if not _scaffold_ready:
+            return _guide(
+                "⚠️ **No program folder scaffolded yet.**\n\n"
+                "Before generating content, set up a program directory:\n\n"
+                "→ Say **set up authoring for `<therapeutic_area> / <disease> / <drug>`**\n\n"
+                "Example: *set up authoring for neurology / bells palsy / prednisolone*\n\n"
+                "This copies the approved CTD template into a program-specific folder in GCS, "
+                "and also maps any uploaded clinical CSV to that program."
+            )
+        # Prerequisite 3: must know which program to generate content for
+        if not _ta or not _dis or not _drug:
+            return _guide(
+                "⚠️ **I couldn't identify the program** to generate content for.\n\n"
+                "Please specify it explicitly:\n\n"
+                "> *generate content for `<therapeutic_area> / <disease> / <drug>`*\n\n"
+                "Example: *generate content for neurology / bells palsy / prednisolone*"
+            )
+        # Clinical CSV is optional — /trigger will ask for confirmation if missing
         result = _analyst_post("/trigger", {
-            "session_id":              session_id,
-            "bucket":                  bkt,
-            "therapeutic_area":        decision.therapeutic_area,
-            "disease_type":            decision.disease_type,
-            "drug_name":               decision.drug_name,
-            "program_scaffold_exists": state.get("program_scaffold_exists", False),
-            "state":                   state,
+            "session_id":       session_id,
+            "bucket":           bkt,
+            "therapeutic_area": _ta,
+            "disease_type":     _dis,
+            "drug_name":        _drug,
+            "state":            state,
         })
 
     elif intent == "status":
         prog = state.get("content_program") or {}
         result = _ctd_get("/status_query", {
-            "session_id": session_id,
-            "bucket":     bkt,
-            "ta":         prog.get("ta"),
-            "dis":        prog.get("dis"),
-            "drug":       prog.get("drug"),
-            "msg_lower":  msg_lower,
+            "session_id":       session_id,
+            "bucket":           bkt,
+            "therapeutic_area": prog.get("therapeutic_area"),
+            "disease_type":     prog.get("disease_type"),
+            "drug_name":        prog.get("drug_name"),
+            "msg_lower":        msg_lower,
         })
 
-    elif intent == "generate_template":
-        # Generate ICH-grounded section templates for the program (no write)
-        result = _ich4_post(
-            _ICH4_ORCHESTRATOR_URL,
-            "/generate",
-            {
-                "program": {
-                    "therapeutic_area": decision.therapeutic_area,
-                    "disease_type":     decision.disease_type,
-                    "drug_name":        decision.drug_name,
-                },
-                "include_clinical_data": True,
-                "include_ich_context":   True,
-                "module_filter":         decision.module_filter or [],
-            },
-            timeout=300,
-        )
-        # Wrap the orchestrator response into the standard reply/state_patch shape
-        if "reply" not in result:
-            templates = result.get("templates") or []
-            ta   = decision.therapeutic_area
-            dis  = decision.disease_type
-            drug = decision.drug_name
-            n    = len(templates)
-            result = {
-                "reply": (
-                    f"✅ Generated **{n} templates** for `{ta} / {dis} / {drug}`.\n\n"
-                    "Templates are saved in GCS. Say **generate content** to run the full writing pipeline."
-                    if n else
-                    f"⚠️ No templates were returned for `{ta} / {dis} / {drug}`. "
-                    "Check that the program or clinical data exists in GCS."
-                ),
-                "state_patch": {"content_program": {"ta": ta, "dis": dis, "drug": drug}},
-            }
-
     elif intent == "rewrite_section":
-        # Regenerate specific CTD section documents via the writer service
+        # Prerequisite: content generation must have run first (templates exist in GCS)
+        if not _scaffold_ready:
+            return _guide(
+                "⚠️ **No program folder set up yet.**\n\n"
+                "To rewrite a section the full pipeline must have run first:\n\n"
+                "1. **Build + approve** the ICH CTD structure\n"
+                "2. **Set up authoring** for the program\n"
+                "3. **Generate content** — runs the template + writer pipeline\n"
+                "4. Then say **rewrite section `<section_key>`**"
+            )
+        _r_ta   = decision.therapeutic_area or _prog_state.get("therapeutic_area", "")
+        _r_dis  = decision.disease_type     or _prog_state.get("disease_type", "")
+        _r_drug = decision.drug_name        or _prog_state.get("drug_name", "")
+        if not _r_ta or not _r_dis or not _r_drug:
+            return _guide(
+                "⚠️ **I need the program details to rewrite a section.**\n\n"
+                "> *rewrite section 2.5 for `<therapeutic_area> / <disease> / <drug>`*"
+            )
         result = _ich4_post(
             _ICH4_WRITER_URL,
             "/write",
             {
                 "program": {
-                    "therapeutic_area": decision.therapeutic_area,
-                    "disease_type":     decision.disease_type,
-                    "drug_name":        decision.drug_name,
+                    "therapeutic_area": _r_ta,
+                    "disease_type":     _r_dis,
+                    "drug_name":        _r_drug,
                 },
                 "bucket_name": bkt,
                 "sections":    decision.section_keys or [],
@@ -374,58 +456,91 @@ def chat(message: str, history: list, state: dict, bucket: str, reviewer_email: 
             timeout=300,
         )
         if "reply" not in result:
-            ta   = decision.therapeutic_area
-            dis  = decision.disease_type
-            drug = decision.drug_name
             docs = result.get("documents") or []
             secs = ", ".join(d.get("section_key", "") for d in docs) if docs else "all sections"
             result = {
                 "reply": (
-                    f"✅ Rewrote **{len(docs)} section(s)** for `{ta} / {dis} / {drug}`.\n\n"
+                    f"✅ Rewrote **{len(docs)} section(s)** for `{_r_ta} / {_r_dis} / {_r_drug}`.\n\n"
                     f"Sections: `{secs}`"
                     if docs else
-                    f"⚠️ No sections were written for `{ta} / {dis} / {drug}`. "
-                    "Check that templates exist in GCS (say **generate templates** first)."
+                    f"⚠️ No sections were written for `{_r_ta} / {_r_dis} / {_r_drug}`. "
+                    "Check that templates exist in GCS (say **generate content** first)."
                 ),
                 "state_patch": {},
             }
 
     elif intent == "analyze_data":
-        # Run clinical data analysis for the program
+        _a_ta   = decision.therapeutic_area or _prog_state.get("therapeutic_area", "")
+        _a_dis  = decision.disease_type     or _prog_state.get("disease_type", "")
+        _a_drug = decision.drug_name        or _prog_state.get("drug_name", "")
+        if not _a_ta or not _a_dis or not _a_drug:
+            return _guide(
+                "⚠️ **I need the program details to analyse clinical data.**\n\n"
+                "> *analyse clinical data for `<therapeutic_area> / <disease> / <drug>`*\n\n"
+                "Note: you must also upload the clinical CSV via the sidebar first."
+            )
         result = _analyst_post(
             "/analyze",
             {
-                "therapeutic_area": decision.therapeutic_area,
-                "disease_type":     decision.disease_type,
-                "drug_name":        decision.drug_name,
+                "therapeutic_area": _a_ta,
+                "disease_type":     _a_dis,
+                "drug_name":        _a_drug,
                 "bucket":           bkt,
                 "question":         message,
             },
         )
 
     else:  # help / unknown — handled locally, no API call
+        # Show current workflow status + guidance based on where the user is
+        _step = "unknown"
+        if not _canonical_ready:
+            _step = "step1"
+        elif not _scaffold_ready:
+            _step = "step2"
+        else:
+            _step = "step3"
+
+        _status_hint = {
+            "step1": (
+                "📍 **Current status:** No approved CTD template yet.\n"
+                "→ Say **build the ICH CTD structure** to start."
+            ),
+            "step2": (
+                "📍 **Current status:** CTD template approved. No program scaffolded yet.\n"
+                "→ Say **set up authoring for `<area> / <disease> / <drug>`** to create a program folder."
+            ),
+            "step3": (
+                "📍 **Current status:** Program folder ready.\n"
+                "→ Upload clinical CSV via sidebar, then say **generate content**."
+            ),
+        }.get(_step, "")
+
         result = {
             "reply": (
-                "I can help you with the **Regulatory Authoring Platform**. Here are examples:\n\n"
-                "**CTD structure**\n"
-                "- *Generate the ICH CTD structure from the guidelines*\n"
-                "- *Approve this structure* • *Re-extract with updates*\n"
-                "- *Set up neurology / bells palsy / prednisolone*\n\n"
-                "**Content generation**\n"
-                "- *Generate content for neurology / bells palsy / prednisolone*\n"
-                "- *Preview templates for module 5* • *Rewrite section 2.5*\n\n"
-                "**Clinical data**\n"
-                "- *Analyse the clinical data for neurology / bells palsy / prednisolone*\n"
-                "- *What does the trial data show for prednisolone?*\n\n"
-                "**Status**\n"
-                "- *What is currently running?* • *What have you loaded so far?*"
+                "I'm your **Regulatory Authoring Assistant**. Here's the full workflow:\n\n"
+                "**Step 1 — Build the ICH CTD structure**\n"
+                "- *build the ICH CTD structure* — queries the ICH M4 guidelines index (3–8 min)\n"
+                "- *approve* — publishes it as the shared default template\n\n"
+                "**Step 2 — Set up a program folder**\n"
+                "- *set up authoring for neurology / bells palsy / prednisolone*\n"
+                "  → Copies the approved template to a program-specific GCS folder\n\n"
+                "**Step 3 — Upload clinical data** *(optional but recommended)*\n"
+                "- Upload the trial CSV via the 📎 sidebar — it maps to the program automatically\n\n"
+                "**Step 4 — Generate content**\n"
+                "- *generate content* — runs the template engine + AI writer pipeline\n"
+                "  → Resolves `{{placeholders}}` from clinical data, generates all CTD sections\n\n"
+                "**Step 5 — Review & refine**\n"
+                "- *content status* — check generation progress\n"
+                "- *rewrite section 2.5* — regenerate a specific section\n"
+                "- *what does the trial data show?* — query clinical data\n\n"
+                f"---\n{_status_hint}"
             ),
             "state_patch": {},
         }
 
     state = {**state, **result.get("state_patch", {})}
     history.append({"role": "assistant", "content": result.get("reply", "_(no reply)_")})
-    yield history, state, gr.update(value="")
+    return history, state, gr.update(value="")
 
 
 # ── Auto-poll timer ───────────────────────────────────────────────────────────
@@ -440,11 +555,11 @@ def _auto_poll(history: list, state: dict, bucket: str):
 
     prog = st.get("content_program") or {}
     data = _ctd_get("/status", {
-        "session_id": sid,
-        "bucket":     bkt,
-        "ta":         prog.get("ta", "") or None,
-        "dis":        prog.get("dis", "") or None,
-        "drug":       prog.get("drug", "") or None,
+        "session_id":       sid,
+        "bucket":           bkt,
+        "therapeutic_area": prog.get("therapeutic_area", "") or None,
+        "disease_type":     prog.get("disease_type", "") or None,
+        "drug_name":        prog.get("drug_name", "") or None,
     })
     ext  = data.get("extraction") or {}
     cont = data.get("content") or {}
@@ -472,7 +587,7 @@ def _auto_poll(history: list, state: dict, bucket: str):
     # ── Content generation complete / failed / timed_out ─────────────────────
     if prog and st.get("content_run_id") and cont:
         cstatus = cont.get("status")
-        ta, dis, drg = prog.get("ta", ""), prog.get("dis", ""), prog.get("drug", "")
+        ta, dis, drg = prog.get("therapeutic_area", ""), prog.get("disease_type", ""), prog.get("drug_name", "")
 
         if cstatus == "done":
             sections = cont.get("sections_written", "?")
@@ -529,6 +644,7 @@ def _upload_clinical_csv(csv_file, ta: str, dis: str, drug: str, bucket: str) ->
                 f"{_ICH4_WRITER_URL.rstrip('/')}/clinical-data/upload",
                 data={"therapeutic_area": ta, "disease_type": dis, "drug_name": drug, "bucket_name": bkt},
                 files={"file": (os.path.basename(local_path), f, "text/csv")},
+                headers=_oidc_headers(_ICH4_WRITER_URL),
                 timeout=120,
             )
         resp.raise_for_status()
@@ -550,11 +666,53 @@ def _update_upload_panel(state: dict):
     if prog:
         return (
             gr.update(visible=True),
-            gr.update(value=prog.get("ta", "")),
-            gr.update(value=prog.get("dis", "")),
-            gr.update(value=prog.get("drug", "")),
+            gr.update(value=prog.get("therapeutic_area", "")),
+            gr.update(value=prog.get("disease_type", "")),
+            gr.update(value=prog.get("drug_name", "")),
         )
     return gr.update(visible=True), gr.update(value=""), gr.update(value=""), gr.update(value="")
+
+
+def _list_documents(ta: str, dis: str, drug: str, bucket: str) -> tuple:
+    """Fetch document list from ich4-writer and return dropdown choices + status."""
+    if not ta or not dis or not drug:
+        return gr.update(choices=[], value=None), "⚠️ Fill in Therapeutic Area, Disease, and Drug Name first."
+    data = _writer_get("/documents", {
+        "therapeutic_area": ta,
+        "disease_type": dis,
+        "drug_name": drug,
+        "bucket_name": bucket or _DEFAULT_BUCKET,
+    })
+    docs = data.get("documents", [])
+    if not docs:
+        return gr.update(choices=[], value=None), "No generated documents found for this program yet."
+    choices = [
+        (f"{d['module']} › {d['section_label']}", f"{d['module']}|{d['section_key']}")
+        for d in docs
+    ]
+    return gr.update(choices=choices, value=None), f"✅ Found **{len(docs)}** sections."
+
+
+def _read_document(selection: str, ta: str, dis: str, drug: str, bucket: str) -> str:
+    """Fetch and return the markdown content of the selected section."""
+    if not selection:
+        return ""
+    parts = selection.split("|", 1)
+    if len(parts) != 2:
+        return "⚠️ Invalid selection."
+    module, section_key = parts
+    data = _writer_get("/documents/read", {
+        "therapeutic_area": ta,
+        "disease_type": dis,
+        "drug_name": drug,
+        "module": module,
+        "section_key": section_key,
+        "bucket_name": bucket or _DEFAULT_BUCKET,
+    })
+    content = data.get("content", "")
+    if not content:
+        return "⚠️ Could not load section content."
+    return content
 
 
 # ── Gradio UI ─────────────────────────────────────────────────────────────────
@@ -670,20 +828,22 @@ with gr.Blocks(title="Regulatory Authoring Platform", css=_CSS, theme=_theme, he
         show_label=False, avatar_images=(None, None), render_markdown=True,
     )
 
-    msg_input = gr.Textbox(
-        placeholder="Describe what you need — e.g. set up authoring for oncology / lung cancer / carboplatin",
-        label="", lines=1, max_lines=4, autofocus=True, show_label=False,
-    )
+    with gr.Row():
+        msg_input = gr.Textbox(
+            placeholder="Describe what you need — e.g. set up authoring for oncology / lung cancer / carboplatin",
+            label="", lines=1, max_lines=4, autofocus=True, show_label=False,
+        )
+        send_btn = gr.Button("➤", variant="primary", scale=0, min_width=60)
 
+    _example_btns: list = []
     with gr.Row(elem_classes=["qa-row"]):
         for ex in _EXAMPLES:
-            gr.Button(ex, size="sm").click(fn=lambda m=ex: m, outputs=msg_input)
+            _example_btns.append((gr.Button(ex, size="sm"), ex))
 
     with gr.Accordion("⚙  Configuration", open=False):
         with gr.Row():
             email_input   = gr.Textbox(label="Compliance officer email", placeholder="officer@example.com", scale=2)
             bucket_input  = gr.Textbox(label="GCS document bucket", value=_DEFAULT_BUCKET, scale=2)
-            api_url_input = gr.Textbox(label="CTD API URL", value=_CTD_API_URL, scale=3)
 
     with gr.Accordion("🔬  Clinical Data Upload", open=False, visible=True) as _upload_accordion:
         gr.Markdown(
@@ -705,6 +865,34 @@ with gr.Blocks(title="Regulatory Authoring Platform", css=_CSS, theme=_theme, he
             outputs=upload_status,
         )
 
+    with gr.Accordion("📄  Generated Documents", open=False) as _docs_accordion:
+        gr.Markdown(
+            "Browse and read generated CTD section content. "
+            "Enter the program details and click **Load Sections** to list available documents."
+        )
+        with gr.Row():
+            docs_ta   = gr.Textbox(label="Therapeutic Area",  placeholder="e.g. neurology",    scale=1)
+            docs_dis  = gr.Textbox(label="Disease",           placeholder="e.g. bells palsy",  scale=1)
+            docs_drug = gr.Textbox(label="Drug Name",         placeholder="e.g. prednisolone", scale=1)
+        with gr.Row():
+            docs_load_btn = gr.Button("Load Sections", variant="primary", scale=1)
+        docs_status = gr.Markdown(value="")
+        docs_dropdown = gr.Dropdown(
+            choices=[], label="Select a section to read", interactive=True
+        )
+        docs_content = gr.Markdown(value="", label="", elem_classes=["chatbot-wrap"])
+
+        docs_load_btn.click(
+            fn=_list_documents,
+            inputs=[docs_ta, docs_dis, docs_drug, bucket_input],
+            outputs=[docs_dropdown, docs_status],
+        )
+        docs_dropdown.change(
+            fn=_read_document,
+            inputs=[docs_dropdown, docs_ta, docs_dis, docs_drug, bucket_input],
+            outputs=docs_content,
+        )
+
     def _on_load(bucket: str, browser_session: str):
         return _initial_state(bucket or _DEFAULT_BUCKET, browser_session)
 
@@ -716,12 +904,32 @@ with gr.Blocks(title="Regulatory Authoring Platform", css=_CSS, theme=_theme, he
         inputs=[_state_init],
         outputs=[_upload_accordion, upload_ta, upload_dis, upload_drug],
     )
+    _state_init.change(
+        fn=lambda s: (
+            gr.update(value=(s or {}).get("content_program", {}).get("therapeutic_area", "")),
+            gr.update(value=(s or {}).get("content_program", {}).get("disease_type", "")),
+            gr.update(value=(s or {}).get("content_program", {}).get("drug_name", "")),
+        ),
+        inputs=[_state_init],
+        outputs=[docs_ta, docs_dis, docs_drug],
+    )
 
     msg_input.submit(
         chat,
         inputs=[msg_input, chatbot, _state_init, bucket_input, email_input],
         outputs=[chatbot, _state_init, msg_input],
     )
+    send_btn.click(
+        chat,
+        inputs=[msg_input, chatbot, _state_init, bucket_input, email_input],
+        outputs=[chatbot, _state_init, msg_input],
+    )
+    for _btn, _ex in _example_btns:
+        (_btn
+            .click(fn=lambda m=_ex: m, outputs=msg_input)
+            .then(fn=chat,
+                  inputs=[msg_input, chatbot, _state_init, bucket_input, email_input],
+                  outputs=[chatbot, _state_init, msg_input]))
 
     poll_timer = gr.Timer(value=20, active=True)
     poll_timer.tick(

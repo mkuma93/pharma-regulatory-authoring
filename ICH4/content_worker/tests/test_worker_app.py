@@ -30,6 +30,10 @@ _mock_gcs = MagicMock()
 with patch("google.cloud.storage.Client", return_value=_mock_gcs):
     from worker_app import _program_prefix, _oidc_headers, app  # noqa: E402
 
+# Ensure worker_app._gcs_client points to our mock regardless of import order
+import worker_app as _worker_app_module  # noqa: E402
+_worker_app_module._gcs_client = _mock_gcs
+
 client = TestClient(app)
 
 
@@ -173,7 +177,10 @@ class TestGenerateHappyPath:
         mock_async_client = AsyncMock()
         mock_async_client.__aenter__ = AsyncMock(return_value=mock_async_client)
         mock_async_client.__aexit__ = AsyncMock(return_value=False)
-        mock_async_client.post = AsyncMock(side_effect=[orch_resp, writer_resp])
+        # 3 DAG passes × (1 orchestrator + 1 writer) = 6 calls
+        mock_async_client.post = AsyncMock(
+            side_effect=[orch_resp, writer_resp, orch_resp, writer_resp, orch_resp, writer_resp]
+        )
 
         with patch("worker_app._oidc_headers", return_value={}), \
              patch("httpx.AsyncClient", return_value=mock_async_client):
@@ -182,7 +189,7 @@ class TestGenerateHappyPath:
         assert resp.status_code == 200
         data = resp.json()
         assert data["status"] == "ok"
-        assert data["sections_written"] == 2
+        assert data["sections_written"] == 6  # 2 sections × 3 passes
 
     def test_templates_saved_to_gcs(self):
         """Verify each template is written to the correct GCS path."""

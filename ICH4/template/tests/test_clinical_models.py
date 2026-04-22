@@ -26,14 +26,15 @@ class TestColumnMapping:
         )
         assert cm.role == "efficacy_endpoint"
 
-    def test_invalid_role_raises(self):
-        with pytest.raises(Exception):
-            ColumnMapping(
-                column_name="X",
-                role="invalid_role",
-                ctd_section_keys=[],
-                placeholder_key="x",
-            )
+    def test_custom_role_accepted(self):
+        """LLM mappers may generate custom role values — any string is valid."""
+        cm = ColumnMapping(
+            column_name="X",
+            role="treatment_timing",
+            ctd_section_keys=[],
+            placeholder_key="x",
+        )
+        assert cm.role == "treatment_timing"
 
 
 class TestClinicalDataManifest:

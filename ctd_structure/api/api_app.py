@@ -46,14 +46,6 @@ from ctd_structure.scaffold import scaffold_in_gcs
 from ctd_structure.structure import CTDStructureOutput, EvaluationResult, refine_from_feedback
 from main import CoordinatorDecision  # Pydantic model only — no LLM calls in the API
 
-# Clinical ingestion — optional (may not be present in minimal API image)
-try:
-    from clinical.ingestion import register_clinical_csv as _register_csv
-    from template.models import ProgramInfo as _ProgramInfo
-    _CLINICAL_AVAILABLE = True
-except ImportError:
-    _CLINICAL_AVAILABLE = False
-
 # ── Config ────────────────────────────────────────────────────────────────────
 
 _DEFAULT_URL    = os.environ.get("ICH_INDEX_URL",
@@ -63,9 +55,11 @@ _DEFAULT_BUCKET = os.environ.get("GCS_BUCKET",
 _GCS_TEMPLATE   = "ctd_structure/ctd"
 _GCS_PROGRAMS   = "therapeutic-area"
 _PUBSUB_TOPIC         = os.environ.get("PUBSUB_TOPIC", "ctd-extraction")
-_CONTENT_PUBSUB_TOPIC = os.environ.get("CONTENT_PUBSUB_TOPIC", "ich4-content-generation")
 _GCP_PROJECT    = os.environ.get("GCP_PROJECT_ID", "pharma-reguatory-author")
 _RUNNING_TIMEOUT_SECONDS        = 20 * 60   # 20 min
+# Content status timeout is used only by the combined GET /status auto-poll below.
+# ctd-api does not generate content — it just reads the status blob that
+# content_worker writes, so the UI can get extraction + content state in one call.
 _CONTENT_STATUS_TIMEOUT_SECONDS = 30 * 60   # 30 min
 
 # ── GCS client (module-level singleton) ───────────────────────────────────────
@@ -138,25 +132,37 @@ class StatusResponse(BaseModel):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _slug(s: str) -> str:
+    """Normalise a label into a GCS-safe path segment (lowercase, spaces → underscores)."""
     return s.strip().lower().replace(" ", "_")
 
 def _get_bucket(name: str) -> storage.Bucket:
+    """Return a GCS Bucket handle for the given bucket name (no network call made here)."""
     return _gcs_client.bucket(name)
 
 def _gcs_session_path(session_id: str) -> str:
+    """GCS blob path where per-session state (approved, ctd_output, content_program) is stored."""
     return f"ctd_structure/users/{session_id}/session_state.json"
 
 def _gcs_status_path(session_id: str) -> str:
+    """GCS blob path where the extraction job status (running/done/failed/timed_out) is stored."""
     return f"ctd_structure/users/{session_id}/extraction_status.json"
 
 def _gcs_user_ctd_prefix(session_id: str) -> str:
+    """GCS prefix under which a user’s draft CTD .keep blobs are written during extract/refine."""
     return f"ctd_structure/users/{session_id}/ctd"
 
 def _program_prefix(ta: str, dis: str, drug: str) -> str:
+    """Build the root GCS prefix for a drug program (e.g. therapeutic-area/oncology/lung_cancer/carboplatin)."""
     return f"{_GCS_PROGRAMS}/{_slug(ta)}/{_slug(dis)}/{_slug(drug)}"
 
 
 def _load_cached_paths(bucket_name: str, session_id: str | None = None) -> list[str]:
+    """Return sorted CTD folder paths from GCS .keep blobs.
+
+    Checks the user’s per-session draft prefix first (when session_id is given),
+    then falls back to the shared canonical template at _GCS_TEMPLATE.
+    Returns [] when neither location contains any .keep blobs.
+    """
     try:
         bkt = _get_bucket(bucket_name)
         candidates: list[tuple[str, int]] = []
@@ -178,27 +184,35 @@ def _load_cached_paths(bucket_name: str, session_id: str | None = None) -> list[
 
 
 def _load_canonical_paths(bucket_name: str) -> list[str]:
+    """Return the shared canonical CTD folder paths (no user-session prefix)."""
     return _load_cached_paths(bucket_name, session_id=None)
 
 
 def _save_to_gcs(bucket_name: str, folder_paths: list[str]) -> None:
+    """Write .keep marker blobs for every folder path into the shared canonical template location."""
     bkt = _get_bucket(bucket_name)
     scaffold_in_gcs(bkt, _GCS_TEMPLATE, folder_paths)
 
 
 def _save_draft_to_gcs(bucket_name: str, session_id: str, folder_paths: list[str]) -> None:
+    """Write .keep marker blobs into the user’s per-session draft CTD prefix."""
     bkt = _get_bucket(bucket_name)
     scaffold_in_gcs(bkt, _gcs_user_ctd_prefix(session_id), folder_paths)
 
 
 def _save_session_state(bucket_name: str, state: dict) -> None:
+    """Persist the fields that need to survive a page-reload (approved, ctd_output,
+    content_program, content_run_id) to GCS as JSON.  Ephemeral UI state is not stored.
+    """
     session_id = (state or {}).get("session_id", "default")
     try:
         payload = {
-            "approved":        state.get("approved", False),
-            "ctd_output":      state.get("ctd_output"),
-            "content_program": state.get("content_program"),
-            "content_run_id":  state.get("content_run_id"),
+            "approved":                state.get("approved", False),
+            "canonical_exists":        state.get("canonical_exists", False),
+            "program_scaffold_exists": state.get("program_scaffold_exists", False),
+            "ctd_output":              state.get("ctd_output"),
+            "content_program":         state.get("content_program"),
+            "content_run_id":          state.get("content_run_id"),
         }
         _get_bucket(bucket_name).blob(_gcs_session_path(session_id)).upload_from_string(
             json.dumps(payload), content_type="application/json"
@@ -208,6 +222,7 @@ def _save_session_state(bucket_name: str, state: dict) -> None:
 
 
 def _load_session_state(bucket_name: str, session_id: str) -> dict:
+    """Load the persisted session state from GCS.  Returns {} if the blob does not exist or on error."""
     try:
         blob = _get_bucket(bucket_name).blob(_gcs_session_path(session_id))
         if not blob.exists():
@@ -218,6 +233,7 @@ def _load_session_state(bucket_name: str, session_id: str) -> dict:
 
 
 def _write_extraction_status(bucket_name: str, session_id: str, payload: dict) -> None:
+    """Write an extraction job status dict to GCS, automatically stamping updated_at."""
     try:
         payload = {**payload, "updated_at": datetime.now(timezone.utc).isoformat()}
         _get_bucket(bucket_name).blob(_gcs_status_path(session_id)).upload_from_string(
@@ -228,6 +244,13 @@ def _write_extraction_status(bucket_name: str, session_id: str, payload: dict) -
 
 
 def _load_extraction_status(bucket_name: str, session_id: str) -> dict:
+    """Load the extraction job status from GCS.
+
+    If the job has been in 'running' or 'refining' state longer than
+    _RUNNING_TIMEOUT_SECONDS it is treated as timed-out and the caller
+    receives {"status": "timed_out", "age_minutes": N}.  Returns {} when
+    no status blob exists.
+    """
     try:
         raw = _get_bucket(bucket_name).blob(_gcs_status_path(session_id)).download_as_text()
         job = json.loads(raw)
@@ -246,7 +269,20 @@ def _load_extraction_status(bucket_name: str, session_id: str) -> dict:
     return job
 
 
+# NOTE: Content status is owned by clinical-analyst (POST /trigger, GET /content_status).
+# This read-only helper exists here solely to serve the combined GET /status endpoint,
+# which the Gradio auto-poll timer calls every few seconds to get both extraction status
+# and content status in a single round-trip.  No content logic runs here — it only reads
+# the `content_status/latest.json` blob that content_worker writes to GCS.
 def _load_content_status(bucket: str, ta: str, dis: str, drug: str) -> dict:
+    """Read the content_worker’s status blob for a drug program from GCS.
+
+    Tries content_status/latest.json first for speed; falls back to scanning
+    all blobs under content_status/ and caching the newest one as latest.json.
+    If the job has been 'running' longer than _CONTENT_STATUS_TIMEOUT_SECONDS
+    it is returned as {"status": "timed_out", "age_minutes": N}.
+    Returns {} when no status blob is found at all.
+    """
     prefix = f"{_program_prefix(ta, dis, drug)}/content_status/"
     bkt_obj = _gcs_client.bucket(bucket)
     try:
@@ -289,6 +325,7 @@ def _load_content_status(bucket: str, ta: str, dis: str, drug: str) -> dict:
 
 
 def _check_program_exists(bucket: str, ta: str, dis: str, drug: str) -> bool:
+    """Return True if the program’s CTD scaffold already exists in GCS (at least one blob found)."""
     prefix = f"{_program_prefix(ta, dis, drug)}/ctd/"
     try:
         return len(list(_gcs_client.bucket(bucket).list_blobs(prefix=prefix, max_results=1))) > 0
@@ -298,6 +335,11 @@ def _check_program_exists(bucket: str, ta: str, dis: str, drug: str) -> bool:
 
 def _publish_extraction(bucket: str, ich_url: str,
                         reviewer_email: str | None, session_id: str) -> str:
+    """Publish an extraction job to the ctd-extraction Pub/Sub topic and return the run_id.
+
+    The extractor worker (subscribed to the topic) will query the ICH index at ich_url,
+    build the full ICH M4(R4) folder hierarchy, and write the result back to GCS.
+    """
     run_id    = str(uuid.uuid4())
     publisher = pubsub_v1.PublisherClient()
     topic     = publisher.topic_path(_GCP_PROJECT, _PUBSUB_TOPIC)
@@ -313,6 +355,7 @@ def _publish_extraction(bucket: str, ich_url: str,
 
 
 def _fmt_tree_paths(paths: list[str]) -> str:
+    """Format a list of GCS folder paths into a human-readable indented tree with summary counts."""
     lines = []
     for p in paths:
         depth = p.rstrip("/").count("/") - 1
@@ -382,6 +425,12 @@ def _handle_extract(state: dict, bucket: str, reviewer_email: str | None,
 
 
 def _handle_approve(decision: CoordinatorDecision, state: dict, bucket: str) -> tuple[str, dict]:
+    """Commit the current folder_paths as the shared canonical CTD template in GCS.
+
+    If therapeutic_area / disease_type / drug_name are already known from the decision,
+    immediately chains into _handle_copy to scaffold the program directory too.
+    Returns (reply_markdown, state_patch).
+    """
     folder_paths = state.get("folder_paths", [])
     if not folder_paths:
         return (
@@ -420,6 +469,11 @@ def _handle_approve(decision: CoordinatorDecision, state: dict, bucket: str) -> 
 
 
 def _handle_disapprove(decision: CoordinatorDecision, state: dict) -> tuple[str, dict]:
+    """Record user disapproval and prompt for specific feedback to guide a targeted re-query.
+
+    Sets awaiting_feedback=True so the next user message is routed to _handle_refine.
+    Returns (reply_markdown, state_patch).
+    """
     feedback = (decision.feedback or "").strip()
     if feedback:
         reply = (
@@ -515,6 +569,13 @@ def _handle_refine(feedback: str, state: dict, bucket: str) -> tuple[str, dict]:
 
 
 def _handle_copy(decision: CoordinatorDecision, state: dict, bucket: str) -> tuple[str, dict]:
+    """Scaffold the shared canonical CTD folder tree into a drug-program directory in GCS.
+
+    Reads the canonical paths from _GCS_TEMPLATE and calls scaffold_in_gcs to write
+    .keep blobs under therapeutic-area/<ta>/<dis>/<drug>/ctd/.  Sets
+    program_scaffold_exists=True in state_patch so downstream steps know the directory exists.
+    Returns (reply_markdown, state_patch).
+    """
     ta   = decision.therapeutic_area.strip().lower().replace(" ", "_")
     dis  = decision.disease_type.strip().lower().replace(" ", "_")
     drug = decision.drug_name.strip().lower().replace(" ", "_")
@@ -540,9 +601,9 @@ def _handle_copy(decision: CoordinatorDecision, state: dict, bucket: str) -> tup
         "program_scaffold_exists": True,
         "canonical_exists":        True,
         "content_program": {
-            "ta":   decision.therapeutic_area.strip(),
-            "dis":  decision.disease_type.strip(),
-            "drug": decision.drug_name.strip(),
+            "therapeutic_area": decision.therapeutic_area.strip(),
+            "disease_type":     decision.disease_type.strip(),
+            "drug_name":        decision.drug_name.strip(),
         },
     }
     _save_session_state(bucket, {**state, **patch})
@@ -551,24 +612,27 @@ def _handle_copy(decision: CoordinatorDecision, state: dict, bucket: str) -> tup
         f"`gs://{bucket}/{gcs_base}/`\n\n"
         f"**{len(canonical_paths)} folder markers** written for "
         f"**{ta.replace('_',' ')} / {dis.replace('_',' ')} / {drug.replace('_',' ')}**.\n\n"
-        "---\n"
-        "**Before generating content, upload your clinical data:**\n\n"
-        "| Step | Action |\n|---|---|\n"
-        "| 1️⃣ | Open the **🔬 Clinical Data Upload** panel |\n"
-        "| 2️⃣ | Upload your clinical trial CSV |\n"
-        "| 3️⃣ | Say **generate content** to kick off the 3-pass generation |\n\n"
-        "> _Without clinical data, all `{{placeholder}}` values will remain unfilled._",
+        "The CTD folder hierarchy is ready. Say **generate content** when you're ready to "
+        "kick off the 3-pass content generation pipeline.",
         patch,
     )
 
 
 def _handle_status(state: dict, bucket: str, msg_lower: str) -> tuple[str, dict]:
+    """Build a human-readable status reply covering both extraction and content generation.
+
+    Priority order:
+      1. If content_program is set → report content_worker progress (running/done/failed).
+      2. Else if 'content' appears in msg_lower → prompt user to scaffold a program first.
+      3. Else → report extraction job status (running/refining/done/failed/timed_out/idle).
+    Returns (reply_markdown, state_patch).
+    """
     session_id = state.get("session_id", "default")
     job        = _load_extraction_status(bucket, session_id)
 
     prog = state.get("content_program")
     if prog:
-        ta_c, dis_c, drug_c = prog.get("ta", ""), prog.get("dis", ""), prog.get("drug", "")
+        ta_c, dis_c, drug_c = prog.get("therapeutic_area", ""), prog.get("disease_type", ""), prog.get("drug_name", "")
         cjob    = _load_content_status(bucket, ta_c, dis_c, drug_c)
         cstatus = cjob.get("status")
         if cstatus == "running":
@@ -660,6 +724,9 @@ def _handle_status(state: dict, bucket: str, msg_lower: str) -> tuple[str, dict]
 
 @app.post("/extract", response_model=ActionResponse)
 def extract(req: ExtractRequest) -> ActionResponse:
+    """Publish a background extraction job to Pub/Sub.  The worker queries the ICH index
+    and writes the resulting CTD folder hierarchy back to GCS when done.
+    """
     state = {"session_id": req.session_id, "ich_url": req.ich_url}
     reply, patch = _handle_extract(state, req.bucket, req.reviewer_email, req.force)
     return ActionResponse(reply=reply, state_patch=patch)
@@ -667,6 +734,9 @@ def extract(req: ExtractRequest) -> ActionResponse:
 
 @app.post("/approve", response_model=ActionResponse)
 def approve(req: ApproveRequest) -> ActionResponse:
+    """Commit the supplied folder_paths as the shared canonical CTD template.
+    Optionally auto-copies into a program directory if ta/dis/drug are supplied.
+    """
     decision = CoordinatorDecision(
         outcome="proceed", intent="approve",
         therapeutic_area=req.therapeutic_area,
@@ -680,6 +750,7 @@ def approve(req: ApproveRequest) -> ActionResponse:
 
 @app.post("/disapprove", response_model=ActionResponse)
 def disapprove(req: DisapproveRequest) -> ActionResponse:
+    """Signal that the user is unhappy with the extracted structure and prompt for feedback."""
     decision = CoordinatorDecision(outcome="proceed", intent="disapprove", feedback=req.feedback)
     state = {"session_id": req.session_id}
     reply, patch = _handle_disapprove(decision, state)
@@ -688,6 +759,9 @@ def disapprove(req: DisapproveRequest) -> ActionResponse:
 
 @app.post("/refine", response_model=ActionResponse)
 def refine(req: RefineRequest) -> ActionResponse:
+    """Re-query the ICH index using the user’s feedback to repair the extracted structure.
+    Runs synchronously; returns the updated folder tree when done.
+    """
     state = {
         "session_id":           req.session_id,
         "disapproval_feedback": req.prior_feedback,
@@ -700,6 +774,7 @@ def refine(req: RefineRequest) -> ActionResponse:
 
 @app.post("/copy", response_model=ActionResponse)
 def copy(req: CopyRequest) -> ActionResponse:
+    """Scaffold the canonical CTD folder tree into the specified drug-program GCS directory."""
     decision = CoordinatorDecision(
         outcome="proceed", intent="copy",
         therapeutic_area=req.therapeutic_area,
@@ -715,15 +790,15 @@ def copy(req: CopyRequest) -> ActionResponse:
 def status_query(
     session_id: str,
     bucket: str = _DEFAULT_BUCKET,
-    ta: str | None = None,
-    dis: str | None = None,
-    drug: str | None = None,
+    therapeutic_area: str | None = None,
+    disease_type: str | None = None,
+    drug_name: str | None = None,
     msg_lower: str = "status",
 ) -> ActionResponse:
     """Returns a human-readable reply string, used by the UI's chat handler."""
     state = {
         "session_id": session_id,
-        "content_program": {"ta": ta, "dis": dis, "drug": drug} if ta and dis and drug else None,
+        "content_program": {"therapeutic_area": therapeutic_area, "disease_type": disease_type, "drug_name": drug_name} if therapeutic_area and disease_type and drug_name else None,
         "folder_paths": [],
         "approved": False,
     }
@@ -733,15 +808,20 @@ def status_query(
 
 @app.get("/health")
 def health():
+    """Liveness probe — returns 200 OK if the service is up."""
     return {"status": "ok"}
 
 
 @app.get("/status", response_model=StatusResponse)
 def status(session_id: str, bucket: str = _DEFAULT_BUCKET,
-           ta: str | None = None, dis: str | None = None, drug: str | None = None):
-    """Poll extraction + content-generation status (used by the auto-poll timer in Gradio)."""
+           therapeutic_area: str | None = None, disease_type: str | None = None, drug_name: str | None = None):
+    """Poll extraction + content-generation status (used by the auto-poll timer in Gradio).
+
+    Returns both extraction and content state in one call to avoid two separate round-trips
+    from the UI timer.  Content state is read-only — triggering lives in clinical-analyst.
+    """
     extraction = _load_extraction_status(bucket, session_id)
-    content    = _load_content_status(bucket, ta or "", dis or "", drug or "") if ta and dis and drug else {}
+    content    = _load_content_status(bucket, therapeutic_area or "", disease_type or "", drug_name or "") if therapeutic_area and disease_type and drug_name else {}
     return StatusResponse(extraction=extraction, content=content)
 
 
@@ -752,12 +832,13 @@ def get_session(session_id: str, bucket: str = _DEFAULT_BUCKET):
     canonical = _load_canonical_paths(bucket)
     session   = _load_session_state(bucket, session_id)
     return {
-        "folder_paths":    paths,
-        "canonical_exists": bool(canonical),
-        "approved":        session.get("approved", False),
-        "ctd_output":      session.get("ctd_output"),
-        "content_program": session.get("content_program"),
-        "content_run_id":  session.get("content_run_id"),
+        "folder_paths":             paths,
+        "canonical_exists":         bool(canonical),
+        "approved":                 session.get("approved", False),
+        "program_scaffold_exists":  session.get("program_scaffold_exists", False),
+        "ctd_output":               session.get("ctd_output"),
+        "content_program":          session.get("content_program"),
+        "content_run_id":           session.get("content_run_id"),
     }
 
 

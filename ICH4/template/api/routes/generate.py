@@ -152,6 +152,10 @@ class GenerateRequest(BaseModel):
     """ICH guideline text keyed by module_key (e.g. "module2" → retrieved ICH text).
     Pre-fetched by the orchestrator from the index service. None → LLM uses
     training memory and marks all requirements as [NOT RETRIEVED]."""
+    bucket: str = Field(
+        default="",
+        description="GCS bucket name; forwarded by the orchestrator to load clinical manifest.",
+    )
     include_clinical_data: bool = True
     """When True the template service loads the clinical manifest from GCS
     (using the bucket configured in settings). Set to False to skip."""
@@ -189,8 +193,9 @@ def generate(body: GenerateRequest) -> GenerateResponse:
     """Generate ICH CTD section templates for module2 and module5."""
     # Fetch clinical manifest from GCS if requested
     clinical_manifest: ClinicalDataManifest | None = None
-    if body.include_clinical_data and settings.gcs_bucket_name:
-        clinical_manifest = load_manifest(settings.gcs_bucket_name, body.program)
+    effective_bucket = body.bucket or settings.gcs_bucket_name
+    if body.include_clinical_data and effective_bucket:
+        clinical_manifest = load_manifest(effective_bucket, body.program)
 
     demo_modules = _build_demo_modules()
 

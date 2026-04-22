@@ -4,12 +4,17 @@ ICH4 Writer Service — FastAPI application.
 Endpoints:
   GET  /health                — liveness probe
   POST /write                 — generate CTD documents from templates + clinical data
+  POST /patch                 — re-write sections affected by clinical data schema changes
   POST /clinical-data/upload  — upload CSV for a program/drug and auto-build manifest
+  GET  /documents             — list generated template sections for a program
+  GET  /documents/read        — read the content of a specific generated section
 """
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from api.routes import documents as documents_route
+from api.routes import patch as patch_route
 from api.routes import upload as upload_route
 from api.routes import validate as validate_route
 from api.routes import write as write_route
@@ -36,8 +41,10 @@ app = FastAPI(
 )
 
 app.include_router(write_route.router, prefix="", tags=["writer"])
+app.include_router(patch_route.router, prefix="", tags=["writer"])
 app.include_router(validate_route.router, prefix="", tags=["validator"])
 app.include_router(upload_route.router, prefix="", tags=["clinical-data"])
+app.include_router(documents_route.router, prefix="", tags=["documents"])
 
 
 @app.get("/health")

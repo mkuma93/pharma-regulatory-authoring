@@ -65,10 +65,11 @@ steps:
       - "--project=$_PROJECT_ID"
       - "--platform=managed"
       - "--no-allow-unauthenticated"
+      - "--ingress=all"
       - "--memory=1Gi"
       - "--cpu=1"
       - "--timeout=300"
-      - "--set-env-vars=GCP_PROJECT_ID=$_PROJECT_ID"
+      - "--set-env-vars=GCP_PROJECT_ID=$_PROJECT_ID,GCS_BUCKET_NAME=pharma-reguatory-author-life-science"
       - "--set-secrets=OPENAI_API_KEY=OPENAI_API_KEY:latest"
 
 images:

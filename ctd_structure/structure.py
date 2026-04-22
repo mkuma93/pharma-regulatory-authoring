@@ -44,30 +44,56 @@ from typing_extensions import TypedDict
 # ── Pydantic output models ────────────────────────────────────────────────────
 
 class CTDSubsection(BaseModel):
+    """Represents a CTD subsection or sub-subsection folder (levels 3 and 4).
+
+    This model is self-referential: sub_subsections holds nested CTDSubsection
+    objects, which allows the same class to represent both subsections (depth 3)
+    and sub-subsections (depth 4) without a separate model for each level.
+    """
     key: str = Field(description="Folder-safe key, e.g. '2.5.1_product_development_rationale'")
     label: str = Field(description="Human-readable title")
     sub_subsections: list["CTDSubsection"] = Field(default_factory=list)
 
 
-# Allow the self-referential list to resolve.
+# Required: CTDSubsection contains list["CTDSubsection"] — a forward reference
+# to itself.  Pydantic v2 cannot resolve this at class-definition time, so
+# model_rebuild() is called immediately after the class body to finalise
+# the schema and allow nested instantiation.
 CTDSubsection.model_rebuild()
 
 
 class CTDSection(BaseModel):
+    """Represents a CTD section folder (level 2, e.g. 2.5_clinical_overview).
+
+    Holds a flat list of CTDSubsection objects; nesting beyond this point is
+    handled recursively by CTDSubsection.sub_subsections.
+    """
     key: str = Field(description="Folder-safe key, e.g. '2.5_clinical_overview'")
     label: str = Field(description="Human-readable title")
     subsections: list[CTDSubsection] = Field(default_factory=list)
 
 
+# Defensive: CTDSection is defined after CTDSubsection.model_rebuild(), so
+# all types are already resolved at class-definition time and this call is
+# technically redundant.  It is kept to make the rebuild chain explicit and
+# to guard against future reordering of the class definitions.
 CTDSection.model_rebuild()
 
 
 class CTDModule(BaseModel):
+    """Represents one of the five top-level ICH M4(R4) CTD modules (level 1).
+
+    key follows the pattern 'module1' … 'module5'.  Each module holds a list
+    of CTDSection objects; the full 4-level hierarchy is reached by traversing
+    CTDSection.subsections and then CTDSubsection.sub_subsections.
+    """
     key: str = Field(description="Folder-safe key, e.g. 'module2'")
     label: str = Field(description="Module title")
     sections: list[CTDSection] = Field(default_factory=list)
 
 
+# Defensive: same reasoning as CTDSection.model_rebuild() above — not required
+# by Pydantic v2 at this point in the file, but kept for symmetry and safety.
 CTDModule.model_rebuild()
 
 

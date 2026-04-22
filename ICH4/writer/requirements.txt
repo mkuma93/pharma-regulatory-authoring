@@ -22,3 +22,6 @@ google-auth>=2.29.0
 pydantic>=2.0.0
 pydantic-settings>=2.3.0
 python-dotenv>=1.0.0
+
+# === JSON repair (handles malformed LLM responses) ===
+json-repair>=0.30.0

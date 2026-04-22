@@ -57,6 +57,7 @@ steps:
       - "--project=$_PROJECT_ID"
       - "--platform=managed"
       - "--no-allow-unauthenticated"
+      - "--ingress=all"
       - "--memory=1Gi"
       - "--cpu=1"
       - "--concurrency=5"

@@ -16,8 +16,10 @@ substitutions:
   _WORKER_NAME:     ich4-content-worker
   _AR_REPO:         ich4
   _TAG:             latest
-  _ORCHESTRATOR_URL: "https://ich4-orchestrator-811317821863.us-central1.run.app"
+  _CONTENT_PIPELINE_URL: "https://ich4-content-pipeline-811317821863.us-central1.run.app"
   _WRITER_URL:       "https://ich4-writer-811317821863.us-central1.run.app"
+  _INDEX_URL:        "https://ich4-index-811317821863.us-central1.run.app"
+  _CLINICAL_ANALYST_URL: "https://ich4-clinical-analyst-811317821863.us-central1.run.app"
   _PUBSUB_TOPIC:    ich4-content-generation
   _SA_NAME:         ich4-content-worker
 
@@ -49,7 +51,7 @@ steps:
       - build
       - -t
       - "$_REGION-docker.pkg.dev/$_PROJECT_ID/$_AR_REPO/$_WORKER_NAME:$_TAG"
-      - .
+      - ICH4/content_worker
 
   # 4. Push image
   - name: "gcr.io/cloud-builders/docker"
@@ -82,10 +84,11 @@ steps:
           --project=$_PROJECT_ID \
           --platform=managed \
           --no-allow-unauthenticated \
+          --ingress=all \
           --service-account=$_SA_NAME@$_PROJECT_ID.iam.gserviceaccount.com \
-          --set-env-vars="ORCHESTRATOR_URL=$_ORCHESTRATOR_URL,WRITER_URL=$_WRITER_URL" \
+          --set-env-vars="CONTENT_PIPELINE_URL=$_CONTENT_PIPELINE_URL,WRITER_URL=$_WRITER_URL,INDEX_URL=$_INDEX_URL,CLINICAL_ANALYST_URL=$_CLINICAL_ANALYST_URL" \
           --memory=512Mi \
-          --timeout=660 \
+          --timeout=1800 \
           --concurrency=5 \
           --min-instances=0 \
           --max-instances=10

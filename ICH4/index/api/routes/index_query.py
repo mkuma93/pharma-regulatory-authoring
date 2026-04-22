@@ -39,7 +39,7 @@ class QueryRequest(BaseModel):
 class QueryResponse(BaseModel):
     question: str
     ctd_module: str | None
-    program_namespace: str | None
+    program_namespace: str | None = None
     answer: str
 
 

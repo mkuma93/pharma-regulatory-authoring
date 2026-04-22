@@ -1,27 +1,29 @@
 """
 ctd_structure/deploy/main.py
 
-Full-coordinator LangGraph pipeline for the CTD Structure assistant.
+CTD-structure coordinator LangGraph pipeline.
+
+Scope: CTD structure operations only — extract, approve, disapprove, copy,
+status, and help.  Content generation (write, rewrite_section) and data
+analysis (analyze_data) are handled by the global UI coordinator
+(ui/coordinator.py).
 
 Architecture
 ────────────
-The coordinator is a two-node LangGraph:
+Two-node LangGraph:
 
   understand → decide
 
-  understand  — GPT-4o-mini reads the user message + full workflow context and
-                extracts what the user wants (intent + program fields + feedback).
+  understand  — GPT-4o-mini reads the user message + workflow context and
+                extracts what the user wants (intent + program fields).
 
-  decide      — GPT-4o-mini reasons about the current workflow state, checks
-                prerequisites, identifies any missing information, and produces
-                ONE of:
-                   • clarify   — a question or guidance message to send back to
-                                 the user before any action can proceed.
-                   • proceed   — all prerequisites met, action can execute now.
+  decide      — GPT-4o-mini reasons about prerequisites and produces ONE of:
+                   • clarify  — a question to send back before acting.
+                   • proceed  — all prerequisites met, action can run now.
 
 Public surface (used by app.py)
 ────────────────────────────────
-  CoordinatorDecision  — output model (replaces IntentResult)
+  CoordinatorDecision  — output model
   run_coordinator(message, session_state) → CoordinatorDecision
 """
 from __future__ import annotations
@@ -44,19 +46,18 @@ class IntentResult(BaseModel):
     Raw intent + entity extraction (understand node).
     Kept as a separate model so the decide node receives structured input.
     """
-    intent: Literal["extract", "approve", "disapprove", "copy", "write", "status",
-                      "generate_template", "rewrite_section", "analyze_data", "help"] = Field(
+    intent: Literal["extract", "approve", "disapprove", "copy", "write",
+                    "rewrite_section", "analyze_data", "status", "help"] = Field(
         description=(
             "The user's intent:\n"
             "  extract           — build/load the canonical ICH CTD folder tree\n"
             "  approve           — accept the currently shown structure\n"
             "  disapprove        — reject or request changes to the structure\n"
-            "  copy              — scaffold the CTD structure for a specific drug program in GCS\n"
+            "  copy              — scaffold the CTD structure for a drug program in GCS\n"
             "  write             — generate / fill CTD section content (full pipeline)\n"
-            "  status            — ask what is currently loaded or running\n"
-            "  generate_template — generate ICH-grounded section templates only (no full write)\n"
             "  rewrite_section   — regenerate one or more specific CTD sections\n"
             "  analyze_data      — analyse clinical trial data / CSV for a program\n"
+            "  status            — ask what is currently loaded or running\n"
             "  help              — anything else / unclear"
         )
     )
@@ -80,21 +81,6 @@ class IntentResult(BaseModel):
         default=None,
         description="For disapprove intent only: concise summary of the user's concern.",
     )
-    section_keys: list[str] = Field(
-        default_factory=list,
-        description=(
-            "For rewrite_section only: list of CTD section keys to rewrite, "
-            "e.g. ['2.5_clinical_overview', '5.3_clinical_study_reports']. "
-            "Empty list means all sections."
-        ),
-    )
-    module_filter: list[str] = Field(
-        default_factory=list,
-        description=(
-            "For generate_template only: restrict to specific module keys, "
-            "e.g. ['module5']. Empty list means all modules."
-        ),
-    )
 
 
 class CoordinatorDecision(BaseModel):
@@ -116,8 +102,8 @@ class CoordinatorDecision(BaseModel):
         description="'clarify' — ask user something; 'proceed' — run the action."
     )
     # ── resolved intent (always set) ─────────────────────────────────────────
-    intent: Literal["extract", "approve", "disapprove", "copy", "write", "status",
-                    "generate_template", "rewrite_section", "analyze_data", "help"] = Field(
+    intent: Literal["extract", "approve", "disapprove", "copy", "write",
+                    "rewrite_section", "analyze_data", "status", "help"] = Field(
         description="The resolved intent to execute when outcome is 'proceed'."
     )
     # ── resolved program fields ───────────────────────────────────────────────
@@ -127,8 +113,6 @@ class CoordinatorDecision(BaseModel):
     # ── other extracted fields ────────────────────────────────────────────────
     force_reextract: bool = Field(default=False)
     feedback: str | None = Field(default=None)
-    section_keys: list[str] = Field(default_factory=list)
-    module_filter: list[str] = Field(default_factory=list)
     # ── coordinator reply (set when outcome == 'clarify') ─────────────────────
     reply: str | None = Field(
         default=None,
@@ -151,30 +135,23 @@ _UNDERSTAND_SYSTEM = """\
 You are the understanding layer of an ICH M4(R4) CTD (Common Technical Document)
 regulatory assistant. Your only job is to extract what the user wants.
 
-Classify the message into one intent:
+Classify the message into one of these intents:
   extract           — build/load the canonical ICH CTD folder tree from the ICH index
   approve           — accept the currently shown CTD structure
   disapprove        — reject or request changes to the structure
-  copy              — scaffold the CTD folder structure for a specific drug program in GCS
-  write             — run the full CTD content generation pipeline for a program
+  copy              — scaffold the CTD folder structure for a drug program in GCS
+  write             — generate or fill CTD section content for a drug program (full pipeline)
+  rewrite_section   — regenerate one or more specific named CTD sections
+  analyze_data      — analyse clinical trial data / CSV for a program
   status            — ask what is currently loaded or running in the background
-  generate_template — generate ICH-grounded section templates only (preview before writing)
-                      e.g. "show templates for module 5", "preview the CTD template"
-  rewrite_section   — regenerate one or more specific CTD section documents
-                      e.g. "rewrite section 2.5", "redo the clinical overview"
-  analyze_data      — analyse clinical trial data / uploaded CSV for a program
-                      e.g. "analyse the clinical data", "summarise trial results",
-                           "what does the data show for prednisolone?"
   help              — unclear or out of scope
 
 Also extract (when present in the message):
-  force_reextract     — user explicitly wants a fresh rebuild (re-extract, refresh, rebuild)
-  therapeutic_area    — e.g. oncology, neurology, cardiology
-  disease_type        — e.g. lung cancer, bells palsy, hypertension
-  drug_name           — e.g. carboplatin, prednisolone, lisinopril
-  feedback            — for disapprove only: one-sentence summary of the concern
-  section_keys        — for rewrite_section only: list of CTD section keys, e.g. ['2.5_clinical_overview']
-  module_filter       — for generate_template only: list of module keys, e.g. ['module5']
+  force_reextract  — user explicitly wants a fresh rebuild (re-extract, refresh, rebuild)
+  therapeutic_area — e.g. oncology, neurology, cardiology
+  disease_type     — e.g. lung cancer, bells palsy, hypertension
+  drug_name        — e.g. carboplatin, prednisolone, lisinopril
+  feedback         — for disapprove only: one-sentence summary of the concern
 
 IMPORTANT: messages often use a slash-separated triplet:
   "<therapeutic_area> / <disease_type> / <drug_name>"
@@ -191,22 +168,18 @@ You receive:
 
 Your job is to decide ONE of:
   proceed  — all prerequisites are met, the action can run now.
-  clarify  — something is missing or a prerequisite has not been completed;
-             compose a helpful Markdown reply to guide the user.
+  clarify  — something is missing; compose a helpful Markdown reply.
 
 --- Workflow prerequisites ---
 
 extract:
-  No prerequisites. Always proceed (unless force_reextract=false and a structure
-  already exists — in that case proceed anyway, the handler will show the cached one).
+  No prerequisites. Always proceed.
 
 approve:
   PREREQUISITE: paths_loaded > 0.
-  RULE: if paths_loaded > 0 → ALWAYS outcome=proceed. NEVER block on canonical_exists or approved.
+  RULE: if paths_loaded > 0 → ALWAYS outcome=proceed.
   If paths_loaded=0 → clarify: ask the user to extract the ICH structure first.
-  IMPORTANT: approval is the action that CREATES the canonical default.
-             It CANNOT and MUST NOT require canonical_exists=true as a prerequisite.
-             canonical_exists=false is the normal state BEFORE approval — it is not an error.
+  IMPORTANT: approval CREATES the canonical default; canonical_exists=false is normal.
 
 disapprove:
   PREREQUISITE: paths_loaded > 0.
@@ -214,51 +187,29 @@ disapprove:
 
 copy (scaffold a program directory):
   PREREQUISITE: therapeutic_area, disease_type, drug_name must all be known.
-  RULE: if all 3 fields are present → ALWAYS outcome=proceed. No other prerequisites.
-  NOTE: scaffolding always reads from the shared canonical default CTD structure in GCS.
-        Approval is NOT required. canonical_exists and session paths are irrelevant.
-        The action handler will check GCS at runtime and report any error.
+  RULE: if all 3 fields are present → ALWAYS outcome=proceed.
+  NOTE: scaffolding reads from the shared canonical CTD structure in GCS.
+        Approval is NOT required. The action handler checks GCS at runtime.
   If any program field missing → clarify: ask only for the missing fields, warmly.
 
-write (generate content):
-  PREREQUISITE: therapeutic_area, disease_type, drug_name must all be known.
-  RULE: if all 3 fields are present → ALWAYS outcome=proceed. No other prerequisites.
-  NOTE: approval is NOT required. Scaffolding will be done automatically if needed.
-        The action handler will check GCS at runtime and report any error.
-  If program fields missing → clarify: ask for the missing fields, warmly.
-
-generate_template (template preview only):
+write / rewrite_section (content generation pipeline):
   PREREQUISITE: therapeutic_area, disease_type, drug_name must all be known.
   RULE: if all 3 fields are present → ALWAYS outcome=proceed.
-  NOTE: generates ICH-grounded section templates and stores them in GCS.
-        Does NOT trigger the content writing pipeline.
-  If program fields missing → clarify.
-
-rewrite_section (regenerate specific sections):
-  PREREQUISITE: therapeutic_area, disease_type, drug_name must all be known.
-  RULE: if all 3 fields are present → ALWAYS outcome=proceed.
-  NOTE: section_keys is optional — empty means rewrite all sections.
-  If program fields missing → clarify.
+  If any program field missing → clarify: ask only for the missing fields.
 
 analyze_data (clinical data analysis):
   PREREQUISITE: therapeutic_area, disease_type, drug_name must all be known.
   RULE: if all 3 fields are present → ALWAYS outcome=proceed.
-  NOTE: the analyst will read clinical CSV from GCS for the given program.
-        It does NOT require a prior write or template generation step.
-  If program fields missing → clarify.
+  If any program field missing → clarify: ask only for the missing fields.
 
 status / help:
   Always proceed.
 
 --- Reply style for clarify ---
 - Be conversational and warm, not robotic.
-- Use bullet points or a numbered list when showing multiple steps.
-- If asking for missing fields, ask for all missing ones in a single message.
+- Use bullet points when showing multiple steps.
+- Ask for all missing fields in a single message.
 - Never repeat information the user already provided.
-- Example for missing fields:
-    "Got it — to generate content I just need a couple more details:
-    - **Disease / indication**: e.g. *lung cancer*, *bells palsy*
-    - **Drug / compound**: e.g. *carboplatin*, *prednisolone*"
 """
 
 
@@ -300,17 +251,26 @@ def _decide_node(state: _CoordState) -> _CoordState:
     # Hard guardrail: approve/disapprove with paths loaded must always proceed.
     # The LLM sometimes mis-routes these despite correct context; this override is deterministic.
     _m = re.search(r"paths_loaded=(\d+)", state.get("workflow_context", ""))
-    _canonical_true = "canonical_exists=True" in state.get("workflow_context", "")
     if (decision.outcome == "clarify"
             and ir.intent in ("approve", "disapprove")
             and _m and int(_m.group(1)) > 0):
         decision = CoordinatorDecision(outcome="proceed", intent=ir.intent)
 
-    # Hard guardrail: copy/write/template/rewrite/analyze with all 3 fields must always
-    # proceed — the action handler does the real GCS check at runtime.
+    # Hard guardrail: copy with all 3 program fields must always proceed.
     _has_all_fields = bool(ir.therapeutic_area and ir.disease_type and ir.drug_name)
     if (decision.outcome == "clarify"
-            and ir.intent in ("copy", "write", "generate_template", "rewrite_section", "analyze_data")
+            and ir.intent == "copy"
+            and _has_all_fields):
+        decision = CoordinatorDecision(
+            outcome="proceed", intent=ir.intent,
+            therapeutic_area=ir.therapeutic_area,
+            disease_type=ir.disease_type,
+            drug_name=ir.drug_name,
+        )
+
+    # Hard guardrail: write/rewrite_section/analyze_data with all 3 fields must proceed.
+    if (decision.outcome == "clarify"
+            and ir.intent in ("write", "rewrite_section", "analyze_data")
             and _has_all_fields):
         decision = CoordinatorDecision(
             outcome="proceed", intent=ir.intent,
@@ -331,10 +291,6 @@ def _decide_node(state: _CoordState) -> _CoordState:
         decision.force_reextract = ir.force_reextract
     if decision.feedback is None and ir.feedback:
         decision.feedback = ir.feedback
-    if not decision.section_keys and ir.section_keys:
-        decision.section_keys = ir.section_keys
-    if not decision.module_filter and ir.module_filter:
-        decision.module_filter = ir.module_filter
     return {"decision": decision}
 
 

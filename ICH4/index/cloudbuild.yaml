@@ -27,7 +27,7 @@ steps:
   # 0. Run ich4-index unit tests — deployment is blocked if any test fails
   - name: "python:3.11-slim"
     id: test-ich4-index
-    dir: ICH4/index
+    dir: "."
     entrypoint: bash
     args:
       - "-c"
@@ -98,6 +98,7 @@ steps:
       - "--region=$_REGION"
       - "--platform=managed"
       - "--no-allow-unauthenticated"
+      - "--ingress=all"
       - "--min-instances=0"
       - "--max-instances=2"
       - "--memory=2Gi"

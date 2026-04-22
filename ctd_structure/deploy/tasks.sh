@@ -12,8 +12,7 @@
 #   test           — run unit tests locally (requires .venv)
 #   build          — build Docker image via Cloud Build only (no deploy)
 #   deploy         — full pipeline: test → build → push → Cloud Run deploy
-#   deploy-worker          — build + deploy ctd-worker + set up Pub/Sub topic + push subscription
-#   deploy-content-worker  — build + deploy ich4-content-worker (template generation + writing pipeline)
+#   deploy-worker  — build + deploy ctd-worker + set up Pub/Sub topic + push subscription
 #   url            — print the current Cloud Run service URL
 #   proxy          — open a local proxy to the Cloud Run service (no public URL needed)
 #   logs           — tail live Cloud Run logs
@@ -157,31 +156,6 @@ task:status() {
     --region="${REGION}" \
     --project="${PROJECT_ID}" \
     --format="yaml(status.url, status.conditions, status.latestReadyRevisionName, spec.template.spec.containers[0].image)"
-}
-
-task:deploy-content-worker() {
-  CONTENT_WORKER_DIR="${REPO_ROOT}/ICH4/content_worker"
-  ORCHESTRATOR_URL="${ORCHESTRATOR_URL:-https://ich4-orchestrator-811317821863.us-central1.run.app}"
-  WRITER_URL="${WRITER_URL:-https://ich4-writer-811317821863.us-central1.run.app}"
-  CONTENT_PUBSUB_TOPIC="${CONTENT_PUBSUB_TOPIC:-ich4-content-generation}"
-  CONTENT_WORKER_NAME="${CONTENT_WORKER_NAME:-ich4-content-worker}"
-  PROJECT_NUMBER="${PROJECT_NUMBER:-$(gcloud projects describe ${PROJECT_ID} --format='value(projectNumber)' 2>/dev/null || echo 811317821863)}"
-  echo "=== [deploy-content-worker] Build + deploy ich4-content-worker ==="
-  echo "  Orchestrator : ${ORCHESTRATOR_URL}"
-  echo "  Writer       : ${WRITER_URL}"
-  echo "  Topic        : ${CONTENT_PUBSUB_TOPIC}"
-  gcloud builds submit "${CONTENT_WORKER_DIR}" \
-    --config="${CONTENT_WORKER_DIR}/cloudbuild.yaml" \
-    --project="${PROJECT_ID}" \
-    --substitutions="\
-_PROJECT_ID=${PROJECT_ID},\
-_PROJECT_NUMBER=${PROJECT_NUMBER},\
-_REGION=${REGION},\
-_WORKER_NAME=${CONTENT_WORKER_NAME},\
-_PUBSUB_TOPIC=${CONTENT_PUBSUB_TOPIC},\
-_ORCHESTRATOR_URL=${ORCHESTRATOR_URL},\
-_WRITER_URL=${WRITER_URL}"
-  echo "=== Content worker deployed and Pub/Sub wired ==="
 }
 
 task:clean-gcs() {

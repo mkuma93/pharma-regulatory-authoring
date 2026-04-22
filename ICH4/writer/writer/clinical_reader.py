@@ -1,9 +1,11 @@
 """Load clinical CSV data from GCS and build context strings for placeholder filling.
 
 Uses the ClinicalDataManifest (written by the template service) to map
-CSV columns → placeholder keys.  Raw rows are passed through the DataAnalyst
-agent which computes deterministic statistical summaries (proportions, mean ± SD,
-crosstabs, median [range]) before handing results to the writer LLM.
+CSV columns → placeholder keys.  Pre-resolved values from clinical-analyst /resolve
+are used directly; any unresolved keys fall back to raw row strings so the
+writer LLM can write [DATA PENDING] rather than hallucinating figures.
+
+Data computation (deterministic statistics) is owned entirely by clinical-analyst.
 """
 from __future__ import annotations
 
@@ -12,9 +14,7 @@ import logging
 from csv import DictReader
 
 import pandas as pd
-from langchain_openai import ChatOpenAI
 
-from .data_analyst import analyse_dataframe
 from .gcs_client import gcs, program_prefix
 from .models import ProgramInfo
 
@@ -69,21 +69,17 @@ def build_clinical_context(
     bucket_name: str,
     program: ProgramInfo,
     placeholder_keys: list[str],
-    llm: ChatOpenAI | None = None,
     resolved_values: dict[str, str] | None = None,
 ) -> dict[str, str]:
-    """Return a mapping  placeholder_key → computed statistical summary string.
+    """Return a mapping  placeholder_key → value string for the writer LLM.
 
-    If *resolved_values* is provided (from ``clinical-analyst /resolve``),
-    those entries are returned as-is and the hybrid analyst is only dispatched
-    for keys that were NOT already resolved.
+    Seeds from *resolved_values* (pre-computed by clinical-analyst /resolve).
+    For any keys not already resolved, falls back to raw row strings from GCS
+    so the writer LLM has enough context to write [DATA PENDING] rather than
+    hallucinating figures.
 
-    For each CSV source in the manifest whose columns map to the requested
-    placeholder_keys, loads the full DataFrame, runs the DataAnalyst agent to
-    compute deterministic summaries (proportions, mean ± SD, median [range],
-    crosstabs), and returns the results.
-
-    Falls back to raw row strings if no LLM is provided (test / offline mode).
+    All statistical computation is owned by clinical-analyst — this function
+    never runs pandas tools or dispatches an LLM.
     Returns empty dict if no manifest is found.
     """
     # Start with pre-resolved values; hybrid analyst fills whatever is missing
@@ -98,54 +94,71 @@ def build_clinical_context(
     if not manifest:
         return context
 
-    # Build lookup: placeholder_key → {column_name, gcs_path, description}
-    placeholder_meta: dict[str, dict] = {}
+    # Build lookup: placeholder_key → list of {column_name, gcs_path, role}
+    # A placeholder may map to MULTIPLE columns (aggregate/narrative keys).
+    placeholder_meta: dict[str, list[dict]] = {}
     for source in manifest.get("sources", []):
         gcs_path = source.get("gcs_path", "")
         for mapping in source.get("column_mappings", []):
             pk = mapping.get("placeholder_key", "")
             cn = mapping.get("column_name", "")
             if pk and cn and pk in remaining_keys:
-                placeholder_meta[pk] = {
+                placeholder_meta.setdefault(pk, []).append({
                     "column_name": cn,
                     "gcs_path": gcs_path,
                     "role": mapping.get("role", ""),
-                    "description": f"{mapping.get('role', '')} — column: {cn}",
-                }
+                })
 
     if not placeholder_meta:
+        # Fallback: inject resolved_values as context for any remaining narrative keys
+        if resolved_values:
+            stats_block = "Pre-resolved clinical statistics:\n" + "\n".join(
+                f"  {k}: {v}" for k, v in resolved_values.items()
+            )
+            for pk in remaining_keys:
+                context[pk] = stats_block
         return context
 
     # Group by CSV file so we load each file once
-    file_groups: dict[str, dict[str, dict]] = {}
-    for pk, meta in placeholder_meta.items():
-        file_groups.setdefault(meta["gcs_path"], {})[pk] = meta
+    # Maps gcs_path → set of column names needed from that file
+    file_columns: dict[str, set[str]] = {}
+    for col_list in placeholder_meta.values():
+        for entry in col_list:
+            file_columns.setdefault(entry["gcs_path"], set()).add(entry["column_name"])
 
-    context: dict[str, str] = {}
+    # Load each CSV file once
+    file_dfs: dict[str, pd.DataFrame] = {}
+    for gcs_path, cols in file_columns.items():
+        rows = _csv_rows_for_columns(bucket_name, gcs_path, list(cols), max_rows=None)
+        if rows:
+            file_dfs[gcs_path] = pd.DataFrame(rows)
 
-    for gcs_path, ph_group in file_groups.items():
-        # Load all columns needed for this file
-        columns_needed = list({m["column_name"] for m in ph_group.values()})
-        rows = _csv_rows_for_columns(bucket_name, gcs_path, columns_needed,
-                                     max_rows=None)  # load full dataset for accuracy
-        if not rows:
-            continue
+    filename_short: dict[str, str] = {p: p.rsplit("/", 1)[-1] for p in file_dfs}
 
-        df = pd.DataFrame(rows)
+    # Build context: accumulate all column snippets for each placeholder key
+    for pk, col_list in placeholder_meta.items():
+        parts: list[str] = []
+        for entry in col_list:
+            gp = entry["gcs_path"]
+            col = entry["column_name"]
+            df = file_dfs.get(gp)
+            if df is None or col not in df.columns:
+                continue
+            col_rows = df[[col]].dropna().head(20)
+            parts.append(
+                f"Column '{col}' from {filename_short.get(gp, gp)}:\n"
+                + col_rows.to_string(index=False)
+            )
+        if parts:
+            context[pk] = "\n\n".join(parts)
 
-        if llm is not None:
-            # Option C: tool-calling analyst computes deterministic summaries
-            ph_descriptions = {pk: m["description"] for pk, m in ph_group.items()}
-            computed = analyse_dataframe(df, ph_descriptions, llm)
-            context.update(computed)
-        else:
-            # Fallback: raw row strings (for tests / offline mode)
-            for pk, meta in ph_group.items():
-                col = meta["column_name"]
-                col_rows = df[[col]].dropna().head(20)
-                context[pk] = (
-                    f"Source: {gcs_path.rsplit('/', 1)[-1]}\n"
-                    + col_rows.to_string(index=False)
-                )
+    # Fallback for any remaining_keys still not covered: inject resolved_values
+    if resolved_values:
+        stats_block = "Pre-resolved clinical statistics:\n" + "\n".join(
+            f"  {k}: {v}" for k, v in resolved_values.items()
+        )
+        for pk in remaining_keys:
+            if pk not in context:
+                context[pk] = stats_block
 
     return context

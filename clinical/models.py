@@ -18,15 +18,7 @@ class ColumnMapping(BaseModel):
     """Maps one CSV column to its regulatory role and CTD section placeholders."""
 
     column_name: str = Field(..., description="Exact CSV column header name")
-    role: Literal[
-        "efficacy_endpoint",
-        "safety_endpoint",
-        "demographics",
-        "treatment_group",
-        "study_metadata",
-        "pharmacokinetics",
-        "other",
-    ] = Field(..., description="Regulatory role of this column in a CTD submission")
+    role: str = Field(..., description="Regulatory role of this column in a CTD submission")
     ctd_section_keys: list[str] = Field(
         ...,
         description=(
@@ -39,6 +31,13 @@ class ColumnMapping(BaseModel):
         description=(
             "Snake-case identifier used as {{placeholder}} in CTD templates, "
             "e.g. 'recovery_rate_3mo'"
+        ),
+    )
+    positive_value: str | None = Field(
+        default=None,
+        description=(
+            "For categorical/binary columns: the value that counts as a positive outcome "
+            "(e.g. 'Yes', 'Recovered', '1'). None for numeric columns."
         ),
     )
 

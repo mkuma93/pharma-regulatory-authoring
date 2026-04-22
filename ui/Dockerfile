@@ -16,8 +16,8 @@ WORKDIR /app
 COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
 
-# Coordinator LangGraph pipeline (shared with ctd-api build, lives in ctd_structure/deploy/)
-COPY ctd_structure/deploy/main.py main.py
+# Coordinator LangGraph pipeline
+COPY ui/coordinator.py coordinator.py
 
 # Gradio UI shell + routing
 COPY ui/app.py app.py

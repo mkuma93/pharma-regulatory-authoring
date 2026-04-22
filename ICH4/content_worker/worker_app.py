@@ -33,33 +33,23 @@ import base64
 import json
 import logging
 import os
-import re
 from datetime import datetime, timezone
 
 import httpx
 from fastapi import FastAPI, Request
 from google.cloud import storage
+from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(name)s  %(message)s")
 
 app = FastAPI(title="ICH4 Content Worker", version="1.0.0")
 
-_ORCHESTRATOR_URL      = os.environ.get("ORCHESTRATOR_URL", "").rstrip("/")
+_CONTENT_PIPELINE_URL  = os.environ.get("CONTENT_PIPELINE_URL", "").rstrip("/")
 _WRITER_URL            = os.environ.get("WRITER_URL", "").rstrip("/")
 _INDEX_URL             = os.environ.get("INDEX_URL", "").rstrip("/")
 _CLINICAL_ANALYST_URL  = os.environ.get("CLINICAL_ANALYST_URL", "").rstrip("/")
 _TIMEOUT               = float(os.environ.get("SERVICE_TIMEOUT", "600"))
-
-_PLACEHOLDER_RE = re.compile(r"\{\{(\w+)\}\}")
-
-
-def _extract_placeholder_keys(templates: list[dict]) -> list[str]:
-    """Return unique {{placeholder}} keys found across all template contents."""
-    keys: set[str] = set()
-    for t in templates:
-        keys.update(_PLACEHOLDER_RE.findall(t.get("content", "")))
-    return sorted(keys)
 
 _gcs_client = storage.Client()
 
@@ -80,15 +70,29 @@ def _program_namespace(ta: str, dis: str, drug: str) -> str:
 
 
 def _content_status_path(ta: str, dis: str, drug: str, session_id: str = "") -> str:
+    suffix = session_id.strip() if session_id and session_id.strip() else "latest"
+    return f"{_program_prefix(ta, dis, drug)}/content_status/{suffix}.json"
+
+
+def _latest_status_path(ta: str, dis: str, drug: str) -> str:
     return f"{_program_prefix(ta, dis, drug)}/content_status/latest.json"
 
 
-def _write_status(bucket: str, path: str, payload: dict) -> None:
+def _write_status(bucket: str, path: str, payload: dict, also_latest: str | None = None) -> None:
     stamped = {**payload, "updated_at": datetime.now(timezone.utc).isoformat()}
+    data = json.dumps(stamped)
+    # Derive latest.json path automatically (content_status/{uuid}.json → content_status/latest.json)
+    if also_latest is None and "/content_status/" in path and not path.endswith("/latest.json"):
+        also_latest = path.rsplit("/", 1)[0] + "/latest.json"
     try:
         _gcs_client.bucket(bucket).blob(path).upload_from_string(
-            json.dumps(stamped), content_type="application/json"
+            data, content_type="application/json"
         )
+        # Always mirror to latest.json so the UI gets the most recent status
+        if also_latest and also_latest != path:
+            _gcs_client.bucket(bucket).blob(also_latest).upload_from_string(
+                data, content_type="application/json"
+            )
     except Exception as exc:
         logger.warning("[worker] Could not write status to GCS: %s", exc)
 
@@ -117,6 +121,156 @@ def _service_audience(base_url: str) -> str:
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+# ── Schema-evolution patch trigger ────────────────────────────────────────────
+
+class SchemaPatchRequest(BaseModel):
+    therapeutic_area: str
+    disease_type: str
+    drug_name: str
+    bucket: str
+    run_validator: bool = False
+
+
+@app.post("/schema-patch")
+async def schema_patch(request: SchemaPatchRequest):
+    """Check for clinical data schema changes and patch affected CTD sections.
+
+    Orchestrates the schema-evolution validator loop:
+      1. Calls clinical-analyst POST /schema-diff  — compares manifest vs snapshot.
+      2. If changes are found, calls writer POST /patch for affected sections only.
+      3. Returns a summary of what changed and what was patched.
+
+    The UI or an automated post-upload hook calls this endpoint after every
+    new clinical CSV upload to keep documents in sync with the evolving schema.
+    """
+    ta   = request.therapeutic_area
+    dis  = request.disease_type
+    drug = request.drug_name
+    bucket = request.bucket
+
+    if not _CLINICAL_ANALYST_URL:
+        return {"status": "skipped", "reason": "CLINICAL_ANALYST_URL not configured"}
+    if not _WRITER_URL:
+        return {"status": "skipped", "reason": "WRITER_URL not configured"}
+
+    # ── Step 1: Detect schema changes ─────────────────────────────────────────
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            analyst_aud = _service_audience(_CLINICAL_ANALYST_URL)
+            r = await client.post(
+                f"{_CLINICAL_ANALYST_URL}/schema-diff",
+                json={
+                    "therapeutic_area": ta,
+                    "disease_type":     dis,
+                    "drug_name":        drug,
+                    "bucket":           bucket,
+                },
+                headers=_oidc_headers(analyst_aud),
+            )
+            if r.status_code == 404:
+                return {"status": "no_manifest", "reason": "No clinical manifest found."}
+            if r.status_code >= 400:
+                return {
+                    "status": "error",
+                    "reason": f"schema-diff HTTP {r.status_code}: {r.text[:200]}",
+                }
+            diff = r.json()
+    except Exception as exc:
+        logger.error("[schema-patch] schema-diff failed: %s", exc)
+        return {"status": "error", "reason": str(exc)}
+
+    if not diff.get("has_changes"):
+        return {
+            "status":  "no_changes",
+            "message": "Clinical data schema unchanged — no patch needed.",
+        }
+
+    affected_sections  = diff.get("affected_sections", [])
+    added_placeholders = diff.get("added_placeholders", [])
+    changed_placeholders = diff.get("changed_placeholders", [])
+    removed_placeholders = diff.get("removed_placeholders", [])
+    changed_keys = sorted(set(added_placeholders + changed_placeholders + removed_placeholders))
+
+    logger.info(
+        "[schema-patch] Schema changed — added=%s changed=%s removed=%s  affected sections=%s",
+        added_placeholders, changed_placeholders, removed_placeholders, affected_sections,
+    )
+
+    # ── Step 1.5: Pre-resolve fresh values for changed keys ───────────────────
+    # clinical-analyst owns all data computation; writer receives values, never
+    # computes them.  Resolve only the changed keys so the writer has up-to-date
+    # numbers before patching prose.
+    resolved_values: dict[str, str] = {}
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            analyst_aud = _service_audience(_CLINICAL_ANALYST_URL)
+            rr = await client.post(
+                f"{_CLINICAL_ANALYST_URL}/resolve",
+                json={
+                    "therapeutic_area": ta,
+                    "disease_type":     dis,
+                    "drug_name":        drug,
+                    "bucket":           bucket,
+                    "placeholder_keys": changed_keys,
+                },
+                headers=_oidc_headers(analyst_aud),
+            )
+            if rr.status_code == 200:
+                resolved_values = rr.json().get("resolved_values", {})
+                logger.info(
+                    "[schema-patch] Resolved %d/%d changed keys via /resolve",
+                    len(resolved_values), len(changed_keys),
+                )
+            else:
+                logger.warning(
+                    "[schema-patch] /resolve HTTP %s — writer will use [DATA PENDING] for unresolved keys",
+                    rr.status_code,
+                )
+    except Exception as exc:
+        logger.warning("[schema-patch] /resolve failed (non-fatal): %s", exc)
+
+    # ── Step 2: Patch affected sections ───────────────────────────────────────
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            writer_aud = _service_audience(_WRITER_URL)
+            rw = await client.post(
+                f"{_WRITER_URL}/patch",
+                json={
+                    "program": {
+                        "therapeutic_area": ta,
+                        "disease_type":     dis,
+                        "drug_name":        drug,
+                    },
+                    "bucket_name":     bucket,
+                    "sections":        affected_sections,
+                    "changed_keys":    changed_keys,
+                    "resolved_values": resolved_values,
+                    "run_validator":   request.run_validator,
+                },
+                headers=_oidc_headers(writer_aud),
+            )
+            if rw.status_code >= 400:
+                return {
+                    "status": "error",
+                    "reason": f"writer /patch HTTP {rw.status_code}: {rw.text[:200]}",
+                }
+            patch_result = rw.json()
+    except Exception as exc:
+        logger.error("[schema-patch] writer /patch failed: %s", exc)
+        return {"status": "error", "reason": str(exc)}
+
+    return {
+        "status":               "patched",
+        "added_placeholders":   added_placeholders,
+        "changed_placeholders": changed_placeholders,
+        "removed_placeholders": removed_placeholders,
+        "affected_sections":    affected_sections,
+        "sections_written":     patch_result.get("sections_written", 0),
+        "sections_failed":      patch_result.get("sections_failed", []),
+        "validation_passed":    patch_result.get("validation", {}).get("passed"),
+    }
 
 
 @app.post("/generate")
@@ -223,15 +377,16 @@ async def generate(request: Request):
 
             # ── Step A: Orchestrator → templates ──────────────────────────────
             async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
-                orch_aud = _service_audience(_ORCHESTRATOR_URL)
+                orch_aud = _service_audience(_CONTENT_PIPELINE_URL)
                 r = await client.post(
-                    f"{_ORCHESTRATOR_URL}/generate",
+                    f"{_CONTENT_PIPELINE_URL}/generate",
                     json={
                         "program": {
                             "therapeutic_area": ta,
                             "disease_type":     dis,
                             "drug_name":        drug,
                         },
+                        "bucket":                bucket,
                         "include_clinical_data": True,
                         "include_ich_context":   True,
                         "module_filter":         dag_pass["module_filter"],
@@ -252,15 +407,28 @@ async def generate(request: Request):
                         return {"status": "failed", "reason": detail}
                     raise httpx.HTTPStatusError(detail, request=r.request, response=r)
 
-                templates = r.json().get("templates", [])
+                orch_data  = r.json()
+                templates  = orch_data.get("templates", [])
+                resolved_values: dict[str, str] = orch_data.get("resolved_values", {})
                 logger.info(
-                    "[worker] Pass %s: orchestrator returned %d templates",
-                    pass_id, len(templates),
+                    "[worker] Pass %s: orchestrator returned %d templates, %d resolved values",
+                    pass_id, len(templates), len(resolved_values),
                 )
 
             if not templates:
-                logger.warning("[worker] Pass %s: no templates — skipping write", pass_id)
-                continue
+                detail = (
+                    f"Pass {pass_id}: content pipeline returned no templates for "
+                    f"{ta}/{dis}/{drug}. "
+                    "Ensure the ICH CTD structure is approved and the program folder is scaffolded "
+                    "before triggering content generation."
+                )
+                logger.error("[worker] %s", detail)
+                _write_status(bucket, status_path, {
+                    "status": "failed",
+                    "run_id": run_id,
+                    "error":  detail,
+                })
+                return {"status": "failed", "reason": detail}
 
             # ── Step B: Save templates to GCS ────────────────────────────────
             prefix = _program_prefix(ta, dis, drug)
@@ -279,54 +447,6 @@ async def generate(request: Request):
                 "[worker] Pass %s: saved %d templates to gs://%s/%s/templates/",
                 pass_id, len(templates), bucket, prefix,
             )
-
-            # ── Step B.5: Clinical Analyst → pre-resolve placeholders ──────────
-            resolved_values: dict[str, str] = {}
-            if _CLINICAL_ANALYST_URL:
-                placeholder_keys = _extract_placeholder_keys(templates)
-                if placeholder_keys:
-                    _write_status(bucket, status_path, {
-                        "status":     "running",
-                        "run_id":     run_id,
-                        "step":       f"resolving_{pass_id}",
-                        "pass_label": pass_label,
-                    })
-                    try:
-                        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
-                            analyst_aud = _service_audience(_CLINICAL_ANALYST_URL)
-                            ra = await client.post(
-                                f"{_CLINICAL_ANALYST_URL}/resolve",
-                                json={
-                                    "therapeutic_area": ta,
-                                    "disease_type":     dis,
-                                    "drug_name":        drug,
-                                    "bucket":           bucket,
-                                    "placeholder_keys": placeholder_keys,
-                                },
-                                headers=_oidc_headers(analyst_aud),
-                            )
-                            if ra.status_code == 200:
-                                resolved_values = ra.json().get("resolved_values", {})
-                                logger.info(
-                                    "[worker] Pass %s: analyst resolved %d/%d keys",
-                                    pass_id, len(resolved_values), len(placeholder_keys),
-                                )
-                            elif ra.status_code == 404:
-                                # No manifest yet — writer hybrid-analyst will handle it
-                                logger.info(
-                                    "[worker] Pass %s: no clinical manifest — skipping resolve",
-                                    pass_id,
-                                )
-                            else:
-                                logger.warning(
-                                    "[worker] Pass %s: analyst /resolve HTTP %s — continuing",
-                                    pass_id, ra.status_code,
-                                )
-                    except Exception as exc:
-                        logger.warning(
-                            "[worker] Pass %s: analyst resolve failed (non-fatal): %s",
-                            pass_id, exc,
-                        )
 
             # ── Step C: Writer ────────────────────────────────────────────────
             _write_status(bucket, status_path, {

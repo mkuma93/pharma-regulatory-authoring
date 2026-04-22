@@ -38,6 +38,7 @@ import io
 import json
 import logging
 
+from json_repair import repair_json
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel
@@ -111,6 +112,8 @@ class UploadResult(BaseModel):
     study_type: str
     ctd_section_keys: list[str]
     columns_mapped: int
+    columns: int          # alias for UI compatibility
+    total_sources: int    # number of CSVs in the manifest after this upload
     manifest_gcs_path: str
 
 
@@ -161,7 +164,36 @@ def _run_mapper(
             raw = raw[4:]
         raw = raw.rsplit("```", 1)[0].strip()
 
-    return json.loads(raw)
+    # Try strict parse first; on failure, attempt repair then retry LLM once
+    for attempt in range(3):
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            if attempt < 2:
+                # First try: repair the malformed JSON in-place
+                try:
+                    return json.loads(repair_json(raw))
+                except Exception:
+                    pass
+                # Second try: ask LLM to return only clean JSON
+                logger.warning(
+                    "[uploader] Mapper returned invalid JSON (attempt %d), retrying LLM...",
+                    attempt + 1,
+                )
+                response = llm.invoke([
+                    SystemMessage(content=_MAPPER_SYSTEM),
+                    HumanMessage(content=prompt + "\n\nIMPORTANT: Return ONLY a valid JSON object. No prose, no code fences."),
+                ])
+                raw = response.content.strip()
+                if raw.startswith("```"):
+                    raw = raw.split("```", 2)[1]
+                    if raw.startswith("json"):
+                        raw = raw[4:]
+                    raw = raw.rsplit("```", 1)[0].strip()
+            else:
+                # Final attempt: use repair_json which is very permissive
+                return json.loads(repair_json(raw))
+    return json.loads(raw)  # unreachable but satisfies type checkers
 
 
 def _load_manifest(bucket_name: str, manifest_path: str) -> dict:
@@ -182,6 +214,24 @@ def _save_manifest(bucket_name: str, manifest_path: str, manifest: dict) -> None
         content_type="application/json",
     )
     logger.info("[uploader] Manifest saved to gs://%s/%s", bucket_name, manifest_path)
+
+
+def _snapshot_manifest(bucket_name: str, manifest_path: str) -> None:
+    """Copy manifest.json → manifest_snapshot.json before overwriting.
+
+    Called before each upload so the clinical-analyst /schema-diff endpoint can
+    compare the old schema against the new one and identify affected CTD sections.
+    """
+    try:
+        bkt  = gcs().bucket(bucket_name)
+        blob = bkt.blob(manifest_path)
+        if blob.exists():
+            snap_path = manifest_path.rsplit("/manifest.json", 1)[0] + "/manifest_snapshot.json"
+            raw = blob.download_as_bytes()
+            bkt.blob(snap_path).upload_from_string(raw, content_type="application/json")
+            logger.info("[uploader] Snapshot saved to gs://%s/%s", bucket_name, snap_path)
+    except Exception as exc:
+        logger.warning("[uploader] Could not snapshot manifest: %s", exc)
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -234,6 +284,8 @@ def upload_clinical_csv(
             study_type="unknown",
             ctd_section_keys=[],
             columns_mapped=0,
+            columns=0,
+            total_sources=0,
             manifest_gcs_path=f"gs://{bucket_name}/{manifest_gcs_path}",
         )
 
@@ -243,6 +295,7 @@ def upload_clinical_csv(
 
     # 3. Upsert into manifest
     manifest = _load_manifest(bucket_name, manifest_gcs_path)
+    _snapshot_manifest(bucket_name, manifest_gcs_path)  # preserve old schema before overwrite
     manifest["program"] = {
         "therapeutic_area": program.therapeutic_area,
         "disease_type": program.disease_type,
@@ -263,5 +316,7 @@ def upload_clinical_csv(
         study_type=source_dict.get("study_type", "unknown"),
         ctd_section_keys=source_dict.get("ctd_section_keys", []),
         columns_mapped=len(source_dict.get("column_mappings", [])),
+        columns=len(source_dict.get("column_mappings", [])),
+        total_sources=len(manifest["sources"]),
         manifest_gcs_path=f"gs://{bucket_name}/{manifest_gcs_path}",
     )

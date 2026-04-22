@@ -13,7 +13,16 @@ substitutions:
   _GCS_BUCKET:   pharma-reguatory-author-life-science
 
 steps:
-  # 1. Ensure Artifact Registry repo exists
+  # 1. Unit tests
+  - name: "python:3.12-slim"
+    entrypoint: bash
+    args:
+      - "-c"
+      - |
+        pip install --quiet pytest -r ctd_structure/api/requirements.txt \
+        && python -m pytest tests/test_ctd_structure/ -v
+
+  # 3. Ensure Artifact Registry repo exists
   - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
     entrypoint: bash
     args:
@@ -27,14 +36,14 @@ steps:
           --project=$_PROJECT_ID \
           --description="ICH4 Docker images"
 
-  # 2. Docker auth
+  # 4. Docker auth
   - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
     entrypoint: bash
     args:
       - "-c"
       - "gcloud auth configure-docker $_REGION-docker.pkg.dev --quiet"
 
-  # 3. Build
+  # 5. Build
   - name: "gcr.io/cloud-builders/docker"
     args:
       - build
@@ -46,14 +55,14 @@ steps:
       - "$_REGION-docker.pkg.dev/$_PROJECT_ID/$_AR_REPO/$_SERVICE_NAME:latest"
       - .
 
-  # 4. Push
+  # 6. Push
   - name: "gcr.io/cloud-builders/docker"
     args:
       - push
       - "--all-tags"
       - "$_REGION-docker.pkg.dev/$_PROJECT_ID/$_AR_REPO/$_SERVICE_NAME"
 
-  # 5. Deploy to Cloud Run
+  # 7. Deploy to Cloud Run
   - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
     entrypoint: gcloud
     args:
@@ -63,8 +72,9 @@ steps:
       - "--image=$_REGION-docker.pkg.dev/$_PROJECT_ID/$_AR_REPO/$_SERVICE_NAME:$_TAG"
       - "--region=$_REGION"
       - "--platform=managed"
-      - "--allow-unauthenticated"
-      - "--min-instances=1"
+      - "--no-allow-unauthenticated"
+      - "--ingress=all"
+      - "--min-instances=0"
       - "--max-instances=5"
       - "--memory=2Gi"
       - "--cpu=1"

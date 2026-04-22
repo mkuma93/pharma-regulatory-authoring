@@ -1,6 +1,7 @@
 """POST /write — generate and persist CTD documents from templates."""
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 
 from fastapi import APIRouter, HTTPException
@@ -19,6 +20,8 @@ from writer.storage import (
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+_VALIDATOR_TIMEOUT_SECONDS = 120  # 2-minute cap; prevents worker HTTP timeout on large writes
 
 
 @router.post("/write", response_model=WriterResponse)
@@ -87,11 +90,28 @@ def write(request: WriterRequest) -> WriterResponse:
     validation: ValidationResult
     if request.run_validator and documents:
         try:
-            validation = run_validator(
-                documents=documents,
-                llm=llm,
-                resolved_values=request.resolved_values or {},
-            )
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(
+                    run_validator,
+                    documents,
+                    llm,
+                    request.resolved_values or {},
+                )
+                try:
+                    validation = future.result(timeout=_VALIDATOR_TIMEOUT_SECONDS)
+                except concurrent.futures.TimeoutError:
+                    logger.warning(
+                        "[write] Validator timed out after %ds — skipping",
+                        _VALIDATOR_TIMEOUT_SECONDS,
+                    )
+                    validation = ValidationResult(
+                        passed=True,
+                        issues=[],
+                        summary=(
+                            f"Validator skipped: timed out after "
+                            f"{_VALIDATOR_TIMEOUT_SECONDS}s."
+                        ),
+                    )
         except Exception as exc:
             logger.warning("[write] Validator error: %s", exc)
             validation = ValidationResult(

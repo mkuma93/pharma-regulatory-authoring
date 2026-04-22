@@ -75,6 +75,9 @@ Section: {section_key} — {section_label}
 === TEMPLATE TO FILL ===
 {template_content}
 
+=== RESOLVED CLINICAL STATISTICS (pre-verified; use verbatim in any relevant narrative placeholder) ===
+{resolved_stats}
+
 === CLINICAL DATA FOR PLACEHOLDERS ===
 {clinical_context}
 
@@ -105,6 +108,50 @@ def _fmt_clinical_context(context: dict[str, str]) -> str:
     return "\n\n".join(parts)
 
 
+_PATCH_SYSTEM_PROMPT = """\
+You are a senior pharmaceutical regulatory scientist updating an existing CTD
+submission section because the underlying clinical dataset has changed.
+
+TASK
+────
+A subset of {{placeholder}} values in the document below have NEW data.
+Revise ONLY the sentences and tables that reference the changed placeholders.
+All other prose must remain VERBATIM — do not rewrite, expand, or improve
+unaffected text.
+
+STRICT RULES
+────────────
+1. Changed placeholders are listed under "CHANGED PLACEHOLDERS".
+   Update every sentence / cell / figure that uses one of those keys using
+   the new values in "CLINICAL DATA FOR PLACEHOLDERS".
+2. For every revised figure append an inline source tag: (Source: {filename}, {column_name}).
+3. If a changed placeholder has no supporting data in the clinical section:
+     [DATA PENDING — {placeholder_key}: no source data supplied]
+4. Do NOT alter any section headings, table structure, or unaffected prose.
+5. Return ONLY the complete revised Markdown document. No commentary.
+"""
+
+_PATCH_USER_TMPL = """\
+Program: {drug_name} | {disease_type} | {therapeutic_area}
+Section: {section_key} — {section_label}
+
+CHANGED PLACEHOLDERS (update only these)
+─────────────────────────────────────────
+{changed_keys_list}
+
+=== EXISTING DOCUMENT (keep unchanged sections verbatim) ===
+{prior_content}
+
+=== CLINICAL DATA FOR PLACEHOLDERS ===
+{clinical_context}
+
+─────────────────────────────────────────────────────────────────────────────────
+REMINDER: Revise ONLY sentences referencing the changed placeholders listed above.
+Return the complete revised Markdown document only — no commentary.
+─────────────────────────────────────────────────────────────────────────────────
+"""
+
+
 def write_section(
     program: ProgramInfo,
     section_key: str,
@@ -115,29 +162,60 @@ def write_section(
     bucket_name: str,
     llm: ChatOpenAI,
     resolved_values: dict[str, str] | None = None,
+    prior_content: str | None = None,
+    changed_keys: list[str] | None = None,
 ) -> SectionDocument:
-    """Fill one template and return a SectionDocument with completed prose."""
+    """Fill one template and return a SectionDocument with completed prose.
+
+    When ``prior_content`` is provided the writer runs in *patch mode*: it
+    receives the existing document as context and only revises sentences that
+    reference placeholders listed in ``changed_keys``.
+    """
     placeholders = extract_placeholders(template_content)
     logger.info("[writer] Section %s — %d placeholders: %s",
                 section_key, len(placeholders), placeholders)
 
     clinical_ctx = build_clinical_context(
-        bucket_name, program, placeholders, llm=llm,
+        bucket_name, program, placeholders,
         resolved_values=resolved_values,
     )
 
-    messages = [
-        SystemMessage(content=_SYSTEM_PROMPT),
-        HumanMessage(content=_USER_TMPL.format(
-            drug_name=program.drug_name,
-            disease_type=program.disease_type,
-            therapeutic_area=program.therapeutic_area,
-            section_key=section_key,
-            section_label=section_label,
-            template_content=template_content,
-            clinical_context=_fmt_clinical_context(clinical_ctx),
-        )),
-    ]
+    if prior_content is not None:
+        # ── Patch mode: update only changed placeholders ──────────────────────
+        keys_list = "\n".join(f"  - {k}" for k in (changed_keys or placeholders))
+        messages = [
+            SystemMessage(content=_PATCH_SYSTEM_PROMPT),
+            HumanMessage(content=_PATCH_USER_TMPL.format(
+                drug_name=program.drug_name,
+                disease_type=program.disease_type,
+                therapeutic_area=program.therapeutic_area,
+                section_key=section_key,
+                section_label=section_label,
+                changed_keys_list=keys_list or "(all placeholders)",
+                prior_content=prior_content,
+                clinical_context=_fmt_clinical_context(clinical_ctx),
+            )),
+        ]
+    else:
+        # ── Standard mode: fill all placeholders in template ──────────────────
+        _rv = resolved_values or {}
+        resolved_stats_str = (
+            "\n".join(f"  {k}: {v}" for k, v in _rv.items())
+            if _rv else "None provided."
+        )
+        messages = [
+            SystemMessage(content=_SYSTEM_PROMPT),
+            HumanMessage(content=_USER_TMPL.format(
+                drug_name=program.drug_name,
+                disease_type=program.disease_type,
+                therapeutic_area=program.therapeutic_area,
+                section_key=section_key,
+                section_label=section_label,
+                template_content=template_content,
+                resolved_stats=resolved_stats_str,
+                clinical_context=_fmt_clinical_context(clinical_ctx),
+            )),
+        ]
 
     response = llm.invoke(messages)
     filled_content = response.content.strip()
