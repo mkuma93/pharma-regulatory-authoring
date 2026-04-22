@@ -572,7 +572,7 @@ _theme = gr.themes.Soft().set(
 
 
 # ── Build Gradio app ───────────────────────────────────────────────────────────
-with gr.Blocks(title="Regulatory Authoring Platform") as demo:
+with gr.Blocks(title="Regulatory Authoring Platform", css=_CSS, theme=_theme, head=_HEAD) as demo:
 
     # ── Persistent state ───────────────────────────────────────────────────────
     _state           = gr.State(value={})
@@ -873,5 +873,4 @@ with gr.Blocks(title="Regulatory Authoring Platform") as demo:
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7860))
-    demo.launch(server_name="0.0.0.0", server_port=port, show_api=False,
-                theme=_theme, css=_CSS, head=_HEAD)
+    demo.launch(server_name="0.0.0.0", server_port=port)
