@@ -57,3 +57,8 @@ node_modules/
 
 # Office temp lock files
 ~$*
+
+# Findings — presentations, PDFs, and internal notes (not for repo)
+Findings/*.pptx
+Findings/*.pdf
+Findings/*.md
