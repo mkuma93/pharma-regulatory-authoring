@@ -392,6 +392,71 @@ def _action_generate(ta: str, dis: str, drug: str, state: dict, log: str):
     return new_state, new_log, _generation_status_html(new_state, ""), msg
 
 
+# ── Evidence & metadata helpers ──────────────────────────────────────────────
+def _evidence_html(manifest_data: dict, section_key: str) -> str:
+    """Build an HTML evidence panel from the manifest, highlighting columns
+    that are relevant to the given section_key (e.g. '2.5_clinical_overview')."""
+    sources = manifest_data.get("sources", [])
+    section_num = section_key.split("_")[0] if "_" in section_key else section_key  # "2.5"
+
+    relevant: list[tuple[str, dict]] = []
+    unmatched: list[tuple[str, dict]] = []
+    for src in sources:
+        for col in src.get("columns", []):
+            keys = col.get("ctd_section_keys", [])
+            matched = any(section_num in k or section_key in k for k in keys)
+            (relevant if (matched or not keys) else unmatched).append(
+                (src.get("filename", "unknown"), col)
+            )
+
+    display = relevant or unmatched  # fall back to all columns
+    if not display:
+        return ""
+
+    rows_html = ""
+    for filename, col in display[:25]:
+        ph   = col.get("placeholder_key", "")
+        name = col.get("column_name", "")
+        role = col.get("role", "")
+        secs = ", ".join(col.get("ctd_section_keys", []))
+        rows_html += (
+            f'<div class="ev-row">'
+            f'<span class="ev-placeholder">&#123;&#123;{ph}&#125;&#125;</span>'
+            f'<span class="ev-col"><strong>{name}</strong>'
+            f'<span class="ev-role"> — {role}</span>'
+            f'<span class="ev-secs"> | CTD: {secs or "all"}</span>'
+            f'</span></div>'
+        )
+
+    total = manifest_data.get("total_columns", len(display))
+    truncation = (
+        f'<div style="font-size:0.78em;color:#94a3b8;text-align:right;padding-top:6px;">'
+        f'Showing top 25 of {total} evidence columns</div>'
+        if total > 25 else ""
+    )
+    return (
+        f'<div class="evidence-card">'
+        f'<div class="evidence-title">📎 Evidence &amp; Data Sources'
+        f'<span style="font-weight:400;color:#64748b;font-size:0.88em;"> — {total} clinical columns mapped</span>'
+        f'</div>'
+        f'{rows_html}{truncation}</div>'
+    )
+
+
+def _section_meta_html(content: str, module: str, section_key: str) -> str:
+    words = len(content.split()) if content else 0
+    size  = f"{len(content) / 1024:.1f} KB" if content else "0 KB"
+    label = section_key.replace("_", " ").title()
+    return (
+        f'<div class="section-meta">'
+        f'<span>📁 <strong>{module.upper()}</strong></span>'
+        f'<span>📄 <strong>{label}</strong></span>'
+        f'<span>📝 <strong>{words:,}</strong> words</span>'
+        f'<span>💾 <strong>{size}</strong></span>'
+        f'</div>'
+    )
+
+
 def _action_load_sections(ta: str, dis: str, drug: str, state: dict):
     ta   = (ta   or (state.get("content_program") or {}).get("therapeutic_area", "")).strip()
     dis  = (dis  or (state.get("content_program") or {}).get("disease_type",     "")).strip()
@@ -415,22 +480,29 @@ def _action_load_sections(ta: str, dis: str, drug: str, state: dict):
     return gr.update(choices=choices, value=None), f"✅ {len(docs)} sections available."
 
 
-def _action_read_section(selection: str, ta: str, dis: str, drug: str, state: dict) -> str:
+def _action_read_section(
+    selection: str, ta: str, dis: str, drug: str, state: dict
+) -> tuple[str, str, str]:
+    """Returns (markdown_content, evidence_html, meta_html)."""
     if not selection:
-        return ""
+        return "", "", ""
     parts = selection.split("|", 1)
     if len(parts) != 2:
-        return "⚠️ Invalid selection."
+        return "⚠️ Invalid selection.", "", ""
     module, section_key = parts
     ta   = (ta   or (state.get("content_program") or {}).get("therapeutic_area", "")).strip()
     dis  = (dis  or (state.get("content_program") or {}).get("disease_type",     "")).strip()
     drug = (drug or (state.get("content_program") or {}).get("drug_name",        "")).strip()
     bkt  = state.get("bucket", _DEFAULT_BUCKET)
-    data = _writer_get("/documents/read", {
-        "therapeutic_area": ta, "disease_type": dis, "drug_name": drug,
-        "module": module, "section_key": section_key, "bucket_name": bkt,
-    })
-    return data.get("content", "⚠️ Could not load section.")
+
+    params = {"therapeutic_area": ta, "disease_type": dis, "drug_name": drug, "bucket_name": bkt}
+    data     = _writer_get("/documents/read",         {**params, "module": module, "section_key": section_key})
+    manifest = _writer_get("/clinical-data/manifest", params)
+
+    content  = data.get("content", "⚠️ Could not load section.")
+    evidence = _evidence_html(manifest, section_key)
+    meta     = _section_meta_html(content, module, section_key)
+    return content, evidence, meta
 
 
 # ── Auto-poll ──────────────────────────────────────────────────────────────────
@@ -543,6 +615,31 @@ html.dark input, html.dark textarea, html.dark select { background-color: #fffff
 /* Section content viewer */
 .section-viewer { border: 1px solid #e2e8f0 !important; border-radius: 8px !important;
                   padding: 20px !important; background: #ffffff !important; }
+
+/* Section metadata bar */
+.section-meta { background:#f8fafc; border:1px solid #e2e8f0; border-radius:6px;
+                padding:10px 16px; font-size:0.83em; color:#475569;
+                display:flex; gap:20px; flex-wrap:wrap; margin-bottom:12px; }
+.section-meta strong { color:#1a1a2e; }
+
+/* Evidence panel */
+.evidence-card { background:#f0f9ff; border:1px solid #bae6fd; border-radius:8px;
+                 padding:16px 20px; margin-top:16px; }
+.evidence-title { font-size:0.88em; font-weight:700; color:#0369a1;
+                  margin-bottom:12px; }
+.ev-row { display:flex; align-items:flex-start; gap:12px; padding:6px 0;
+          border-bottom:1px solid #e0f2fe; font-size:0.82em; }
+.ev-row:last-of-type { border-bottom:none; }
+.ev-placeholder { font-family:'Courier New',monospace; font-size:0.78em;
+                  background:#e0f2fe; color:#0369a1; padding:3px 8px;
+                  border-radius:4px; white-space:nowrap; min-width:180px; }
+.ev-col { color:#1e293b; }
+.ev-role { color:#64748b; font-weight:400; }
+.ev-secs { color:#94a3b8; }
+
+/* Soften Gradio's reconnect banner */
+.connecting, .pending { background:#eff6ff !important;
+                         border-color:#bfdbfe !important; color:#1e40af !important; }
 """
 
 _HEAD = """
@@ -693,13 +790,16 @@ with gr.Blocks(title="Regulatory Authoring Platform", css=_CSS, theme=_theme, he
         with gr.Tab("5 · Review"):
             gr.HTML(_step_banner(
                 "Step 5 — Review Generated Documents",
-                "Browse and read every generated CTD section directly in the browser.",
+                "Browse every generated CTD section. Evidence sources are shown beneath each section.",
                 _badge("Browse your generated regulatory content", "blue"),
             ))
             gr.HTML(_info_box(
                 "Select a section from the dropdown to read its full content. "
-                "Documents are grouped by module (Module 2 — Quality & Clinical Overview, "
-                "Module 5 — Clinical Study Reports). Click Load Sections if the list is empty."
+                "Below the document you will see <strong>Evidence &amp; Data Sources</strong> — "
+                "every clinical data column that was mapped to a regulatory placeholder "
+                "for this program. "
+                "Documents are grouped by module (Module 2 — Clinical Overview, "
+                "Module 5 — Clinical Study Reports)."
             ))
             with gr.Row():
                 _s5_ta_disp   = gr.Textbox(label="Therapeutic Area",    interactive=False, scale=1)
@@ -711,9 +811,9 @@ with gr.Blocks(title="Regulatory Authoring Platform", css=_CSS, theme=_theme, he
             _s5_dropdown = gr.Dropdown(
                 choices=[], label="Select a CTD section to read", interactive=True,
             )
-            _s5_content = gr.Markdown(
-                value="", label="", elem_classes=["section-viewer"],
-            )
+            _s5_meta    = gr.HTML(value="")
+            _s5_content = gr.Markdown(value="", label="", elem_classes=["section-viewer"])
+            _s5_evidence = gr.HTML(value="")
 
     # ── Activity Log (always visible at bottom) ────────────────────────────────
     with gr.Accordion("📋  Activity Log", open=False):
@@ -848,7 +948,7 @@ with gr.Blocks(title="Regulatory Authoring Platform", css=_CSS, theme=_theme, he
         outputs=[_s5_dropdown, _s5_load_msg],
     )
 
-    # Step 5 — Read section
+    # Step 5 — Read section (returns content + evidence panel + metadata)
     def _read_section_action(selection, state):
         prog = state.get("content_program") or {}
         ta   = prog.get("therapeutic_area", "")
@@ -859,7 +959,7 @@ with gr.Blocks(title="Regulatory Authoring Platform", css=_CSS, theme=_theme, he
     _s5_dropdown.change(
         fn=_read_section_action,
         inputs=[_s5_dropdown, _state],
-        outputs=[_s5_content],
+        outputs=[_s5_content, _s5_evidence, _s5_meta],
     )
 
     # ── Auto-poll every 20 s ───────────────────────────────────────────────────
