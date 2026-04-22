@@ -572,7 +572,7 @@ _theme = gr.themes.Soft().set(
 
 
 # ── Build Gradio app ───────────────────────────────────────────────────────────
-with gr.Blocks(title="Regulatory Authoring Platform", css=_CSS, theme=_theme, head=_HEAD) as demo:
+with gr.Blocks(title="Regulatory Authoring Platform") as demo:
 
     # ── Persistent state ───────────────────────────────────────────────────────
     _state           = gr.State(value={})
@@ -707,7 +707,7 @@ with gr.Blocks(title="Regulatory Authoring Platform", css=_CSS, theme=_theme, he
                 _s5_drug_disp = gr.Textbox(label="Drug Name",            interactive=False, scale=1)
             with gr.Row():
                 _s5_load_btn = gr.Button("🔄  Load Sections", variant="secondary", scale=1)
-                _s5_load_msg = gr.Markdown(value="", scale=3)
+                _s5_load_msg = gr.Markdown(value="")
             _s5_dropdown = gr.Dropdown(
                 choices=[], label="Select a CTD section to read", interactive=True,
             )
@@ -873,4 +873,5 @@ with gr.Blocks(title="Regulatory Authoring Platform", css=_CSS, theme=_theme, he
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7860))
-    demo.launch(server_name="0.0.0.0", server_port=port, show_api=False)
+    demo.launch(server_name="0.0.0.0", server_port=port, show_api=False,
+                theme=_theme, css=_CSS, head=_HEAD)
