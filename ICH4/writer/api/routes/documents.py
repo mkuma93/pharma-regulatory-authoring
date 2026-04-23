@@ -1,4 +1,4 @@
-"""GET /documents — list and read generated template documents from GCS.
+"""GET /documents — list and read generated documents from GCS.
 GET /clinical-data/manifest — return clinical column mapping for a program.
 """
 from __future__ import annotations
@@ -13,7 +13,7 @@ from pydantic import BaseModel
 from config.settings import settings
 from writer.gcs_client import gcs
 from writer.models import ProgramInfo
-from writer.storage import list_template_paths, load_template
+from writer.storage import list_generated_paths, load_template
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -54,17 +54,20 @@ def list_documents(
     )
 
     try:
-        paths = list_template_paths(bucket, program)
+        paths = list_generated_paths(bucket, program)
     except Exception as exc:
         logger.error("Failed to list documents: %s", exc)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     items: list[DocumentListItem] = []
     for path in sorted(paths):
+        # path format: …/ctd/{module}/{section_key}/document.md
         parts = path.rstrip("/").split("/")
-        filename = parts[-1]
-        module = parts[-2] if len(parts) >= 2 else "unknown"
-        section_key = filename[:-3]  # strip .md
+        # parts[-1] == "document.md", parts[-2] == section_key, parts[-3] == module
+        if len(parts) < 3 or parts[-1] != "document.md":
+            continue
+        section_key = parts[-2]
+        module      = parts[-3]
         section_label = section_key.replace("_", " ").title()
         items.append(DocumentListItem(
             gcs_path=path,

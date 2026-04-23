@@ -16,6 +16,20 @@ def list_template_paths(bucket_name: str, program: ProgramInfo) -> list[str]:
     return [b.name for b in bkt.list_blobs(prefix=prefix) if b.name.endswith(".md")]
 
 
+def list_generated_paths(bucket_name: str, program: ProgramInfo) -> list[str]:
+    """Return all generated document.md paths under the program's ctd/ prefix.
+
+    Scans therapeutic-area/{ta}/{dis}/{drug}/ctd/{module}/{section}/document.md
+    and returns the full GCS blob names for all that exist.
+    """
+    prefix = f"{program_prefix(program)}/ctd/"
+    bkt    = gcs().bucket(bucket_name)
+    return [
+        b.name for b in bkt.list_blobs(prefix=prefix)
+        if b.name.endswith("/document.md")
+    ]
+
+
 def load_template(bucket_name: str, gcs_path: str) -> str:
     """Download and return the text content of a template blob."""
     bkt  = gcs().bucket(bucket_name)
