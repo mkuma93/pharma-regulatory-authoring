@@ -759,9 +759,22 @@ def _load_manifest(bucket_name: str, prefix: str) -> dict | None:
 
 
 def _load_csv(bucket_name: str, gcs_path: str) -> pd.DataFrame | None:
-    """Stream a CSV from GCS into a pandas DataFrame."""
+    """Stream a CSV from GCS into a pandas DataFrame.
+
+    Accepts either a full ``gs://bucket/path`` URI or a bucket-relative blob
+    path.  The bucket-relative path is always derived by stripping the
+    ``gs://<bucket>/`` prefix when present.
+    """
     try:
-        data = _gcs_client().bucket(bucket_name).blob(gcs_path).download_as_bytes()
+        blob_path = gcs_path
+        full_prefix = f"gs://{bucket_name}/"
+        if blob_path.startswith(full_prefix):
+            blob_path = blob_path[len(full_prefix):]
+        elif blob_path.startswith("gs://"):
+            # URI for a different bucket — extract bucket + path
+            without = blob_path[len("gs://"):]
+            _, blob_path = without.split("/", 1)
+        data = _gcs_client().bucket(bucket_name).blob(blob_path).download_as_bytes()
         return pd.read_csv(io.BytesIO(data))
     except Exception as exc:
         logger.warning("Could not load CSV at %s: %s", gcs_path, exc)
