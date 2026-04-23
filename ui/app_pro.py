@@ -47,16 +47,30 @@ _DEFAULT_BUCKET       = os.environ.get("GCS_BUCKET",           "pharma-reguatory
 
 # ── OIDC ───────────────────────────────────────────────────────────────────────
 def _oidc_headers(base_url: str) -> dict[str, str]:
+    from urllib.parse import urlparse
+    p = urlparse(base_url)
+    audience = f"{p.scheme}://{p.netloc}"
+    # Try google-auth library first (works on Cloud Run / GCE)
     try:
         from google.auth.transport.requests import Request as AuthRequest
         from google.oauth2.id_token import fetch_id_token
-        from urllib.parse import urlparse
-        p = urlparse(base_url)
-        audience = f"{p.scheme}://{p.netloc}"
         token = fetch_id_token(AuthRequest(), audience)
         return {"Authorization": f"Bearer {token}"}
     except Exception:
-        return {}
+        pass
+    # Fallback: use gcloud CLI (works for local dev with gcloud auth login)
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["gcloud", "auth", "print-identity-token"],
+            capture_output=True, text=True, timeout=10
+        )
+        token = result.stdout.strip()
+        if token:
+            return {"Authorization": f"Bearer {token}"}
+    except Exception:
+        pass
+    return {}
 
 
 # ── API helpers ────────────────────────────────────────────────────────────────
@@ -115,7 +129,20 @@ def _log(existing: str, message: str) -> str:
 
 # ── Session state init ─────────────────────────────────────────────────────────
 def _init_session(bucket: str, browser_session: str):
-    sid  = browser_session or str(uuid.uuid4())
+    import json as _json
+    # browser_session may be a plain session_id string or a JSON blob
+    saved_prog = None
+    raw = (browser_session or "").strip()
+    if raw.startswith("{"):
+        try:
+            bs = _json.loads(raw)
+            sid = bs.get("session_id") or str(uuid.uuid4())
+            saved_prog = bs.get("content_program")
+        except Exception:
+            sid = raw or str(uuid.uuid4())
+    else:
+        sid = raw or str(uuid.uuid4())
+
     bkt  = (bucket or "").strip() or _DEFAULT_BUCKET
     data = _ctd_get("/session", {"session_id": sid, "bucket": bkt})
 
@@ -126,7 +153,7 @@ def _init_session(bucket: str, browser_session: str):
         "approved":                data.get("approved", False),
         "canonical_exists":        data.get("canonical_exists", False),
         "program_scaffold_exists": data.get("program_scaffold_exists", False),
-        "content_program":         data.get("content_program"),
+        "content_program":         data.get("content_program") or saved_prog,
         "content_run_id":          data.get("content_run_id"),
         "ctd_output":              data.get("ctd_output"),
         "extraction_in_progress":  False,
@@ -302,16 +329,17 @@ def _action_publish_framework(state: dict, log: str):
 
 
 def _action_setup_program(ta: str, dis: str, drug: str, state: dict, log: str):
+    import json as _json
     ta   = (ta   or "").strip()
     dis  = (dis  or "").strip()
     drug = (drug or "").strip()
     if not ta or not dis or not drug:
         msg = "⚠️ Please fill in all three fields: Therapeutic Area, Disease, and Drug Name."
-        return state, _log(log, msg), _program_status_html(state), msg
+        return state, _log(log, msg), _program_status_html(state), msg, state.get("_browser_session_val", "")
 
     if not (state.get("approved") or state.get("canonical_exists")):
         msg = "⚠️ Complete Step 1 (publish the document framework) first."
-        return state, _log(log, msg), _program_status_html(state), msg
+        return state, _log(log, msg), _program_status_html(state), msg, state.get("_browser_session_val", "")
 
     sid = state.get("session_id", "default")
     bkt = state.get("bucket", _DEFAULT_BUCKET)
@@ -324,9 +352,17 @@ def _action_setup_program(ta: str, dis: str, drug: str, state: dict, log: str):
         "state":            state,
     })
     new_state = {**state, **result.get("state_patch", {})}
+    # Store program in new_state.content_program if not already set
+    if not new_state.get("content_program"):
+        new_state["content_program"] = {"therapeutic_area": ta, "disease_type": dis, "drug_name": drug}
     msg = result.get("reply", "Program folder created.")
     new_log = _log(log, f"✅ Program set up: {ta} / {dis} / {drug}")
-    return new_state, new_log, _program_status_html(new_state), ""
+    # Persist session_id + content_program to browser localStorage
+    new_browser_session = _json.dumps({
+        "session_id": sid,
+        "content_program": new_state.get("content_program"),
+    })
+    return new_state, new_log, _program_status_html(new_state), "", new_browser_session
 
 
 def _action_upload_csv(csv_file, ta: str, dis: str, drug: str, state: dict, log: str):
@@ -443,16 +479,21 @@ def _evidence_html(manifest_data: dict, section_key: str) -> str:
     )
 
 
-def _section_meta_html(content: str, module: str, section_key: str) -> str:
+def _section_meta_html(content: str, module: str, section_key: str,
+                       template_path: str = "") -> str:
     words = len(content.split()) if content else 0
     size  = f"{len(content) / 1024:.1f} KB" if content else "0 KB"
     label = section_key.replace("_", " ").title()
+    tpl   = template_path or f"templates/{module}/{section_key}.md"
+    # Show just the relative part after the program prefix for readability
+    tpl_display = tpl.split("/templates/", 1)[-1] if "/templates/" in tpl else tpl
     return (
         f'<div class="section-meta">'
         f'<span>📁 <strong>{module.upper()}</strong></span>'
         f'<span>📄 <strong>{label}</strong></span>'
         f'<span>📝 <strong>{words:,}</strong> words</span>'
         f'<span>💾 <strong>{size}</strong></span>'
+        f'<span style="color:#64748b">🗂 Template: <strong style="font-family:monospace;font-size:0.95em">{tpl_display}</strong></span>'
         f'</div>'
     )
 
@@ -501,7 +542,15 @@ def _action_read_section(
 
     content  = data.get("content", "⚠️ Could not load section.")
     evidence = _evidence_html(manifest, section_key)
-    meta     = _section_meta_html(content, module, section_key)
+    # Derive the template path from the document GCS path:
+    # document: .../ctd/{module}/{section_key}/document.md
+    # template: .../templates/{module}/{section_key}.md
+    gcs_path = data.get("gcs_path", "")
+    template_path = gcs_path.replace(
+        f"/ctd/{module}/{section_key}/document.md",
+        f"/templates/{module}/{section_key}.md",
+    ) if gcs_path else ""
+    meta     = _section_meta_html(content, module, section_key, template_path)
     return content, evidence, meta
 
 
@@ -541,19 +590,24 @@ def _poll(state: dict, log: str, gen_msg: str):
             new_log = _log(new_log, f"✅ Framework built — {n} folders. Review and click Publish Framework.")
 
     # ── Content done / failed ─────────────────────────────────────────────────
-    if st.get("generation_in_progress") and cont:
+    if cont:
         cstatus = cont.get("status")
         if cstatus == "done":
             secs     = cont.get("sections_written", "?")
             val_pass = cont.get("validation_passed", False)
             val_sum  = cont.get("validation_summary", "") or ("passed" if val_pass else "issues found")
-            new_state = {**new_state, "generation_in_progress": False, "content_run_id": None}
-            new_gen   = f"✅ Complete — {secs} sections written. Validation: {val_sum}"
-            new_log   = _log(new_log, new_gen)
+            completed_gen = f"✅ Complete — {secs} sections written. Validation: {val_sum}"
+            if st.get("generation_in_progress"):
+                new_state = {**new_state, "generation_in_progress": False, "content_run_id": None}
+                new_log   = _log(new_log, completed_gen)
+            # Always reflect the completed status in gen_msg so page reloads show it
+            new_gen = completed_gen
         elif cstatus == "failed":
-            new_state = {**new_state, "generation_in_progress": False, "content_run_id": None}
-            new_gen   = f"❌ Failed — {cont.get('error', 'unknown error')}"
-            new_log   = _log(new_log, new_gen)
+            failed_gen = f"❌ Failed — {cont.get('error', 'unknown error')}"
+            if st.get("generation_in_progress"):
+                new_state = {**new_state, "generation_in_progress": False, "content_run_id": None}
+                new_log   = _log(new_log, failed_gen)
+            new_gen = failed_gen
 
     return (
         new_state,
@@ -669,7 +723,10 @@ _theme = gr.themes.Soft().set(
 
 
 # ── Build Gradio app ───────────────────────────────────────────────────────────
-with gr.Blocks(title="Regulatory Authoring Platform", css=_CSS, theme=_theme, head=_HEAD) as demo:
+with gr.Blocks(title="Regulatory Authoring Platform") as demo:
+
+    # Inject CSS and head scripts as HTML
+    gr.HTML(f"<style>{_CSS}</style>{_HEAD}")
 
     # ── Persistent state ───────────────────────────────────────────────────────
     _state           = gr.State(value={})
@@ -881,13 +938,13 @@ with gr.Blocks(title="Regulatory Authoring Platform", css=_CSS, theme=_theme, he
 
     # Step 2 — Setup program (also propagates program to steps 3-5)
     def _setup_and_propagate(ta, dis, drug, state, log):
-        new_state, new_log, s2b, msg = _action_setup_program(ta, dis, drug, state, log)
+        new_state, new_log, s2b, msg, new_bs = _action_setup_program(ta, dis, drug, state, log)
         prog = new_state.get("content_program") or {}
         t = prog.get("therapeutic_area", ta)
         d = prog.get("disease_type",     dis)
         n = prog.get("drug_name",        drug)
         return (
-            new_state, new_log, s2b, msg,
+            new_state, new_bs, new_log, s2b, msg,
             gr.update(value=t), gr.update(value=d), gr.update(value=n),
             gr.update(value=t), gr.update(value=d), gr.update(value=n),
             gr.update(value=t), gr.update(value=d), gr.update(value=n),
@@ -897,7 +954,7 @@ with gr.Blocks(title="Regulatory Authoring Platform", css=_CSS, theme=_theme, he
         fn=_setup_and_propagate,
         inputs=[_s2_ta, _s2_dis, _s2_drug, _state, _log_box],
         outputs=[
-            _state, _log_box, _s2_banner, _s2_msg,
+            _state, _browser_session, _log_box, _s2_banner, _s2_msg,
             _s3_ta_disp, _s3_dis_disp, _s3_drug_disp,
             _s4_ta_disp, _s4_dis_disp, _s4_drug_disp,
             _s5_ta_disp, _s5_dis_disp, _s5_drug_disp,
