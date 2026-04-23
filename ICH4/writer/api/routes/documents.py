@@ -96,7 +96,7 @@ def read_document(
         disease_type=disease_type,
         drug_name=drug_name,
     )
-    gcs_path = f"{program_prefix(program)}/templates/{module}/{section_key}.md"
+    gcs_path = f"{program_prefix(program)}/ctd/{module}/{section_key}/document.md"
 
     try:
         content = load_template(bucket, gcs_path)
