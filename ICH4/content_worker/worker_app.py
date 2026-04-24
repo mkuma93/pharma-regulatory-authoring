@@ -619,6 +619,19 @@ async def generate(request: Request):
             )
             logger.error("[worker] Unexpected error: %s", exc, exc_info=True)
             return {"status": "failed", "reason": str(exc)}
+        # HTTPStatusError (5xx) bubbled up from inner pass loop — emit audit
+        # event before re-raising so Pub/Sub retry is still traceable.
+        emit_generation_run(
+            run_id=run_id,
+            author=author or "system",
+            therapeutic_area=ta,
+            disease_type=dis,
+            drug_name=drug,
+            sections_written=all_sections_written,
+            sections_failed=all_sections_failed,
+            validation_passed=False,
+            validation_issue_count=0,
+        )
         raise
 
     # ── Save full validation report to GCS (non-fatal) ───────────────────────
