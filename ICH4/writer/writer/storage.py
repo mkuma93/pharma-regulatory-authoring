@@ -167,6 +167,7 @@ def save_document(
             )
     except Exception as exc:
         # Non-fatal — proceed with write even if versioning fails
+        _first_write = False  # unknown state — suppress version=1 emit to avoid false audit
         logger.warning("[storage] Versioning failed (non-fatal): %s", exc)
 
     # ── Write latest ──────────────────────────────────────────────────────────

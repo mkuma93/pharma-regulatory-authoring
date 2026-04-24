@@ -49,7 +49,9 @@ BQ_TABLE_SCHEMA (run once to create the table):
     csv_source          STRING,
     -- generation stats --
     sections_written    INT64,
-    sections_failed     JSON
+    sections_failed     JSON,
+    -- session identity (generation_start events) --
+    session_id          STRING
   )
   PARTITION BY DATE(emitted_at)
   CLUSTER BY event_type, therapeutic_area, drug_name;
@@ -156,7 +158,7 @@ def emit_generation_start(
         "therapeutic_area": therapeutic_area,
         "disease_type":     disease_type,
         "drug_name":        drug_name,
-        "section_key":      session_id,   # reuse section_key column to carry session_id
+        "session_id":       session_id,
     })
 
 

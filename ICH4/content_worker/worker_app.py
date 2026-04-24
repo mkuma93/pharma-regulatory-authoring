@@ -565,6 +565,17 @@ async def generate(request: Request):
         _write_status(bucket, status_path, {
             "status": "failed", "run_id": run_id, "error": f"transient: {exc}",
         })
+        emit_generation_run(
+            run_id=run_id,
+            author=author or "system",
+            therapeutic_area=ta,
+            disease_type=dis,
+            drug_name=drug,
+            sections_written=all_sections_written,
+            sections_failed=all_sections_failed,
+            validation_passed=False,
+            validation_issue_count=0,
+        )
         raise  # 5xx → Pub/Sub retries
 
     except Exception as exc:
@@ -572,6 +583,17 @@ async def generate(request: Request):
             _write_status(bucket, status_path, {
                 "status": "failed", "run_id": run_id, "error": str(exc),
             })
+            emit_generation_run(
+                run_id=run_id,
+                author=author or "system",
+                therapeutic_area=ta,
+                disease_type=dis,
+                drug_name=drug,
+                sections_written=all_sections_written,
+                sections_failed=all_sections_failed,
+                validation_passed=False,
+                validation_issue_count=0,
+            )
             logger.error("[worker] Unexpected error: %s", exc, exc_info=True)
             return {"status": "failed", "reason": str(exc)}
         raise

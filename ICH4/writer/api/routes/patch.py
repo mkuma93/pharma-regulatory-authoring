@@ -34,6 +34,8 @@ router = APIRouter()
 class PatchRequest(BaseModel):
     program: ProgramInfo
     bucket_name: str | None = Field(default=None)
+    run_id: str = Field(default="", description="Content-generation run identifier for traceability.")
+    author: str = Field(default="", description="User who triggered the patch (IAP email).")
     sections: list[str] = Field(
         default_factory=list,
         description="CTD section keys to patch. Empty = patch ALL sections that have a generated document.",
@@ -136,7 +138,8 @@ def patch(request: PatchRequest) -> WriterResponse:
                 prior_content=prior_content,
                 changed_keys=request.changed_keys or None,
             )
-            doc.gcs_path = save_document(bucket_name, request.program, doc)
+            doc.gcs_path = save_document(bucket_name, request.program, doc,
+                                          run_id=request.run_id, author=request.author)
             documents.append(doc)
         except Exception as exc:
             logger.error("[patch] Failed section %s: %s", section_key, exc)
