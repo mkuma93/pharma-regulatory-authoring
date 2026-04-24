@@ -106,6 +106,26 @@ def _writer_get(path: str, params: dict, timeout: int = 60) -> dict:
         return {}
 
 
+def _writer_put(path: str, payload: dict, iap_user: str = "", timeout: int = 60) -> dict:
+    """PUT to the writer service, forwarding the IAP-authenticated user email.
+
+    The writer reads ``X-Goog-Authenticated-User-Email`` to attribute edits to
+    a real human; falling back to an explicit ``author`` body field for
+    local dev where Cloud Run IAP isn't in front.
+    """
+    url     = f"{_ICH4_WRITER_URL.rstrip('/')}{path}"
+    headers = _oidc_headers(_ICH4_WRITER_URL)
+    if iap_user:
+        headers["X-Goog-Authenticated-User-Email"] = iap_user
+    try:
+        r = requests.put(url, json=payload, headers=headers, timeout=timeout)
+        if r.status_code >= 400:
+            return {"error": f"HTTP {r.status_code}", "detail": r.text[:500]}
+        return r.json()
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
 def _analyst_post(path: str, payload: dict, timeout: int = 120) -> dict:
     url = f"{_CLINICAL_ANALYST_URL.rstrip('/')}{path}"
     try:
@@ -1033,6 +1053,48 @@ with gr.Blocks(title="Regulatory Authoring Platform") as demo:
                 )
                 _s5_ver_content = gr.Markdown(value="", label="", elem_classes=["section-viewer"])
             _s5_evidence = gr.HTML(value="")
+            with gr.Accordion("✏️  Edit Generated Document", open=False):
+                gr.HTML(_info_box(
+                    "Edit the generated document inline. On save, the prior revision "
+                    "is snapshotted to <code>versions/v{N}.md</code> and the edit is "
+                    "attributed to your IAP-authenticated identity. Add an "
+                    "<strong>edit reason</strong> for the audit trail."
+                ))
+                _s5_edit_box = gr.Textbox(
+                    label="Document Source (markdown)",
+                    lines=20, interactive=True, elem_classes=["section-viewer"],
+                )
+                _s5_edit_reason = gr.Textbox(
+                    label="Edit reason (required for audit trail)",
+                    placeholder="e.g. Corrected pooled OR per latest meta-analysis",
+                    interactive=True,
+                )
+                with gr.Row():
+                    _s5_edit_btn = gr.Button("💾  Save Edits", variant="primary", scale=1)
+                    _s5_edit_msg = gr.Markdown(value="", elem_classes=[])
+            with gr.Accordion("📄  Edit Template Source", open=False):
+                gr.HTML(_info_box(
+                    "Templates drive the next regeneration. Edit the template source "
+                    "here, save it, then re-run Step 4 to propagate changes. "
+                    "Previous template revisions are snapshotted for audit."
+                ))
+                with gr.Row():
+                    _s5_tpl_load_btn = gr.Button(
+                        "📥  Load Template", variant="secondary", scale=1,
+                    )
+                    _s5_tpl_msg = gr.Markdown(value="")
+                _s5_tpl_box = gr.Textbox(
+                    label="Template Source (markdown with {{placeholders}})",
+                    lines=20, interactive=True, elem_classes=["section-viewer"],
+                )
+                _s5_tpl_reason = gr.Textbox(
+                    label="Edit reason (required for audit trail)",
+                    placeholder="e.g. Added efficacy-endpoints table scaffold",
+                    interactive=True,
+                )
+                _s5_tpl_save_btn = gr.Button(
+                    "💾  Save Template", variant="primary",
+                )
             with gr.Accordion("🔍  Consistency Validation Report", open=False):
                 gr.HTML(_info_box(
                     "Cross-module validation checks: drug name consistency, demographic "
@@ -1198,14 +1260,43 @@ with gr.Blocks(title="Regulatory Authoring Platform") as demo:
         dis  = (dis_field  or prog.get("disease_type",     "")).strip()
         drug = (drug_field or prog.get("drug_name",        "")).strip()
         content, evidence, meta = _action_read_section(selection, ta, dis, drug, state)
+        # Also fetch the raw (unstripped) source for the inline editor so what
+        # the user edits exactly matches what is persisted in GCS.
+        raw_content = ""
+        if selection:
+            section_key, module = _parse_section_key_module(selection)
+            if section_key and ta and dis and drug:
+                raw = _writer_get("/documents/read", {
+                    "therapeutic_area": ta,
+                    "disease_type":     dis,
+                    "drug_name":        drug,
+                    "module":           module,
+                    "section_key":      section_key,
+                    "bucket_name":      state.get("bucket", _DEFAULT_BUCKET),
+                })
+                raw_content = raw.get("content", "")
         # Also load version list when a section is selected
         ver_choices = _load_version_choices(selection, ta, dis, drug, state)
-        return content, evidence, meta, gr.update(choices=ver_choices, value=None), ""
+        return (
+            content, evidence, meta,
+            gr.update(choices=ver_choices, value=None), "",
+            raw_content,  # _s5_edit_box
+            "",           # _s5_edit_reason (clear)
+            "",           # _s5_edit_msg (clear)
+            "",           # _s5_tpl_box (clear on section change)
+            "",           # _s5_tpl_reason
+            "",           # _s5_tpl_msg
+        )
 
     _s5_dropdown.change(
         fn=_read_section_action,
         inputs=[_s5_dropdown, _s5_ta_disp, _s5_dis_disp, _s5_drug_disp, _state],
-        outputs=[_s5_content, _s5_evidence, _s5_meta, _s5_ver_dropdown, _s5_ver_content],
+        outputs=[
+            _s5_content, _s5_evidence, _s5_meta,
+            _s5_ver_dropdown, _s5_ver_content,
+            _s5_edit_box, _s5_edit_reason, _s5_edit_msg,
+            _s5_tpl_box, _s5_tpl_reason, _s5_tpl_msg,
+        ],
     )
 
     # Step 5 — Read prior version
@@ -1271,6 +1362,143 @@ with gr.Blocks(title="Regulatory Authoring Platform") as demo:
         fn=_load_val_report_action,
         inputs=[_s5_ta_disp, _s5_dis_disp, _s5_drug_disp, _state],
         outputs=[_s5_val_report],
+    )
+
+    # Step 5 — Save document edit
+    def _save_doc_edit_action(
+        selection, new_content, edit_reason,
+        ta_field, dis_field, drug_field, state, iap_user,
+    ):
+        if not selection:
+            return "⚠️ Select a section first."
+        if not new_content or not new_content.strip():
+            return "⚠️ Document cannot be empty."
+        if not edit_reason or not edit_reason.strip():
+            return "⚠️ Please provide an edit reason for the audit trail."
+        section_key, module = _parse_section_key_module(selection)
+        if not section_key:
+            return "⚠️ Invalid section selection."
+        prog = state.get("content_program") or {}
+        ta   = (ta_field   or prog.get("therapeutic_area", "")).strip()
+        dis  = (dis_field  or prog.get("disease_type",     "")).strip()
+        drug = (drug_field or prog.get("drug_name",        "")).strip()
+        if not (ta and dis and drug):
+            return "⚠️ Program details missing."
+        result = _writer_put(
+            "/documents/content",
+            {
+                "therapeutic_area": ta,
+                "disease_type":     dis,
+                "drug_name":        drug,
+                "module":           module,
+                "section_key":      section_key,
+                "content":          new_content,
+                "edit_reason":      edit_reason.strip(),
+                "author":           iap_user or "",
+                "bucket_name":      state.get("bucket", _DEFAULT_BUCKET),
+            },
+            iap_user=iap_user,
+        )
+        if "error" in result:
+            return f"❌ Save failed: {result.get('detail') or result['error']}"
+        return (
+            f"✅ Saved — new <code>{result.get('gcs_path','')}</code> "
+            f"by `{result.get('author','system')}` at "
+            f"{result.get('timestamp','')[:19].replace('T',' ')} UTC."
+        )
+
+    _s5_edit_btn.click(
+        fn=_save_doc_edit_action,
+        inputs=[
+            _s5_dropdown, _s5_edit_box, _s5_edit_reason,
+            _s5_ta_disp, _s5_dis_disp, _s5_drug_disp, _state, _iap_user,
+        ],
+        outputs=[_s5_edit_msg],
+    )
+
+    # Step 5 — Load template source into editor
+    def _load_template_action(selection, ta_field, dis_field, drug_field, state):
+        if not selection:
+            return "", "⚠️ Select a section first."
+        section_key, module = _parse_section_key_module(selection)
+        if not section_key:
+            return "", "⚠️ Invalid selection."
+        prog = state.get("content_program") or {}
+        ta   = (ta_field   or prog.get("therapeutic_area", "")).strip()
+        dis  = (dis_field  or prog.get("disease_type",     "")).strip()
+        drug = (drug_field or prog.get("drug_name",        "")).strip()
+        if not (ta and dis and drug):
+            return "", "⚠️ Program details missing."
+        data = _writer_get("/templates/read", {
+            "therapeutic_area": ta,
+            "disease_type":     dis,
+            "drug_name":        drug,
+            "module":           module,
+            "section_key":      section_key,
+            "bucket_name":      state.get("bucket", _DEFAULT_BUCKET),
+        })
+        content = data.get("content", "")
+        if not content:
+            return "", f"⚠️ Template not found for {module}/{section_key}."
+        return content, f"✅ Loaded <code>{data.get('gcs_path','')}</code>."
+
+    _s5_tpl_load_btn.click(
+        fn=_load_template_action,
+        inputs=[_s5_dropdown, _s5_ta_disp, _s5_dis_disp, _s5_drug_disp, _state],
+        outputs=[_s5_tpl_box, _s5_tpl_msg],
+    )
+
+    # Step 5 — Save template edit
+    def _save_template_action(
+        selection, new_content, edit_reason,
+        ta_field, dis_field, drug_field, state, iap_user,
+    ):
+        if not selection:
+            return "⚠️ Select a section first."
+        if not new_content or not new_content.strip():
+            return "⚠️ Template cannot be empty."
+        if not edit_reason or not edit_reason.strip():
+            return "⚠️ Please provide an edit reason."
+        section_key, module = _parse_section_key_module(selection)
+        if not section_key:
+            return "⚠️ Invalid selection."
+        prog = state.get("content_program") or {}
+        ta   = (ta_field   or prog.get("therapeutic_area", "")).strip()
+        dis  = (dis_field  or prog.get("disease_type",     "")).strip()
+        drug = (drug_field or prog.get("drug_name",        "")).strip()
+        if not (ta and dis and drug):
+            return "⚠️ Program details missing."
+        result = _writer_put(
+            "/templates/content",
+            {
+                "therapeutic_area": ta,
+                "disease_type":     dis,
+                "drug_name":        drug,
+                "module":           module,
+                "section_key":      section_key,
+                "content":          new_content,
+                "edit_reason":      edit_reason.strip(),
+                "author":           iap_user or "",
+                "bucket_name":      state.get("bucket", _DEFAULT_BUCKET),
+            },
+            iap_user=iap_user,
+        )
+        if "error" in result:
+            return f"❌ Save failed: {result.get('detail') or result['error']}"
+        return (
+            f"✅ Template v{result.get('version','?')} saved "
+            f"(<code>{result.get('gcs_path','')}</code>) by "
+            f"`{result.get('author','system')}`. "
+            f"Re-run Step 4 to regenerate with the new template."
+        )
+
+    _s5_tpl_save_btn.click(
+        fn=_save_template_action,
+        inputs=[
+            _s5_dropdown, _s5_tpl_box, _s5_tpl_reason,
+            _s5_ta_disp, _s5_dis_disp, _s5_drug_disp, _state, _iap_user,
+        ],
+        outputs=[_s5_tpl_msg],
     )
 
     # ── Auto-poll every 20 s ───────────────────────────────────────────────────

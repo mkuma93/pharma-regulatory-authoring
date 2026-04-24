@@ -24,6 +24,8 @@ from writer.storage import (
     load_publish_status,
     load_template,
     record_section_approval,
+    save_document_edit,
+    save_template,
 )
 
 logger = logging.getLogger(__name__)
@@ -401,7 +403,11 @@ class ApproveRequest(BaseModel):
     section_key: str
     module: str
     approver: str = Field(..., description="Email of approver; must differ from author.")
-    approval_reason: str = ""
+    approval_reason: str = Field(
+        ...,
+        min_length=3,
+        description="Required audit-trail reason for the approval.",
+    )
     run_id: str = ""
     bucket_name: str | None = None
 
@@ -435,6 +441,11 @@ def approve_section(req: ApproveRequest, http_request: Request) -> ApproveRespon
             status_code=422,
             detail="approver is required (body field or IAP header).",
         )
+    if not req.approval_reason.strip():
+        raise HTTPException(
+            status_code=422,
+            detail="approval_reason is required (audit trail).",
+        )
     program = ProgramInfo(
         therapeutic_area=req.therapeutic_area,
         disease_type=req.disease_type,
@@ -455,3 +466,150 @@ def approve_section(req: ApproveRequest, http_request: Request) -> ApproveRespon
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Approval failed: {exc}") from exc
     return ApproveResponse(approved=True, status=status)
+
+
+# ── Manual edits: generated content + templates ──────────────────────────────
+
+class EditDocumentRequest(BaseModel):
+    therapeutic_area: str
+    disease_type:     str
+    drug_name:        str
+    module:           str
+    section_key:      str
+    content:          str = Field(..., description="Full replacement markdown.")
+    author:           str = ""
+    edit_reason:      str = Field(
+        ...,
+        min_length=3,
+        description="Required audit-trail reason for the edit (min 3 chars).",
+    )
+    run_id:           str = ""
+    bucket_name:      str | None = None
+
+
+class EditResponse(BaseModel):
+    gcs_path:    str
+    version:     int | None = None
+    author:      str
+    timestamp:   str
+    edit_reason: str = ""
+
+
+@router.put("/documents/content", response_model=EditResponse)
+def edit_document_content(
+    req: EditDocumentRequest,
+    http_request: Request,
+) -> EditResponse:
+    """Save a user-edited CTD section.
+
+    The previous ``document.md`` is snapshotted into ``versions/v{N}.md`` and
+    the edit is attributed to the IAP-authenticated user (falling back to
+    ``req.author`` when running outside Cloud Run).
+    """
+    bucket = req.bucket_name or settings.gcs_bucket_name
+    if not bucket:
+        raise HTTPException(status_code=422, detail="bucket_name is required.")
+    author = resolve_author(req.author, http_request.headers)
+    if not author:
+        raise HTTPException(
+            status_code=422,
+            detail="author is required (body field or IAP header).",
+        )
+    if not req.edit_reason.strip():
+        raise HTTPException(
+            status_code=422,
+            detail="edit_reason is required (audit trail).",
+        )
+    program = ProgramInfo(
+        therapeutic_area=req.therapeutic_area,
+        disease_type=req.disease_type,
+        drug_name=req.drug_name,
+    )
+    try:
+        result = save_document_edit(
+            bucket_name=bucket,
+            program=program,
+            module_key=req.module,
+            section_key=req.section_key,
+            content=req.content,
+            author=author,
+            edit_reason=req.edit_reason,
+            run_id=req.run_id,
+        )
+    except Exception as exc:
+        logger.error("Document edit failed: %s", exc)
+        raise HTTPException(status_code=500, detail=f"Edit failed: {exc}") from exc
+    return EditResponse(**result)
+
+
+class TemplateReadResponse(BaseModel):
+    gcs_path: str
+    content:  str
+
+
+@router.get("/templates/read", response_model=TemplateReadResponse)
+def read_template(
+    therapeutic_area: str = Query(...),
+    disease_type:     str = Query(...),
+    drug_name:        str = Query(...),
+    module:           str = Query(...),
+    section_key:      str = Query(...),
+    bucket_name:      str = Query(default=None),
+) -> TemplateReadResponse:
+    """Return the current source of a program's section template."""
+    bucket = bucket_name or settings.gcs_bucket_name
+    if not bucket:
+        raise HTTPException(status_code=422, detail="bucket_name is required.")
+    from writer.gcs_client import program_prefix
+    program = ProgramInfo(
+        therapeutic_area=therapeutic_area,
+        disease_type=disease_type,
+        drug_name=drug_name,
+    )
+    gcs_path = f"{program_prefix(program)}/templates/{module}/{section_key}.md"
+    try:
+        content = load_template(bucket, gcs_path)
+    except Exception as exc:
+        raise HTTPException(status_code=404, detail=f"Template not found: {gcs_path}") from exc
+    return TemplateReadResponse(gcs_path=gcs_path, content=content)
+
+
+@router.put("/templates/content", response_model=EditResponse)
+def edit_template_content(
+    req: EditDocumentRequest,
+    http_request: Request,
+) -> EditResponse:
+    """Save an edited template and snapshot the previous revision."""
+    bucket = req.bucket_name or settings.gcs_bucket_name
+    if not bucket:
+        raise HTTPException(status_code=422, detail="bucket_name is required.")
+    author = resolve_author(req.author, http_request.headers)
+    if not author:
+        raise HTTPException(
+            status_code=422,
+            detail="author is required (body field or IAP header).",
+        )
+    if not req.edit_reason.strip():
+        raise HTTPException(
+            status_code=422,
+            detail="edit_reason is required (audit trail).",
+        )
+    program = ProgramInfo(
+        therapeutic_area=req.therapeutic_area,
+        disease_type=req.disease_type,
+        drug_name=req.drug_name,
+    )
+    try:
+        result = save_template(
+            bucket_name=bucket,
+            program=program,
+            module_key=req.module,
+            section_key=req.section_key,
+            content=req.content,
+            author=author,
+            edit_reason=req.edit_reason,
+        )
+    except Exception as exc:
+        logger.error("Template edit failed: %s", exc)
+        raise HTTPException(status_code=500, detail=f"Template edit failed: {exc}") from exc
+    return EditResponse(**result)

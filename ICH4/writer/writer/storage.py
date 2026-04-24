@@ -479,3 +479,115 @@ def record_section_approval(
         module_key, section_key, approver, status.get("author", "system"),
     )
     return status
+
+
+# ── Template editing ──────────────────────────────────────────────────────────
+
+def _template_path(prefix: str, module_key: str, section_key: str) -> str:
+    return f"{prefix}/templates/{module_key}/{section_key}.md"
+
+
+def _template_versions_prefix(prefix: str, module_key: str, section_key: str) -> str:
+    return f"{prefix}/templates/{module_key}/versions/{section_key}"
+
+
+def save_template(
+    bucket_name: str,
+    program: ProgramInfo,
+    module_key: str,
+    section_key: str,
+    content: str,
+    author: str,
+    edit_reason: str = "",
+) -> dict:
+    """Save an edited template with per-template version history.
+
+    Before overwriting, the current template (if any) is snapshotted to
+    ``templates/{module}/versions/{section}/v{N}.md`` and recorded in a
+    sibling ``manifest.json``. The new content is then written to the
+    canonical ``templates/{module}/{section}.md`` path.
+    """
+    prefix   = program_prefix(program)
+    gcs_path = _template_path(prefix, module_key, section_key)
+    vprefix  = _template_versions_prefix(prefix, module_key, section_key)
+    bkt      = gcs().bucket(bucket_name)
+    now_iso  = datetime.now(timezone.utc).isoformat()
+    version  = 1
+
+    current_blob = bkt.blob(gcs_path)
+    try:
+        if current_blob.exists():
+            manifest = _load_version_manifest(bkt, vprefix)
+            version = len(manifest) + 1
+            versioned_path = f"{vprefix}/v{version}.md"
+            bkt.copy_blob(current_blob, bkt, versioned_path)
+            manifest.append({
+                "version":     version,
+                "timestamp":   now_iso,
+                "author":      author or "system",
+                "edit_reason": edit_reason,
+                "gcs_path":    versioned_path,
+            })
+            _save_version_manifest(bkt, vprefix, manifest)
+            logger.info(
+                "[storage] Template snapshotted v%d → gs://%s/%s (author=%s)",
+                version, bucket_name, versioned_path, author or "system",
+            )
+    except Exception as exc:
+        logger.warning("[storage] Template versioning failed (non-fatal): %s", exc)
+
+    bkt.blob(gcs_path).upload_from_string(
+        content,
+        content_type="text/markdown; charset=utf-8",
+    )
+    logger.info(
+        "[storage] Template saved to gs://%s/%s by %s",
+        bucket_name, gcs_path, author or "system",
+    )
+    return {
+        "gcs_path":    gcs_path,
+        "version":     version,
+        "author":      author or "system",
+        "timestamp":   now_iso,
+        "edit_reason": edit_reason,
+    }
+
+
+def save_document_edit(
+    bucket_name: str,
+    program: ProgramInfo,
+    module_key: str,
+    section_key: str,
+    content: str,
+    author: str,
+    edit_reason: str = "",
+    run_id: str = "",
+) -> dict:
+    """Save a user-edited CTD section via the existing versioning pipeline.
+
+    Wraps :func:`save_document` so manual edits are snapshotted into
+    ``versions/v{N}.md`` exactly like regenerations. ``module_label`` is
+    derived from ``module_key`` (e.g. ``module2`` → ``Module 2``).
+    """
+    module_label = module_key.replace("module", "Module ").strip()
+    section_label = section_key.replace("_", " ").title()
+    doc = SectionDocument(
+        module_key=module_key,
+        module_label=module_label,
+        section_key=section_key,
+        section_label=section_label,
+        content=content,
+    )
+    gcs_path = save_document(
+        bucket_name=bucket_name,
+        program=program,
+        doc=doc,
+        run_id=run_id or f"edit-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}",
+        author=author or "system",
+    )
+    return {
+        "gcs_path":    gcs_path,
+        "author":      author or "system",
+        "timestamp":   datetime.now(timezone.utc).isoformat(),
+        "edit_reason": edit_reason,
+    }
