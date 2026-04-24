@@ -45,13 +45,15 @@ steps:
       - "-c"
       - "gcloud auth configure-docker $_REGION-docker.pkg.dev --quiet"
 
-  # 3. Build worker image
+  # 3. Build worker image (repo-root context so COPY system/bq_audit.py works)
   - name: "gcr.io/cloud-builders/docker"
     args:
       - build
       - -t
       - "$_REGION-docker.pkg.dev/$_PROJECT_ID/$_AR_REPO/$_WORKER_NAME:$_TAG"
-      - ICH4/content_worker
+      - -f
+      - ICH4/content_worker/Dockerfile
+      - .
 
   # 4. Push image
   - name: "gcr.io/cloud-builders/docker"
