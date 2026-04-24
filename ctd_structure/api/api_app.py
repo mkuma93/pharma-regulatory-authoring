@@ -825,6 +825,27 @@ def status(session_id: str, bucket: str = _DEFAULT_BUCKET,
     return StatusResponse(extraction=extraction, content=content)
 
 
+@app.get("/validation-report")
+def validation_report(
+    therapeutic_area: str,
+    disease_type: str,
+    drug_name: str,
+    bucket: str = _DEFAULT_BUCKET,
+):
+    """Return the latest consistency validation report for a drug program.
+
+    Reads `content_status/validation_report.json` that the content_worker saves
+    after every successful generation run.  Returns {} when no report exists yet.
+    """
+    prefix = _program_prefix(therapeutic_area, disease_type, drug_name)
+    blob_path = f"{prefix}/content_status/validation_report.json"
+    try:
+        raw = _gcs_client.bucket(bucket).blob(blob_path).download_as_text()
+        return json.loads(raw)
+    except Exception:
+        return {}
+
+
 @app.get("/session")
 def get_session(session_id: str, bucket: str = _DEFAULT_BUCKET):
     """Return session state + cached folder paths (used by Gradio on page load)."""

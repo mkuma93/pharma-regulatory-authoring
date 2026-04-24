@@ -620,6 +620,96 @@ def _load_version_choices(selection: str, ta: str, dis: str, drug: str, state: d
     return choices
 
 
+# ── Validation report helpers ──────────────────────────────────────────────────
+def _fetch_validation_report(ta: str, dis: str, drug: str, state: dict) -> dict:
+    """Fetch the latest validation_report.json for a program via CTD API."""
+    bkt = state.get("bucket", _DEFAULT_BUCKET)
+    return _ctd_get("/validation-report", {
+        "therapeutic_area": ta,
+        "disease_type":     dis,
+        "drug_name":        drug,
+        "bucket":           bkt,
+    })
+
+
+def _render_validation_report_html(report: dict) -> str:
+    """Render the validation report dict as a colour-coded HTML panel."""
+    if not report:
+        return (
+            '<div style="padding:16px;border-radius:8px;background:#f8fafc;'
+            'border:1px solid #e2e8f0;color:#64748b;font-style:italic;">'
+            'No validation report found. Run content generation first.'
+            '</div>'
+        )
+
+    passed  = report.get("passed", False)
+    summary = report.get("summary", "")
+    issues  = report.get("issues", [])
+    run_id  = report.get("run_id", "")
+    author  = report.get("author", "system")
+    ts      = (report.get("generated_at") or "")[:16].replace("T", " ")
+
+    badge_color = "#d1fae5" if passed else "#fee2e2"
+    badge_text_color = "#065f46" if passed else "#991b1b"
+    badge_label = "✅  PASSED" if passed else "❌  FAILED"
+
+    errors   = [i for i in issues if i.get("severity") == "error"]
+    warnings = [i for i in issues if i.get("severity") == "warning"]
+    infos    = [i for i in issues if i.get("severity") == "info"]
+
+    def _issue_rows(items: list[dict], icon: str, bg: str, border: str) -> str:
+        if not items:
+            return ""
+        rows = "".join(
+            f'<tr>'
+            f'<td style="padding:6px 10px;font-size:0.82em;color:#475569;'
+            f'border-bottom:1px solid {border};white-space:nowrap;">'
+            f'{i.get("section_key","—")}</td>'
+            f'<td style="padding:6px 10px;font-size:0.82em;color:#1e293b;'
+            f'border-bottom:1px solid {border};">{i.get("message","")}</td>'
+            f'</tr>'
+            for i in items
+        )
+        return (
+            f'<div style="margin-top:12px;">'
+            f'<div style="font-weight:600;font-size:0.85em;padding:6px 10px;'
+            f'background:{bg};border-radius:6px 6px 0 0;color:{border.replace("f","3").replace("b","0") if "f" in border else "#1e293b"};">'
+            f'{icon} {len(items)} issue{"s" if len(items) != 1 else ""}</div>'
+            f'<table style="width:100%;border-collapse:collapse;background:#fff;'
+            f'border-radius:0 0 6px 6px;overflow:hidden;">'
+            f'<thead><tr>'
+            f'<th style="text-align:left;padding:5px 10px;font-size:0.78em;'
+            f'color:#64748b;background:{bg};width:140px;">Section</th>'
+            f'<th style="text-align:left;padding:5px 10px;font-size:0.78em;'
+            f'color:#64748b;background:{bg};">Message</th>'
+            f'</tr></thead><tbody>{rows}</tbody></table></div>'
+        )
+
+    errors_html   = _issue_rows(errors,   "🔴  Errors",   "#fee2e2", "#fca5a5")
+    warnings_html = _issue_rows(warnings, "🟡  Warnings", "#fef9c3", "#fde68a")
+    infos_html    = _issue_rows(infos,    "🔵  Info",     "#eff6ff", "#bfdbfe")
+
+    total = len(issues)
+    meta = (
+        f'<div style="font-size:0.78em;color:#64748b;margin-top:4px;">'
+        f'Run: <code>{run_id[:8] if run_id else "—"}</code>&nbsp;·&nbsp;'
+        f'Author: {author}&nbsp;·&nbsp;{ts} UTC&nbsp;·&nbsp;{total} issue{"s" if total != 1 else ""} total'
+        f'</div>'
+    )
+
+    return (
+        f'<div style="padding:16px;border-radius:8px;background:#f8fafc;border:1px solid #e2e8f0;">'
+        f'<div style="display:flex;align-items:center;gap:12px;margin-bottom:8px;">'
+        f'<span style="padding:4px 12px;border-radius:20px;font-weight:700;font-size:0.9em;'
+        f'background:{badge_color};color:{badge_text_color};">{badge_label}</span>'
+        f'<span style="font-size:0.88em;color:#334155;">{summary}</span>'
+        f'</div>'
+        f'{meta}'
+        f'{errors_html}{warnings_html}{infos_html}'
+        f'</div>'
+    )
+
+
 # ── Auto-poll ──────────────────────────────────────────────────────────────────
 def _poll(state: dict, log: str, gen_msg: str):
     """Poll extraction + generation status every 20 s."""
@@ -943,6 +1033,15 @@ with gr.Blocks(title="Regulatory Authoring Platform") as demo:
                 )
                 _s5_ver_content = gr.Markdown(value="", label="", elem_classes=["section-viewer"])
             _s5_evidence = gr.HTML(value="")
+            with gr.Accordion("🔍  Consistency Validation Report", open=False):
+                gr.HTML(_info_box(
+                    "Cross-module validation checks: drug name consistency, demographic "
+                    "and safety alignment across sections, unfilled placeholders, ICH M4 "
+                    "mandatory element coverage, and LLM deep-check for benefit-risk "
+                    "coherence. Click <strong>Load Report</strong> to fetch the latest run."
+                ))
+                _s5_val_btn    = gr.Button("📋  Load Validation Report", variant="secondary")
+                _s5_val_report = gr.HTML(value="")
 
     # ── Activity Log (always visible at bottom) ────────────────────────────────
     with gr.Accordion("📋  Activity Log", open=False):
@@ -1155,6 +1254,23 @@ with gr.Blocks(title="Regulatory Authoring Platform") as demo:
         fn=_read_version_action,
         inputs=[_s5_ver_dropdown, _s5_dropdown, _s5_ta_disp, _s5_dis_disp, _s5_drug_disp, _state],
         outputs=[_s5_ver_content],
+    )
+
+    # Step 5 — Load validation report
+    def _load_val_report_action(ta_field, dis_field, drug_field, state):
+        prog = state.get("content_program") or {}
+        ta   = (ta_field   or prog.get("therapeutic_area", "")).strip()
+        dis  = (dis_field  or prog.get("disease_type",     "")).strip()
+        drug = (drug_field or prog.get("drug_name",        "")).strip()
+        if not ta or not dis or not drug:
+            return _render_validation_report_html({})
+        report = _fetch_validation_report(ta, dis, drug, state)
+        return _render_validation_report_html(report)
+
+    _s5_val_btn.click(
+        fn=_load_val_report_action,
+        inputs=[_s5_ta_disp, _s5_dis_disp, _s5_drug_disp, _state],
+        outputs=[_s5_val_report],
     )
 
     # ── Auto-poll every 20 s ───────────────────────────────────────────────────

@@ -561,6 +561,31 @@ async def generate(request: Request):
             return {"status": "failed", "reason": str(exc)}
         raise
 
+    # ── Save full validation report to GCS (non-fatal) ───────────────────────
+    prefix = _program_prefix(ta, dis, drug)
+    validation_report_path = f"{prefix}/content_status/{session_id}_validation.json"
+    validation_latest_path = f"{prefix}/content_status/validation_report.json"
+    try:
+        report_payload = json.dumps({
+            "run_id":          run_id,
+            "author":          author or "system",
+            "generated_at":    datetime.now(timezone.utc).isoformat(),
+            "passed":          final_validation.get("passed", False),
+            "summary":         final_validation.get("summary", ""),
+            "sections_written": all_sections_written,
+            "sections_failed": all_sections_failed,
+            "issues":          final_validation.get("issues", []),
+        }, indent=2)
+        _gcs_client.bucket(bucket).blob(validation_report_path).upload_from_string(
+            report_payload, content_type="application/json"
+        )
+        _gcs_client.bucket(bucket).blob(validation_latest_path).upload_from_string(
+            report_payload, content_type="application/json"
+        )
+        logger.info("[worker] Saved validation report to gs://%s/%s", bucket, validation_latest_path)
+    except Exception as exc:
+        logger.warning("[worker] Validation report save failed (non-fatal): %s", exc)
+
     # ── Write final done status ───────────────────────────────────────────────
     _write_status(bucket, status_path, {
         "status":             "done",
@@ -569,6 +594,7 @@ async def generate(request: Request):
         "sections_failed":    all_sections_failed,
         "validation_passed":  final_validation.get("passed", False),
         "validation_summary": final_validation.get("summary", ""),
+        "validation_report_path": f"gs://{bucket}/{validation_latest_path}",
     })
     logger.info(
         "[worker] Generation complete  written=%d  validation_passed=%s",
