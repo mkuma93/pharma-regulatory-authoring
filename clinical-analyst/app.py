@@ -1237,8 +1237,7 @@ def trigger(req: TriggerRequest) -> ActionResponse:
     if not ctd_blobs:
         return ActionResponse(
             reply=(
-                f"⚠️ **Program folder not scaffolded** for **{ta} / {dis} / {drug}**.
-\n"
+                f"⚠️ **Program folder not scaffolded** for **{ta} / {dis} / {drug}**.\n"
                 "Content generation requires the CTD folder structure to be set up first.\n\n"
                 "**Steps to fix:**\n"
                 "1. Make sure the default ICH CTD structure has been **built and approved**\n"
