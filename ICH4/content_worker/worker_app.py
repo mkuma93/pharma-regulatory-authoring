@@ -257,6 +257,8 @@ async def schema_patch(request: SchemaPatchRequest):
                         "drug_name":        drug,
                     },
                     "bucket_name":     bucket,
+                    "run_id":          run_id,
+                    "author":          author,
                     "sections":        affected_sections,
                     "changed_keys":    changed_keys,
                     "resolved_values": resolved_values,
@@ -426,6 +428,13 @@ async def generate(request: Request):
                         "status": "failed", "run_id": run_id, "error": detail,
                     })
                     if r.status_code < 500:
+                        emit_generation_run(
+                            run_id=run_id, author=author or "system",
+                            therapeutic_area=ta, disease_type=dis, drug_name=drug,
+                            sections_written=all_sections_written,
+                            sections_failed=all_sections_failed,
+                            validation_passed=False, validation_issue_count=0,
+                        )
                         return {"status": "failed", "reason": detail}
                     raise httpx.HTTPStatusError(detail, request=r.request, response=r)
 
@@ -450,6 +459,13 @@ async def generate(request: Request):
                     "run_id": run_id,
                     "error":  detail,
                 })
+                emit_generation_run(
+                    run_id=run_id, author=author or "system",
+                    therapeutic_area=ta, disease_type=dis, drug_name=drug,
+                    sections_written=all_sections_written,
+                    sections_failed=all_sections_failed,
+                    validation_passed=False, validation_issue_count=0,
+                )
                 return {"status": "failed", "reason": detail}
 
             # ── Step B: Save templates to GCS ────────────────────────────────
@@ -506,6 +522,13 @@ async def generate(request: Request):
                         "status": "failed", "run_id": run_id, "error": detail,
                     })
                     if r.status_code < 500:
+                        emit_generation_run(
+                            run_id=run_id, author=author or "system",
+                            therapeutic_area=ta, disease_type=dis, drug_name=drug,
+                            sections_written=all_sections_written,
+                            sections_failed=all_sections_failed,
+                            validation_passed=False, validation_issue_count=0,
+                        )
                         return {"status": "failed", "reason": detail}
                     raise httpx.HTTPStatusError(detail, request=r.request, response=r)
 
