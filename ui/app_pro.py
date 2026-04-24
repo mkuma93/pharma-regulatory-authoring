@@ -267,6 +267,11 @@ def _framework_status_html(state: dict) -> str:
     )
 
 
+def _display_label(s: str) -> str:
+    """Convert snake_case/lowercase to a readable label without apostrophe capitalisation bugs."""
+    return " ".join(w.capitalize() for w in s.replace("_", " ").lower().split())
+
+
 # ── Step 2: Program status HTML ────────────────────────────────────────────────
 def _program_status_html(state: dict) -> str:
     prog    = state.get("content_program") or {}
@@ -278,7 +283,7 @@ def _program_status_html(state: dict) -> str:
         note   = "The document framework must be published before creating a program folder."
     elif ready:
         ta, dis, drug = prog.get("therapeutic_area","?"), prog.get("disease_type","?"), prog.get("drug_name","?")
-        status = _badge(f"✅  Active: {ta.title()} / {dis.title()} / {drug.title()}", "green")
+        status = _badge(f"✅  Active: {_display_label(ta)} / {_display_label(dis)} / {_display_label(drug)}", "green")
         note   = "Program folder is set up in the document store."
     else:
         status = _badge("○  Not set up yet", "grey")
@@ -636,15 +641,33 @@ def _parse_section_key_module(selection: str) -> tuple[str, str]:
     return section_key, module
 
 
-def _parse_section_key_module(selection: str) -> tuple[str, str]:
-    """Parse 'module|section_key' selection string into (section_key, module)."""
-    if not selection:
-        return "", ""
-    parts = selection.split("|", 1)
-    if len(parts) != 2:
-        return "", ""
-    module, section_key = parts
-    return section_key, module
+def _load_version_choices(selection: str, ta: str, dis: str, drug: str, state: dict) -> list[str]:
+    """Return a list of version-label strings for the version history dropdown."""
+    section_key, module = _parse_section_key_module(selection)
+    if not section_key:
+        return []
+    bkt = state.get("bucket", _DEFAULT_BUCKET)
+    try:
+        data = _writer_get(
+            "/documents/versions",
+            {
+                "therapeutic_area": ta,
+                "disease_type":     dis,
+                "drug_name":        drug,
+                "section_key":      section_key,
+                "module":           module,
+                "bucket_name":      bkt,
+            },
+        )
+    except Exception:
+        return []
+    choices = []
+    for entry in data.get("versions", []):
+        v   = entry.get("version", "?")
+        ts  = entry.get("timestamp", "")[:16].replace("T", " ")  # "2026-04-24 12:00"
+        who = entry.get("author", "system")
+        choices.append(f"v{v} — {ts} UTC by {who}")
+    return choices
 
 
 def _export_section_docx(
@@ -1372,6 +1395,8 @@ with gr.Blocks(title="Regulatory Authoring Platform") as demo:
             gr.update(value=t), gr.update(value=d), gr.update(value=n),
             gr.update(value=t), gr.update(value=d), gr.update(value=n),
             gr.update(value=t), gr.update(value=d), gr.update(value=n),
+            _clinical_status_html("", new_state),
+            _generation_status_html(new_state, ""),
         )
 
     _s2_setup_btn.click(
@@ -1382,6 +1407,7 @@ with gr.Blocks(title="Regulatory Authoring Platform") as demo:
             _s3_ta_disp, _s3_dis_disp, _s3_drug_disp,
             _s4_ta_disp, _s4_dis_disp, _s4_drug_disp,
             _s5_ta_disp, _s5_dis_disp, _s5_drug_disp,
+            _s3_banner, _s4_banner,
         ],
     )
 
