@@ -1,7 +1,18 @@
-"""GCS helpers for loading templates and saving final documents."""
+"""GCS helpers for loading templates and saving final documents.
+
+Versioning layout per section:
+  .../ctd/{module_key}/{section_key}/
+    document.md          ← always the latest
+    versions/
+      v1.md              ← first-ever write
+      v2.md              ← second write, etc.
+      manifest.json      ← [{version, timestamp, run_id, author, gcs_path}, ...]
+"""
 from __future__ import annotations
 
+import json
 import logging
+from datetime import datetime, timezone
 
 from .gcs_client import gcs, program_prefix
 from .models import ProgramInfo, SectionDocument
@@ -52,14 +63,78 @@ def parse_section_meta_from_path(gcs_path: str) -> tuple[str, str, str]:
     return module_key, section_key, section_label
 
 
-def save_document(bucket_name: str, program: ProgramInfo, doc: SectionDocument) -> str:
-    """Write a completed document to:
-      therapeutic-area/{ta}/{dis}/{drug}/ctd/{module_key}/{section_key}/document.md
-    Returns the GCS path.
+# ── Version helpers ───────────────────────────────────────────────────────────
+
+def _versions_prefix(prefix: str, module_key: str, section_key: str) -> str:
+    return f"{prefix}/ctd/{module_key}/{section_key}/versions"
+
+
+def _load_version_manifest(bkt, vprefix: str) -> list[dict]:
+    """Return existing version manifest list, or [] if none exists."""
+    blob = bkt.blob(f"{vprefix}/manifest.json")
+    try:
+        if blob.exists():
+            return json.loads(blob.download_as_text())
+    except Exception as exc:
+        logger.warning("[storage] Could not load version manifest: %s", exc)
+    return []
+
+
+def _save_version_manifest(bkt, vprefix: str, manifest: list[dict]) -> None:
+    bkt.blob(f"{vprefix}/manifest.json").upload_from_string(
+        json.dumps(manifest, indent=2),
+        content_type="application/json",
+    )
+
+
+def save_document(
+    bucket_name: str,
+    program: ProgramInfo,
+    doc: SectionDocument,
+    run_id: str = "",
+    author: str = "",
+) -> str:
+    """Write a completed document to GCS with version history.
+
+    Before overwriting document.md the existing blob (if any) is copied to
+    versions/v{N}.md and recorded in versions/manifest.json.
+
+    Args:
+        run_id:  Content-generation run identifier (for traceability).
+        author:  User who triggered the write, extracted from IAP header.
+
+    Returns the GCS path of the new document.md.
     """
     prefix   = program_prefix(program)
     gcs_path = f"{prefix}/ctd/{doc.module_key}/{doc.section_key}/document.md"
+    vprefix  = _versions_prefix(prefix, doc.module_key, doc.section_key)
     bkt      = gcs().bucket(bucket_name)
+
+    # ── Snapshot current document into versions/ before overwriting ───────────
+    current_blob = bkt.blob(gcs_path)
+    try:
+        if current_blob.exists():
+            manifest = _load_version_manifest(bkt, vprefix)
+            next_version = len(manifest) + 1
+            versioned_path = f"{vprefix}/v{next_version}.md"
+            bkt.copy_blob(current_blob, bkt, versioned_path)
+            manifest.append({
+                "version":   next_version,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "run_id":    run_id,
+                "author":    author,
+                "gcs_path":  versioned_path,
+            })
+            _save_version_manifest(bkt, vprefix, manifest)
+            logger.info(
+                "[storage] Snapshotted v%d → gs://%s/%s (author=%s)",
+                next_version, bucket_name, versioned_path, author or "system",
+            )
+    except Exception as exc:
+        # Non-fatal — proceed with write even if versioning fails
+        logger.warning("[storage] Versioning failed (non-fatal): %s", exc)
+
+    # ── Write latest ──────────────────────────────────────────────────────────
     bkt.blob(gcs_path).upload_from_string(
         doc.content,
         content_type="text/markdown; charset=utf-8",

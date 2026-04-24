@@ -1120,6 +1120,10 @@ class TriggerRequest(BaseModel):
     therapeutic_area: str
     disease_type: str
     drug_name: str
+    author: str = Field(
+        default="",
+        description="IAP-authenticated user email — propagated to version manifest.",
+    )
     force_no_clinical: bool = Field(
         default=False,
         description="Proceed even when no clinical manifest is found.",
@@ -1134,7 +1138,7 @@ class ActionResponse(BaseModel):
 
 
 def _publish_content_generation(
-    bucket: str, ta: str, dis: str, drug: str, session_id: str
+    bucket: str, ta: str, dis: str, drug: str, session_id: str, author: str = ""
 ) -> str:
     run_id    = str(uuid.uuid4())
     publisher = pubsub_v1.PublisherClient()
@@ -1143,6 +1147,7 @@ def _publish_content_generation(
         "bucket":     bucket,
         "session_id": session_id,
         "run_id":     run_id,
+        "author":     author,
         "program": {
             "therapeutic_area": ta,
             "disease_type":     dis,
@@ -1270,7 +1275,7 @@ def trigger(req: TriggerRequest) -> ActionResponse:
         msg_prefix = "⚠️ Proceeding without clinical data — placeholders will appear as `[NOT FILLED]`.\n\n"
 
     try:
-        run_id = _publish_content_generation(bucket, ta, dis, drug, req.session_id)
+        run_id = _publish_content_generation(bucket, ta, dis, drug, req.session_id, req.author)
     except Exception as exc:
         logger.error("[trigger] Pub/Sub publish failed: %s", exc)
         raise HTTPException(status_code=500, detail=f"Failed to queue content job: {exc}") from exc

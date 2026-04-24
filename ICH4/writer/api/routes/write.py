@@ -80,7 +80,11 @@ def write(request: WriterRequest) -> WriterResponse:
                 llm=llm,
                 resolved_values=request.resolved_values or {},
             )
-            doc.gcs_path = save_document(bucket_name, request.program, doc)
+            doc.gcs_path = save_document(
+                bucket_name, request.program, doc,
+                run_id=request.run_id,
+                author=request.author,
+            )
             documents.append(doc)
         except Exception as exc:
             logger.error("[write] Failed section %s: %s", section_key, exc)

@@ -400,7 +400,7 @@ def _action_upload_csv(csv_file, ta: str, dis: str, drug: str, state: dict, log:
         return state, _log(log, msg), _clinical_status_html("", state), msg
 
 
-def _action_generate(ta: str, dis: str, drug: str, state: dict, log: str):
+def _action_generate(ta: str, dis: str, drug: str, state: dict, log: str, author: str = ""):
     ta   = (ta   or (state.get("content_program") or {}).get("therapeutic_area", "")).strip()
     dis  = (dis  or (state.get("content_program") or {}).get("disease_type",     "")).strip()
     drug = (drug or (state.get("content_program") or {}).get("drug_name",        "")).strip()
@@ -420,6 +420,7 @@ def _action_generate(ta: str, dis: str, drug: str, state: dict, log: str):
         "therapeutic_area": ta,
         "disease_type":     dis,
         "drug_name":        drug,
+        "author":           author,
         "state":            state,
     })
     new_state = {**state, **result.get("state_patch", {}), "generation_in_progress": True}
@@ -577,6 +578,46 @@ def _action_read_section(
     )
 
     return display_content, evidence, meta
+
+
+def _parse_section_key_module(selection: str) -> tuple[str, str]:
+    """Parse 'module|section_key' selection string into (section_key, module)."""
+    if not selection:
+        return "", ""
+    parts = selection.split("|", 1)
+    if len(parts) != 2:
+        return "", ""
+    module, section_key = parts
+    return section_key, module
+
+
+def _load_version_choices(selection: str, ta: str, dis: str, drug: str, state: dict) -> list[str]:
+    """Return a list of version-label strings for the version history dropdown."""
+    section_key, module = _parse_section_key_module(selection)
+    if not section_key:
+        return []
+    bkt = state.get("bucket", _DEFAULT_BUCKET)
+    try:
+        data = _writer_get(
+            "/documents/versions",
+            {
+                "therapeutic_area": ta,
+                "disease_type":     dis,
+                "drug_name":        drug,
+                "section_key":      section_key,
+                "module":           module,
+                "bucket_name":      bkt,
+            },
+        )
+    except Exception:
+        return []
+    choices = []
+    for entry in data.get("versions", []):
+        v   = entry.get("version", "?")
+        ts  = entry.get("timestamp", "")[:16].replace("T", " ")  # "2026-04-24 12:00"
+        who = entry.get("author", "system")
+        choices.append(f"v{v} — {ts} UTC by {who}")
+    return choices
 
 
 # ── Auto-poll ──────────────────────────────────────────────────────────────────
@@ -758,6 +799,7 @@ with gr.Blocks(title="Regulatory Authoring Platform") as demo:
     _browser_session = gr.BrowserState("")
     _gen_msg         = gr.State(value="")      # last generation status text
     _upload_msg      = gr.State(value="")      # last upload status text
+    _iap_user        = gr.State(value="")      # IAP-authenticated user email
 
     # ── Header ─────────────────────────────────────────────────────────────────
     gr.HTML("""
@@ -895,6 +937,11 @@ with gr.Blocks(title="Regulatory Authoring Platform") as demo:
             )
             _s5_meta    = gr.HTML(value="")
             _s5_content = gr.Markdown(value="", label="", elem_classes=["section-viewer"])
+            with gr.Accordion("🕓  Version History", open=False):
+                _s5_ver_dropdown = gr.Dropdown(
+                    choices=[], label="Prior versions (newest first)", interactive=True,
+                )
+                _s5_ver_content = gr.Markdown(value="", label="", elem_classes=["section-viewer"])
             _s5_evidence = gr.HTML(value="")
 
     # ── Activity Log (always visible at bottom) ────────────────────────────────
@@ -912,7 +959,7 @@ with gr.Blocks(title="Regulatory Authoring Platform") as demo:
     # ══════════════════════════════════════════════════════════════════════════
     # Page load
     # ══════════════════════════════════════════════════════════════════════════
-    def _on_load(bucket: str, browser_session: str):
+    def _on_load(bucket: str, browser_session: str, request: gr.Request = None):
         import json as _json
         state, sid = _init_session(bucket or _DEFAULT_BUCKET, browser_session)
         prog = state.get("content_program") or {}
@@ -922,6 +969,13 @@ with gr.Blocks(title="Regulatory Authoring Platform") as demo:
         log  = f"[{_ts()}]  Session loaded — ID: {sid[:8]}…"
         s1b  = _framework_status_html(state)
         s2b  = _program_status_html(state)
+        # Extract IAP-authenticated user email from request headers.
+        # Cloud Run injects X-Goog-Authenticated-User-Email in format
+        # "accounts.google.com:user@example.com" — strip the prefix.
+        iap_user = ""
+        if request:
+            raw = request.headers.get("x-goog-authenticated-user-email", "")
+            iap_user = raw.split(":", 1)[-1] if ":" in raw else raw
         # Preserve the full JSON browser session (session_id + content_program).
         # Writing just `sid` here would clobber the stored content_program on reload.
         new_browser_session = _json.dumps({"session_id": sid, "content_program": prog}) if prog else sid
@@ -932,6 +986,7 @@ with gr.Blocks(title="Regulatory Authoring Platform") as demo:
             gr.update(value=ta), gr.update(value=dis), gr.update(value=drug),  # step 3
             gr.update(value=ta), gr.update(value=dis), gr.update(value=drug),  # step 4
             gr.update(value=ta), gr.update(value=dis), gr.update(value=drug),  # step 5
+            iap_user,
         )
 
     demo.load(
@@ -944,6 +999,7 @@ with gr.Blocks(title="Regulatory Authoring Platform") as demo:
             _s3_ta_disp, _s3_dis_disp, _s3_drug_disp,
             _s4_ta_disp, _s4_dis_disp, _s4_drug_disp,
             _s5_ta_disp, _s5_dis_disp, _s5_drug_disp,
+            _iap_user,
         ],
     )
 
@@ -1006,17 +1062,17 @@ with gr.Blocks(title="Regulatory Authoring Platform") as demo:
     )
 
     # Step 4 — Generate
-    def _generate_action(state, log, gen_msg):
+    def _generate_action(state, log, gen_msg, iap_user):
         prog = state.get("content_program") or {}
         ta   = prog.get("therapeutic_area", "")
         dis  = prog.get("disease_type",     "")
         drug = prog.get("drug_name",        "")
-        new_state, new_log, banner, msg = _action_generate(ta, dis, drug, state, log)
+        new_state, new_log, banner, msg = _action_generate(ta, dis, drug, state, log, author=iap_user)
         return new_state, new_log, banner, msg, msg
 
     _s4_gen_btn.click(
         fn=_generate_action,
-        inputs=[_state, _log_box, _gen_msg],
+        inputs=[_state, _log_box, _gen_msg, _iap_user],
         outputs=[_state, _log_box, _s4_banner, _s4_msg, _gen_msg],
     )
 
@@ -1042,12 +1098,63 @@ with gr.Blocks(title="Regulatory Authoring Platform") as demo:
         ta   = (ta_field   or prog.get("therapeutic_area", "")).strip()
         dis  = (dis_field  or prog.get("disease_type",     "")).strip()
         drug = (drug_field or prog.get("drug_name",        "")).strip()
-        return _action_read_section(selection, ta, dis, drug, state)
+        content, evidence, meta = _action_read_section(selection, ta, dis, drug, state)
+        # Also load version list when a section is selected
+        ver_choices = _load_version_choices(selection, ta, dis, drug, state)
+        return content, evidence, meta, gr.update(choices=ver_choices, value=None), ""
 
     _s5_dropdown.change(
         fn=_read_section_action,
         inputs=[_s5_dropdown, _s5_ta_disp, _s5_dis_disp, _s5_drug_disp, _state],
-        outputs=[_s5_content, _s5_evidence, _s5_meta],
+        outputs=[_s5_content, _s5_evidence, _s5_meta, _s5_ver_dropdown, _s5_ver_content],
+    )
+
+    # Step 5 — Read prior version
+    def _read_version_action(ver_label, section, ta_field, dis_field, drug_field, state):
+        """Load content for a selected prior version."""
+        if not ver_label or not section:
+            return ""
+        prog = state.get("content_program") or {}
+        ta   = (ta_field   or prog.get("therapeutic_area", "")).strip()
+        dis  = (dis_field  or prog.get("disease_type",     "")).strip()
+        drug = (drug_field or prog.get("drug_name",        "")).strip()
+        # ver_label format: "v3 — 2026-04-24 12:00 UTC by user@example.com"
+        try:
+            version_num = int(ver_label.split("v", 1)[1].split(" ", 1)[0])
+        except (IndexError, ValueError):
+            return "⚠️ Could not parse version number from selection."
+
+        section_key, module = _parse_section_key_module(section)
+        bkt = state.get("bucket", _DEFAULT_BUCKET)
+        try:
+            r = httpx.get(
+                f"{_WRITER_URL}/documents/version",
+                params={
+                    "therapeutic_area": ta,
+                    "disease_type":     dis,
+                    "drug_name":        drug,
+                    "section_key":      section_key,
+                    "module":           module,
+                    "version":          version_num,
+                    "bucket_name":      bkt,
+                },
+                headers=_oidc_headers(_WRITER_URL),
+                timeout=15,
+            )
+            r.raise_for_status()
+            data = r.json()
+            badge = (
+                f"**Version {data['version']}** · {data['timestamp']} · "
+                f"authored by `{data.get('author', 'system')}`"
+            )
+            return f"{badge}\n\n---\n\n{data['content']}"
+        except Exception as exc:
+            return f"⚠️ Could not load version: {exc}"
+
+    _s5_ver_dropdown.change(
+        fn=_read_version_action,
+        inputs=[_s5_ver_dropdown, _s5_dropdown, _s5_ta_disp, _s5_dis_disp, _s5_drug_disp, _state],
+        outputs=[_s5_ver_content],
     )
 
     # ── Auto-poll every 20 s ───────────────────────────────────────────────────

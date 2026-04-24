@@ -110,6 +110,131 @@ def read_document(
     return DocumentReadResponse(gcs_path=gcs_path, content=content)
 
 
+# ── Version history ───────────────────────────────────────────────────────────
+
+class VersionEntry(BaseModel):
+    version: int
+    timestamp: str
+    run_id: str
+    author: str
+    gcs_path: str
+
+
+class VersionListResponse(BaseModel):
+    section_key: str
+    versions: list[VersionEntry]
+
+
+class VersionReadResponse(BaseModel):
+    section_key: str
+    version: int
+    author: str
+    timestamp: str
+    content: str
+
+
+@router.get("/documents/versions", response_model=VersionListResponse)
+def list_versions(
+    therapeutic_area: str = Query(...),
+    disease_type: str = Query(...),
+    drug_name: str = Query(...),
+    section_key: str = Query(...),
+    module: str = Query(...),
+    bucket_name: str = Query(default=None),
+) -> VersionListResponse:
+    """List all prior versions of a CTD section, newest first."""
+    bucket = bucket_name or settings.gcs_bucket_name
+    if not bucket:
+        raise HTTPException(status_code=422, detail="bucket_name is required.")
+
+    from writer.gcs_client import program_prefix
+    program = ProgramInfo(
+        therapeutic_area=therapeutic_area,
+        disease_type=disease_type,
+        drug_name=drug_name,
+    )
+    vprefix = (
+        f"{program_prefix(program)}/ctd/{module}/{section_key}/versions"
+    )
+    manifest_blob = gcs().bucket(bucket).blob(f"{vprefix}/manifest.json")
+    try:
+        if not manifest_blob.exists():
+            return VersionListResponse(section_key=section_key, versions=[])
+        entries: list[dict] = json.loads(manifest_blob.download_as_text())
+    except Exception as exc:
+        logger.warning("Could not load version manifest for %s: %s", section_key, exc)
+        return VersionListResponse(section_key=section_key, versions=[])
+
+    versions = [
+        VersionEntry(
+            version=e.get("version", 0),
+            timestamp=e.get("timestamp", ""),
+            run_id=e.get("run_id", ""),
+            author=e.get("author", "system"),
+            gcs_path=e.get("gcs_path", ""),
+        )
+        for e in entries
+    ]
+    versions.sort(key=lambda v: v.version, reverse=True)
+    return VersionListResponse(section_key=section_key, versions=versions)
+
+
+@router.get("/documents/version", response_model=VersionReadResponse)
+def read_version(
+    therapeutic_area: str = Query(...),
+    disease_type: str = Query(...),
+    drug_name: str = Query(...),
+    section_key: str = Query(...),
+    module: str = Query(...),
+    version: int = Query(...),
+    bucket_name: str = Query(default=None),
+) -> VersionReadResponse:
+    """Read the content of a specific prior version of a CTD section."""
+    bucket = bucket_name or settings.gcs_bucket_name
+    if not bucket:
+        raise HTTPException(status_code=422, detail="bucket_name is required.")
+
+    from writer.gcs_client import program_prefix
+    program = ProgramInfo(
+        therapeutic_area=therapeutic_area,
+        disease_type=disease_type,
+        drug_name=drug_name,
+    )
+    vprefix      = f"{program_prefix(program)}/ctd/{module}/{section_key}/versions"
+    version_path = f"{vprefix}/v{version}.md"
+
+    try:
+        content = load_template(bucket, version_path)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Version {version} of {section_key} not found",
+        ) from exc
+
+    # Read author/timestamp from manifest
+    author = "system"
+    timestamp = ""
+    try:
+        manifest_blob = gcs().bucket(bucket).blob(f"{vprefix}/manifest.json")
+        if manifest_blob.exists():
+            entries: list[dict] = json.loads(manifest_blob.download_as_text())
+            for e in entries:
+                if e.get("version") == version:
+                    author    = e.get("author", "system")
+                    timestamp = e.get("timestamp", "")
+                    break
+    except Exception:
+        pass
+
+    return VersionReadResponse(
+        section_key=section_key,
+        version=version,
+        author=author,
+        timestamp=timestamp,
+        content=content,
+    )
+
+
 # ── Clinical data manifest ────────────────────────────────────────────────────
 
 class ManifestColumn(BaseModel):

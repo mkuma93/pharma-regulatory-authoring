@@ -52,6 +52,14 @@ class WriterRequest(BaseModel):
             "Keys present here will not be re-dispatched to the hybrid analyst."
         ),
     )
+    run_id: str = Field(
+        default="",
+        description="Content-generation run identifier — stored in version manifest.",
+    )
+    author: str = Field(
+        default="",
+        description="User who triggered the write, extracted from IAP header.",
+    )
 
 
 class WriterResponse(BaseModel):

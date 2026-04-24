@@ -291,6 +291,7 @@ async def generate(request: Request):
     bucket     = msg.get("bucket", "")
     session_id = msg.get("session_id", "default")
     run_id     = msg.get("run_id", "")
+    author     = msg.get("author", "")   # IAP user email, set by UI on trigger
     program    = msg.get("program", {})
 
     ta   = program.get("therapeutic_area", "")
@@ -470,6 +471,8 @@ async def generate(request: Request):
                         "sections":        section_keys,
                         "run_validator":   pass_idx == total_passes - 1,
                         "resolved_values": resolved_values,
+                        "run_id":          run_id,
+                        "author":          author,
                     },
                     headers=_oidc_headers(writer_aud),
                 )
