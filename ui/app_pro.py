@@ -126,6 +126,21 @@ def _writer_put(path: str, payload: dict, iap_user: str = "", timeout: int = 60)
         return {"error": str(exc)}
 
 
+def _writer_post(path: str, payload: dict, iap_user: str = "", timeout: int = 60) -> dict:
+    """POST to the writer service, forwarding the IAP reviewer identity."""
+    url     = f"{_ICH4_WRITER_URL.rstrip('/')}{path}"
+    headers = _oidc_headers(_ICH4_WRITER_URL)
+    if iap_user:
+        headers["X-Goog-Authenticated-User-Email"] = iap_user
+    try:
+        r = requests.post(url, json=payload, headers=headers, timeout=timeout)
+        if r.status_code >= 400:
+            return {"error": f"HTTP {r.status_code}", "detail": r.text[:500]}
+        return r.json()
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
 def _analyst_post(path: str, payload: dict, timeout: int = 120) -> dict:
     url = f"{_CLINICAL_ANALYST_URL.rstrip('/')}{path}"
     try:
@@ -931,6 +946,31 @@ with gr.Blocks(title="Regulatory Authoring Platform") as demo:
     </div>
     """)
 
+    # ── Reviewer persona (demo-only; in prod the IAP header supplies identity) ─
+    with gr.Accordion("👤  Reviewer Identity (demo persona)", open=False):
+        gr.HTML(_info_box(
+            "In production, the reviewer identity is supplied by Google IAP and cannot "
+            "be changed here. For demo purposes, pick a persona below to act as the "
+            "author, statistician, medical writer, or QA/compliance officer. "
+            "Every save, edit, and approval is attributed to this identity in the audit trail."
+        ))
+        with gr.Row():
+            _persona_dropdown = gr.Dropdown(
+                label="Demo persona",
+                choices=[
+                    "author@demo.com",
+                    "statistician@demo.com",
+                    "medical.writer@demo.com",
+                    "qa.compliance@demo.com",
+                    "regulatory.lead@demo.com",
+                ],
+                value="author@demo.com",
+                allow_custom_value=True,
+                interactive=True,
+                scale=2,
+            )
+            _persona_status = gr.Markdown(value="", elem_classes=[])
+
     # ── Main tabs ──────────────────────────────────────────────────────────────
     with gr.Tabs(elem_classes=["tab-nav"]):
 
@@ -1095,7 +1135,56 @@ with gr.Blocks(title="Regulatory Authoring Platform") as demo:
                 _s5_tpl_save_btn = gr.Button(
                     "💾  Save Template", variant="primary",
                 )
-            with gr.Accordion("🔍  Consistency Validation Report", open=False):
+            with gr.Accordion("�  Multi-Reviewer Validation Package", open=True):
+                gr.HTML(_info_box(
+                    "A released section needs three independent approvals: "
+                    "<strong>Clinical Statistician</strong> (verifies demographics, "
+                    "endpoints, CIs), <strong>Medical Writer</strong> (verifies "
+                    "narrative & ICH M4 structure), and <strong>QA/Compliance "
+                    "Officer</strong> (final release gate). Each reviewer must be "
+                    "a different person from the author and from each other — "
+                    "segregation of duties is enforced server-side."
+                ))
+                _s5_gate_banner = gr.HTML(value="")
+                _s5_gate_cards  = gr.HTML(value="")
+                with gr.Row():
+                    _s5_gate_role = gr.Dropdown(
+                        label="I am reviewing as…",
+                        choices=[
+                            ("Clinical Statistician",     "statistician"),
+                            ("Medical Writer",            "medical_writer"),
+                            ("QA / Compliance Officer",   "qa_compliance"),
+                            ("Clinical Lead (optional)",  "clinical_lead"),
+                            ("Regulatory Affairs (opt.)", "regulatory"),
+                            ("Pharmacovigilance (opt.)",  "pharmacovigilance"),
+                        ],
+                        value="statistician",
+                        interactive=True, scale=1,
+                    )
+                    _s5_gate_reason = gr.Textbox(
+                        label="Approval reason (required; min 3 chars)",
+                        placeholder="e.g. Demographics match SAP v2.1; CI widths within protocol",
+                        interactive=True, scale=2,
+                    )
+                with gr.Row():
+                    _s5_gate_approve_btn = gr.Button(
+                        "✅  Sign as selected reviewer", variant="primary", scale=1,
+                    )
+                    _s5_gate_refresh_btn = gr.Button(
+                        "🔄  Refresh gate status", variant="secondary", scale=1,
+                    )
+                _s5_gate_msg = gr.Markdown(value="")
+            with gr.Accordion("🔍  Regulator View (audit rehearsal)", open=False):
+                gr.HTML(_info_box(
+                    "One-click view showing exactly what a regulator would request "
+                    "during an inspection: current document version, author, all "
+                    "reviewer signatures with reasons, validator report path, "
+                    "source-data provenance, and links to the immutable prior-version "
+                    "history. Nothing here is editable."
+                ))
+                _s5_regview_btn = gr.Button("🗂  Generate Audit Bundle", variant="secondary")
+                _s5_regview_html = gr.HTML(value="")
+            with gr.Accordion("�🔍  Consistency Validation Report", open=False):
                 gr.HTML(_info_box(
                     "Cross-module validation checks: drug name consistency, demographic "
                     "and safety alignment across sections, unfilled placeholders, ICH M4 "
@@ -1499,6 +1588,294 @@ with gr.Blocks(title="Regulatory Authoring Platform") as demo:
             _s5_ta_disp, _s5_dis_disp, _s5_drug_disp, _state, _iap_user,
         ],
         outputs=[_s5_tpl_msg],
+    )
+
+    # ── Multi-Reviewer Validation Package (persona-driven approval chain) ────
+    _ROLE_LABEL_MAP = {
+        "statistician":      "Clinical Statistician",
+        "medical_writer":    "Medical Writer",
+        "qa_compliance":     "QA / Compliance Officer",
+        "clinical_lead":     "Clinical Lead",
+        "regulatory":        "Regulatory Affairs",
+        "pharmacovigilance": "Pharmacovigilance",
+    }
+    _REQUIRED_GATE_ROLES = ("statistician", "medical_writer", "qa_compliance")
+
+    def _esc(s: str) -> str:
+        import html as _h
+        return _h.escape(str(s or ""), quote=True)
+
+    def _render_gate_cards(gate: dict) -> tuple[str, str]:
+        """Return (banner_html, cards_html) for the current gate state."""
+        if not gate or not gate.get("gcs_path"):
+            banner = (
+                "<div style='padding:10px 14px;border-left:4px solid #94a3b8;"
+                "background:#f1f5f9;color:#334155;border-radius:4px;'>"
+                "ℹ️ No section selected — pick one from the dropdown above to see its review status."
+                "</div>"
+            )
+            return banner, ""
+        gates = gate.get("gates") or {}
+        author = _esc(gate.get("author", ""))
+        ver    = gate.get("current_version")
+        ver_str = f"v{ver}" if ver is not None else "v?"
+        release_ready = bool(gate.get("release_ready"))
+        publish_blocked = not gate.get("publish_approved", False)
+        if publish_blocked:
+            banner = (
+                f"<div style='padding:12px 16px;border-left:6px solid #dc2626;"
+                f"background:#fef2f2;color:#7f1d1d;border-radius:6px;font-weight:600;'>"
+                f"🛑 VALIDATOR-BLOCKED {ver_str} · "
+                f"reason: {_esc(gate.get('publish_blocked_reason', 'unknown'))}"
+                f"</div>"
+            )
+        elif release_ready:
+            banner = (
+                f"<div style='padding:12px 16px;border-left:6px solid #16a34a;"
+                f"background:#f0fdf4;color:#14532d;border-radius:6px;font-weight:600;'>"
+                f"✅ RELEASED {ver_str} · 3 signatures on file · authored by {author}"
+                f"</div>"
+            )
+        else:
+            pending = [r for r in _REQUIRED_GATE_ROLES if r not in gates]
+            pending_labels = ", ".join(_ROLE_LABEL_MAP[r] for r in pending)
+            banner = (
+                f"<div style='padding:12px 16px;border-left:6px solid #f59e0b;"
+                f"background:#fffbeb;color:#78350f;border-radius:6px;font-weight:600;'>"
+                f"⏳ NOT RELEASED {ver_str} · awaiting: {_esc(pending_labels)} · author: {author}"
+                f"</div>"
+            )
+        cards = []
+        for role in _REQUIRED_GATE_ROLES:
+            label = _ROLE_LABEL_MAP[role]
+            sig = gates.get(role)
+            if sig:
+                card = (
+                    f"<div style='flex:1;min-width:200px;padding:12px;"
+                    f"border:1px solid #86efac;background:#f0fdf4;border-radius:6px;'>"
+                    f"<div style='font-weight:600;color:#14532d;margin-bottom:4px;'>"
+                    f"✅ {_esc(label)}</div>"
+                    f"<div style='font-size:0.85em;color:#334155;'>"
+                    f"by <code>{_esc(sig.get('approver',''))}</code><br>"
+                    f"<span style='color:#64748b;'>{_esc(sig.get('approved_at','')[:19])}</span><br>"
+                    f"<em>“{_esc(sig.get('approval_reason',''))}”</em>"
+                    f"</div></div>"
+                )
+            else:
+                card = (
+                    f"<div style='flex:1;min-width:200px;padding:12px;"
+                    f"border:1px dashed #cbd5e1;background:#f8fafc;border-radius:6px;'>"
+                    f"<div style='font-weight:600;color:#475569;margin-bottom:4px;'>"
+                    f"⏳ {_esc(label)}</div>"
+                    f"<div style='font-size:0.85em;color:#64748b;'>Pending</div>"
+                    f"</div>"
+                )
+            cards.append(card)
+        cards_html = (
+            f"<div style='display:flex;gap:10px;flex-wrap:wrap;margin-top:10px;'>"
+            + "".join(cards) + "</div>"
+        )
+        return banner, cards_html
+
+    def _load_gate_state(selection, ta, dis, drug, state):
+        if not selection:
+            b, c = _render_gate_cards({})
+            return b, c
+        prog = state.get("content_program") or {}
+        ta   = (ta   or prog.get("therapeutic_area", "")).strip()
+        dis  = (dis  or prog.get("disease_type",     "")).strip()
+        drug = (drug or prog.get("drug_name",        "")).strip()
+        section_key, module = _parse_section_key_module(selection)
+        if not all([ta, dis, drug, section_key, module]):
+            b, c = _render_gate_cards({})
+            return b, c
+        bucket = state.get("bucket", _DEFAULT_BUCKET)
+        data = _writer_get("/documents/gate-status", {
+            "therapeutic_area": ta, "disease_type": dis, "drug_name": drug,
+            "module": module, "section_key": section_key, "bucket_name": bucket,
+        })
+        return _render_gate_cards(data or {})
+
+    def _approve_gate_action(selection, role, reason, ta, dis, drug, state, iap_user):
+        if not selection:
+            b, c = _render_gate_cards({})
+            return b, c, "⚠️ Select a section first."
+        if not (iap_user or "").strip():
+            b, c = _load_gate_state(selection, ta, dis, drug, state)
+            return b, c, "⚠️ Set a reviewer persona at the top of the page first."
+        if not (reason or "").strip() or len(reason.strip()) < 3:
+            b, c = _load_gate_state(selection, ta, dis, drug, state)
+            return b, c, "⚠️ Approval reason is required (min 3 chars)."
+        prog = state.get("content_program") or {}
+        ta   = (ta   or prog.get("therapeutic_area", "")).strip()
+        dis  = (dis  or prog.get("disease_type",     "")).strip()
+        drug = (drug or prog.get("drug_name",        "")).strip()
+        section_key, module = _parse_section_key_module(selection)
+        bucket = state.get("bucket", _DEFAULT_BUCKET)
+        result = _writer_post(
+            "/documents/approve",
+            {
+                "therapeutic_area": ta, "disease_type": dis, "drug_name": drug,
+                "module": module, "section_key": section_key,
+                "approver": iap_user, "approval_reason": reason.strip(),
+                "role": role, "bucket_name": bucket,
+            },
+            iap_user=iap_user,
+        )
+        b, c = _load_gate_state(selection, ta, dis, drug, state)
+        if "error" in result:
+            return b, c, f"❌ Approval rejected: {_esc(result.get('detail') or result['error'])}"
+        status = (result or {}).get("status", {})
+        if status.get("release_ready"):
+            msg = (
+                f"🎉 Section is now **RELEASED** — all three required signatures on file."
+            )
+        else:
+            gates = status.get("gates") or {}
+            remaining = [
+                _ROLE_LABEL_MAP[r] for r in _REQUIRED_GATE_ROLES if r not in gates
+            ]
+            msg = (
+                f"✅ Signed as **{_ROLE_LABEL_MAP.get(role, role)}** "
+                f"(`{_esc(iap_user)}`). Still awaiting: {', '.join(remaining)}."
+            )
+        return b, c, msg
+
+    _s5_gate_refresh_btn.click(
+        fn=_load_gate_state,
+        inputs=[_s5_dropdown, _s5_ta_disp, _s5_dis_disp, _s5_drug_disp, _state],
+        outputs=[_s5_gate_banner, _s5_gate_cards],
+    )
+
+    _s5_gate_approve_btn.click(
+        fn=_approve_gate_action,
+        inputs=[
+            _s5_dropdown, _s5_gate_role, _s5_gate_reason,
+            _s5_ta_disp, _s5_dis_disp, _s5_drug_disp, _state, _iap_user,
+        ],
+        outputs=[_s5_gate_banner, _s5_gate_cards, _s5_gate_msg],
+    )
+
+    # Refresh gates automatically whenever the selected section changes.
+    _s5_dropdown.change(
+        fn=_load_gate_state,
+        inputs=[_s5_dropdown, _s5_ta_disp, _s5_dis_disp, _s5_drug_disp, _state],
+        outputs=[_s5_gate_banner, _s5_gate_cards],
+    )
+
+    # ── Regulator View — audit rehearsal bundle ──────────────────────────────
+    def _regulator_view_action(selection, ta, dis, drug, state):
+        if not selection:
+            return "<div style='color:#b91c1c;'>Select a section first.</div>"
+        prog = state.get("content_program") or {}
+        ta   = (ta   or prog.get("therapeutic_area", "")).strip()
+        dis  = (dis  or prog.get("disease_type",     "")).strip()
+        drug = (drug or prog.get("drug_name",        "")).strip()
+        section_key, module = _parse_section_key_module(selection)
+        bucket = state.get("bucket", _DEFAULT_BUCKET)
+        params = {
+            "therapeutic_area": ta, "disease_type": dis, "drug_name": drug,
+            "module": module, "section_key": section_key, "bucket_name": bucket,
+        }
+        gate = _writer_get("/documents/gate-status", params) or {}
+        doc  = _writer_get("/documents/read",
+                           {"therapeutic_area": ta, "disease_type": dis,
+                            "drug_name": drug, "module": module,
+                            "section_key": section_key, "bucket_name": bucket}) or {}
+        gates = gate.get("gates") or {}
+
+        sig_rows = []
+        for role in _REQUIRED_GATE_ROLES + ("clinical_lead", "regulatory", "pharmacovigilance"):
+            sig = gates.get(role)
+            if not sig:
+                continue
+            sig_rows.append(
+                f"<tr><td style='padding:4px 8px;'><strong>{_esc(_ROLE_LABEL_MAP[role])}</strong></td>"
+                f"<td style='padding:4px 8px;'><code>{_esc(sig.get('approver',''))}</code></td>"
+                f"<td style='padding:4px 8px;color:#64748b;'>{_esc(sig.get('approved_at',''))}</td>"
+                f"<td style='padding:4px 8px;'><em>{_esc(sig.get('approval_reason',''))}</em></td></tr>"
+            )
+        if not sig_rows:
+            sig_rows.append(
+                "<tr><td colspan='4' style='padding:8px;color:#b91c1c;'>"
+                "No signatures on file yet.</td></tr>"
+            )
+        sigs_html = (
+            "<table style='width:100%;border-collapse:collapse;font-size:0.9em;'>"
+            "<thead><tr style='background:#f1f5f9;'>"
+            "<th style='padding:6px 8px;text-align:left;'>Reviewer Role</th>"
+            "<th style='padding:6px 8px;text-align:left;'>Email (IAP)</th>"
+            "<th style='padding:6px 8px;text-align:left;'>Signed At</th>"
+            "<th style='padding:6px 8px;text-align:left;'>Reason</th>"
+            "</tr></thead><tbody>" + "".join(sig_rows) + "</tbody></table>"
+        )
+
+        release_badge = (
+            "<span style='background:#16a34a;color:white;padding:3px 10px;"
+            "border-radius:10px;font-weight:600;'>RELEASED</span>"
+            if gate.get("release_ready") else
+            "<span style='background:#f59e0b;color:white;padding:3px 10px;"
+            "border-radius:10px;font-weight:600;'>NOT RELEASED</span>"
+        )
+
+        header = (
+            f"<div style='padding:12px;background:#0f172a;color:#f1f5f9;"
+            f"border-radius:6px;margin-bottom:12px;'>"
+            f"<div style='font-size:0.8em;letter-spacing:1px;color:#94a3b8;'>"
+            f"AUDIT REHEARSAL — what an inspector would ask for</div>"
+            f"<h3 style='margin:4px 0;'>{_esc(module)} / {_esc(section_key)} &middot; "
+            f"v{gate.get('current_version', '?')} &middot; {release_badge}</h3>"
+            f"<div style='font-size:0.85em;'>Program: "
+            f"<code>{_esc(ta)}/{_esc(dis)}/{_esc(drug)}</code> &middot; "
+            f"Authored by <code>{_esc(gate.get('author', ''))}</code></div>"
+            f"</div>"
+        )
+
+        provenance = (
+            f"<div style='margin-top:14px;padding:10px;background:#f8fafc;"
+            f"border:1px solid #e2e8f0;border-radius:6px;font-size:0.85em;'>"
+            f"<strong>Provenance</strong><br>"
+            f"Document: <code>{_esc(gate.get('gcs_path', ''))}</code><br>"
+            f"Validator report: <code>{_esc(gate.get('validation_gcs_path', ''))}</code><br>"
+            f"Validator outcome: "
+            f"{'✅ publish-approved' if gate.get('publish_approved') else '🛑 blocked — ' + _esc(gate.get('publish_blocked_reason', ''))}"
+            f"</div>"
+        )
+
+        content_html = (
+            f"<details style='margin-top:14px;'>"
+            f"<summary style='cursor:pointer;font-weight:600;'>📄 Current document content (v{gate.get('current_version', '?')})</summary>"
+            f"<pre style='padding:10px;background:#f8fafc;border:1px solid #e2e8f0;"
+            f"border-radius:6px;max-height:400px;overflow:auto;font-size:0.8em;white-space:pre-wrap;'>"
+            f"{_esc((doc.get('content') or '')[:8000])}"
+            f"{'…(truncated)' if len(doc.get('content') or '') > 8000 else ''}"
+            f"</pre></details>"
+        )
+
+        return (
+            header
+            + "<h4 style='margin-top:14px;'>Reviewer Signatures</h4>"
+            + sigs_html
+            + provenance
+            + content_html
+        )
+
+    _s5_regview_btn.click(
+        fn=_regulator_view_action,
+        inputs=[_s5_dropdown, _s5_ta_disp, _s5_dis_disp, _s5_drug_disp, _state],
+        outputs=[_s5_regview_html],
+    )
+
+    # ── Persona dropdown drives the IAP identity in demo mode ─────────────────
+    def _set_persona(persona):
+        if not persona:
+            return "", "⚠️ No persona selected."
+        return persona, f"✅ Acting as `{persona}`. All saves & approvals will be attributed to this identity."
+
+    _persona_dropdown.change(
+        fn=_set_persona,
+        inputs=[_persona_dropdown],
+        outputs=[_iap_user, _persona_status],
     )
 
     # ── Auto-poll every 20 s ───────────────────────────────────────────────────

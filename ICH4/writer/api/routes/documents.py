@@ -20,7 +20,11 @@ from config.settings import settings
 from writer.gcs_client import gcs
 from writer.models import ProgramInfo
 from writer.storage import (
+    GATE_ROLES_ALL,
+    GATE_ROLES_REQUIRED,
+    ROLE_LABELS,
     list_generated_paths,
+    load_gate_status,
     load_publish_status,
     load_template,
     record_section_approval,
@@ -408,6 +412,13 @@ class ApproveRequest(BaseModel):
         min_length=3,
         description="Required audit-trail reason for the approval.",
     )
+    role: str = Field(
+        default="qa_compliance",
+        description=(
+            "Reviewer role — one of: statistician, medical_writer, qa_compliance, "
+            "clinical_lead, regulatory, pharmacovigilance."
+        ),
+    )
     run_id: str = ""
     bucket_name: str | None = None
 
@@ -446,6 +457,11 @@ def approve_section(req: ApproveRequest, http_request: Request) -> ApproveRespon
             status_code=422,
             detail="approval_reason is required (audit trail).",
         )
+    if req.role not in GATE_ROLES_ALL:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown role '{req.role}'. Allowed: {', '.join(GATE_ROLES_ALL)}.",
+        )
     program = ProgramInfo(
         therapeutic_area=req.therapeutic_area,
         disease_type=req.disease_type,
@@ -460,12 +476,53 @@ def approve_section(req: ApproveRequest, http_request: Request) -> ApproveRespon
             approver=req.approver,
             approval_reason=req.approval_reason,
             run_id=req.run_id,
+            role=req.role,
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Approval failed: {exc}") from exc
     return ApproveResponse(approved=True, status=status)
+
+
+class GateStatusResponse(BaseModel):
+    module_key:       str
+    section_key:      str
+    gcs_path:         str
+    current_version:  int | None = None
+    author:           str = ""
+    publish_approved: bool = False
+    publish_blocked_reason: str = ""
+    required_roles:   list[str]
+    role_labels:      dict[str, str]
+    gates:            dict[str, dict]
+    release_ready:    bool
+    validation_gcs_path: str = ""
+
+
+@router.get("/documents/gate-status", response_model=GateStatusResponse)
+def get_gate_status(
+    therapeutic_area: str = Query(...),
+    disease_type:     str = Query(...),
+    drug_name:        str = Query(...),
+    module:           str = Query(...),
+    section_key:      str = Query(...),
+    bucket_name:      str = Query(default=None),
+) -> GateStatusResponse:
+    """Rollup of the multi-reviewer validation-package gates for one section."""
+    bucket = bucket_name or settings.gcs_bucket_name
+    if not bucket:
+        raise HTTPException(status_code=422, detail="bucket_name is required.")
+    program = ProgramInfo(
+        therapeutic_area=therapeutic_area,
+        disease_type=disease_type,
+        drug_name=drug_name,
+    )
+    try:
+        data = load_gate_status(bucket, program, module, section_key)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return GateStatusResponse(**data)
 
 
 # ── Manual edits: generated content + templates ──────────────────────────────

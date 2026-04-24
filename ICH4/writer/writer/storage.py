@@ -390,6 +390,23 @@ def load_publish_status(
         return None
 
 
+# ── Multi-reviewer validation package (demo "compliance officer / statistician / QA") ─
+# Required gates — all three must approve before a section is release-ready.
+GATE_ROLES_REQUIRED: tuple[str, ...] = ("statistician", "medical_writer", "qa_compliance")
+# Full set of roles accepted by the API (the extras are optional approvals).
+GATE_ROLES_ALL: tuple[str, ...] = GATE_ROLES_REQUIRED + (
+    "clinical_lead", "regulatory", "pharmacovigilance",
+)
+ROLE_LABELS: dict[str, str] = {
+    "statistician":      "Clinical Statistician",
+    "medical_writer":    "Medical Writer",
+    "qa_compliance":     "QA / Compliance Officer",
+    "clinical_lead":     "Clinical Lead",
+    "regulatory":        "Regulatory Affairs",
+    "pharmacovigilance": "Pharmacovigilance",
+}
+
+
 def record_section_approval(
     bucket_name: str,
     program: ProgramInfo,
@@ -398,17 +415,31 @@ def record_section_approval(
     approver: str,
     approval_reason: str,
     run_id: str,
+    role: str = "qa_compliance",
 ) -> dict:
-    """Human approval (A6) — flips ``human_approved=True`` on publish_status.
+    """Role-scoped human approval — one step of the validation-package chain.
 
-    Enforces segregation of duties: approver must differ from ``author``
-    of the latest publish_status.  Also writes an immutable audit record
-    to ``approvals/{timestamp}_{section_key}_{approver}.json``.
+    Writes the approval into ``publish_status.gates[role]`` and, once every
+    required role has signed, flips ``human_approved=True`` + ``release_ready=True``.
 
-    Raises ``ValueError`` on self-approval or when no publish_status exists.
+    Enforces:
+      * publish_status.json exists (validator has run)
+      * publish not validator-blocked
+      * ``approver`` != document author (segregation of duties, case-insensitive)
+      * same approver cannot sign two different gates on the same section
+        (no one-person rubber-stamp)
+      * each role can only be signed once
+
+    Also writes an immutable witness record to
+    ``approvals/{section_key}/{role}__{timestamp}__{approver}.json``.
     """
     prefix = program_prefix(program)
     bkt    = gcs().bucket(bucket_name)
+
+    if role not in GATE_ROLES_ALL:
+        raise ValueError(
+            f"Unknown role '{role}'. Allowed: {', '.join(GATE_ROLES_ALL)}."
+        )
 
     status = load_publish_status(bucket_name, program, module_key, section_key)
     if status is None:
@@ -418,9 +449,10 @@ def record_section_approval(
         )
 
     author = (status.get("author") or "").strip().lower()
-    if not approver or not approver.strip():
+    approver_norm = (approver or "").strip().lower()
+    if not approver_norm:
         raise ValueError("approver email is required.")
-    if approver.strip().lower() == author:
+    if approver_norm == author:
         raise ValueError(
             f"Self-approval blocked: approver '{approver}' is the same as author."
         )
@@ -431,33 +463,63 @@ def record_section_approval(
             "Re-run /write to fix errors before approving."
         )
 
+    gates = dict(status.get("gates") or {})
+    if role in gates:
+        existing = gates[role].get("approver", "?")
+        raise ValueError(
+            f"Gate '{role}' already signed by {existing}. Each role signs once."
+        )
+    # No single person may sign two gates — multi-reviewer integrity.
+    for prior_role, prior in gates.items():
+        if (prior.get("approver") or "").strip().lower() == approver_norm:
+            raise ValueError(
+                f"Approver '{approver}' already signed gate '{prior_role}'. "
+                "Each gate needs a different reviewer."
+            )
+
     now_iso = datetime.now(timezone.utc).isoformat()
-    status["human_approved"]  = True
-    status["approver"]        = approver
-    status["approved_at"]     = now_iso
+    gates[role] = {
+        "approver":        approver,
+        "approved_at":     now_iso,
+        "approval_reason": approval_reason,
+        "run_id":          run_id or status.get("run_id", ""),
+    }
+
+    release_ready = all(r in gates for r in GATE_ROLES_REQUIRED)
+    status["gates"]          = gates
+    status["release_ready"]  = release_ready
+    status["required_roles"] = list(GATE_ROLES_REQUIRED)
+    # Backward-compat surface — the last approval populates the legacy fields.
+    status["human_approved"] = release_ready
+    status["approver"]       = approver
+    status["approved_at"]    = now_iso
     status["approval_reason"] = approval_reason
 
-    # Overwrite sidecar
     bkt.blob(_publish_status_path(prefix, module_key, section_key)).upload_from_string(
         json.dumps(status, indent=2),
         content_type="application/json",
     )
 
-    # Immutable witnessed approval record
+    # Per-role immutable witness record
+    approver_safe = approver.replace("@", "_at_").replace("/", "_")
+    ts_safe       = now_iso.replace(":", "-")
     approval_blob_name = (
-        f"{prefix}/approvals/{now_iso.replace(':', '-')}_{section_key}_{approver.replace('@', '_at_')}.json"
+        f"{prefix}/approvals/{section_key}/{role}__{ts_safe}__{approver_safe}.json"
     )
     bkt.blob(approval_blob_name).upload_from_string(
         json.dumps({
             "run_id":          run_id or status.get("run_id", ""),
             "author":          status.get("author", ""),
             "approver":        approver,
+            "role":            role,
+            "role_label":      ROLE_LABELS.get(role, role),
             "approved_at":     now_iso,
             "module_key":      module_key,
             "section_key":     section_key,
             "gcs_path":        status.get("gcs_path", ""),
             "approval_reason": approval_reason,
             "validation_gcs_path": status.get("validation_gcs_path", ""),
+            "release_ready":   release_ready,
         }, indent=2),
         content_type="application/json",
     )
@@ -472,13 +534,39 @@ def record_section_approval(
         module_key=module_key,
         section_key=section_key,
         gcs_path=status.get("gcs_path", ""),
-        approval_reason=approval_reason,
+        approval_reason=f"[{role}] {approval_reason}",
     )
     logger.info(
-        "[storage] Section approved %s/%s by %s (author=%s)",
-        module_key, section_key, approver, status.get("author", "system"),
+        "[storage] Gate '%s' signed %s/%s by %s (release_ready=%s, author=%s)",
+        role, module_key, section_key, approver, release_ready,
+        status.get("author", "system"),
     )
     return status
+
+
+def load_gate_status(
+    bucket_name: str,
+    program: ProgramInfo,
+    module_key: str,
+    section_key: str,
+) -> dict:
+    """Rollup view of the validation-package gates for one section."""
+    status = load_publish_status(bucket_name, program, module_key, section_key) or {}
+    gates  = dict(status.get("gates") or {})
+    return {
+        "module_key":         module_key,
+        "section_key":        section_key,
+        "gcs_path":           status.get("gcs_path", ""),
+        "current_version":    status.get("version"),
+        "author":             status.get("author", ""),
+        "publish_approved":   bool(status.get("publish_approved", False)),
+        "publish_blocked_reason": status.get("publish_blocked_reason", ""),
+        "required_roles":     list(GATE_ROLES_REQUIRED),
+        "role_labels":        {r: ROLE_LABELS[r] for r in GATE_ROLES_ALL},
+        "gates":              gates,
+        "release_ready":      bool(status.get("release_ready", False)),
+        "validation_gcs_path": status.get("validation_gcs_path", ""),
+    }
 
 
 # ── Template editing ──────────────────────────────────────────────────────────
