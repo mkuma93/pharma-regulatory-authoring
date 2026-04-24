@@ -30,6 +30,9 @@ import sys
 import uuid
 from datetime import datetime
 
+import io
+import tempfile
+
 import gradio as gr
 import requests
 
@@ -633,7 +636,81 @@ def _parse_section_key_module(selection: str) -> tuple[str, str]:
     return section_key, module
 
 
-def _load_version_choices(selection: str, ta: str, dis: str, drug: str, state: dict) -> list[str]:
+def _parse_section_key_module(selection: str) -> tuple[str, str]:
+    """Parse 'module|section_key' selection string into (section_key, module)."""
+    if not selection:
+        return "", ""
+    parts = selection.split("|", 1)
+    if len(parts) != 2:
+        return "", ""
+    module, section_key = parts
+    return section_key, module
+
+
+def _export_section_docx(
+    selection: str, content: str
+) -> tuple[str | None, str]:
+    """Convert the current section markdown to a .docx file.
+
+    Returns (file_path_or_None, status_message).
+    """
+    if not content or not content.strip():
+        return None, "⚠️ Load a section first before exporting."
+    try:
+        from docx import Document as _DocxDocument
+        from docx.shared import Pt, RGBColor
+        import re as _re
+    except ImportError:
+        return None, "⚠️ python-docx is not installed. Add it to requirements.txt and redeploy."
+
+    section_key, module = _parse_section_key_module(selection or "")
+    filename = f"{section_key or 'section'}.docx"
+
+    doc = _DocxDocument()
+    # Narrow margins for regulatory look
+    for section in doc.sections:
+        section.top_margin    = Pt(72)
+        section.bottom_margin = Pt(72)
+        section.left_margin   = Pt(90)
+        section.right_margin  = Pt(90)
+
+    for line in content.splitlines():
+        line = line.rstrip()
+        if line.startswith("# "):
+            p = doc.add_heading(line[2:], level=1)
+            p.runs[0].font.color.rgb = RGBColor(0x1A, 0x4F, 0x8A)
+        elif line.startswith("## "):
+            p = doc.add_heading(line[3:], level=2)
+            p.runs[0].font.color.rgb = RGBColor(0x1A, 0x4F, 0x8A)
+        elif line.startswith("### "):
+            doc.add_heading(line[4:], level=3)
+        elif line.startswith("---"):
+            doc.add_paragraph("─" * 60)
+        elif line == "":
+            doc.add_paragraph("")
+        else:
+            # Handle inline bold/italic — strip markers for now, add runs
+            p = doc.add_paragraph()
+            # Split on **bold** markers
+            parts = _re.split(r"(\*\*[^*]+\*\*|\*[^*]+\*)", line)
+            for part in parts:
+                if part.startswith("**") and part.endswith("**"):
+                    run = p.add_run(part[2:-2])
+                    run.bold = True
+                elif part.startswith("*") and part.endswith("*"):
+                    run = p.add_run(part[1:-1])
+                    run.italic = True
+                else:
+                    p.add_run(part)
+            p.style.font.size = Pt(11)
+
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".docx", prefix=f"{section_key or 'section'}_")
+    doc.save(tmp.name)
+    tmp.close()
+    return tmp.name, f"✅ Ready: {filename}"
+
+
+
     """Return a list of version-label strings for the version history dropdown."""
     section_key, module = _parse_section_key_module(selection)
     if not section_key:
@@ -1094,6 +1171,10 @@ with gr.Blocks(title="Regulatory Authoring Platform") as demo:
             )
             _s5_meta    = gr.HTML(value="")
             _s5_content = gr.Markdown(value="", label="", elem_classes=["section-viewer"])
+            with gr.Row():
+                _s5_export_docx_btn = gr.Button("📥  Export as Word (.docx)", variant="secondary", scale=1)
+            _s5_export_msg  = gr.Markdown(value="")
+            _s5_export_file = gr.File(label="Download", visible=False, interactive=False)
             with gr.Accordion("🕓  Version History", open=False):
                 _s5_ver_dropdown = gr.Dropdown(
                     choices=[], label="Prior versions (newest first)", interactive=True,
@@ -1258,6 +1339,7 @@ with gr.Blocks(title="Regulatory Authoring Platform") as demo:
             _s5_ta_disp, _s5_dis_disp, _s5_drug_disp,
             _iap_user,
         ],
+        show_progress="hidden",
     )
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -1395,7 +1477,20 @@ with gr.Blocks(title="Regulatory Authoring Platform") as demo:
         ],
     )
 
-    # Step 5 — Read prior version
+    # Step 5 — Export section as Word document
+    def _do_export_docx(selection, content):
+        path, msg = _export_section_docx(selection, content)
+        if path:
+            return gr.update(value=path, visible=True), msg
+        return gr.update(visible=False), msg
+
+    _s5_export_docx_btn.click(
+        fn=_do_export_docx,
+        inputs=[_s5_dropdown, _s5_content],
+        outputs=[_s5_export_file, _s5_export_msg],
+    )
+
+
     def _read_version_action(*args):
         """Load content for a selected prior version.
 
