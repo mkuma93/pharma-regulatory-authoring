@@ -139,6 +139,27 @@ def emit_document_version(
     })
 
 
+def emit_generation_start(
+    *,
+    run_id: str,
+    author: str,
+    therapeutic_area: str,
+    disease_type: str,
+    drug_name: str,
+    session_id: str,
+) -> None:
+    """Emit when a content-generation run is first accepted by the worker."""
+    emit_audit_event({
+        "event_type":       "generation_start",
+        "run_id":           run_id,
+        "author":           author or "system",
+        "therapeutic_area": therapeutic_area,
+        "disease_type":     disease_type,
+        "drug_name":        drug_name,
+        "section_key":      session_id,   # reuse section_key column to carry session_id
+    })
+
+
 def emit_generation_run(
     *,
     run_id: str,

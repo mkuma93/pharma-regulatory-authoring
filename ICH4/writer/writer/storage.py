@@ -117,8 +117,10 @@ def save_document(
 
     # ── Snapshot current document into versions/ before overwriting ───────────
     current_blob = bkt.blob(gcs_path)
+    _first_write = True
     try:
         if current_blob.exists():
+            _first_write = False
             manifest = _load_version_manifest(bkt, vprefix)
             next_version = len(manifest) + 1
             versioned_path = f"{vprefix}/v{next_version}.md"
@@ -173,4 +175,19 @@ def save_document(
         content_type="text/markdown; charset=utf-8",
     )
     logger.info("[storage] Saved document to gs://%s/%s", bucket_name, gcs_path)
+
+    # Emit version=1 audit event for brand-new documents (no prior blob existed)
+    if _first_write:
+        emit_document_version(
+            run_id=run_id,
+            author=author or "system",
+            therapeutic_area=program.therapeutic_area,
+            disease_type=program.disease_type,
+            drug_name=program.drug_name,
+            module_key=doc.module_key,
+            section_key=doc.section_key,
+            version=1,
+            gcs_path=gcs_path,
+        )
+
     return gcs_path

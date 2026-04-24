@@ -41,9 +41,10 @@ from google.cloud import storage
 from pydantic import BaseModel
 
 try:
-    from bq_audit import emit_generation_run, emit_validation_issue  # noqa: F401
+    from bq_audit import emit_generation_run, emit_generation_start, emit_validation_issue  # noqa: F401
 except ImportError:
     def emit_generation_run(**_): pass    # noqa: E704
+    def emit_generation_start(**_): pass  # noqa: E704
     def emit_validation_issue(**_): pass  # noqa: E704
 
 logger = logging.getLogger(__name__)
@@ -330,6 +331,14 @@ async def generate(request: Request):
     _write_status(bucket, status_path, {
         "status": "running", "run_id": run_id, "step": "starting",
     })
+    emit_generation_start(
+        run_id=run_id,
+        author=author or "system",
+        therapeutic_area=ta,
+        disease_type=dis,
+        drug_name=drug,
+        session_id=session_id,
+    )
     logger.info("[worker] Content generation started  %s/%s/%s  session=%s", ta, dis, drug, session_id)
 
     # ── ICH M4E(R2) evidence-ordered generation ───────────────────────────────
