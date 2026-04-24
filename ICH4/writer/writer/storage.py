@@ -445,7 +445,7 @@ def record_section_approval(
     if status is None:
         raise ValueError(
             f"No publish_status for {module_key}/{section_key} — "
-            "must run /write with a validator before approval."
+            "an admin must call /documents/admin/seed-publish-status first."
         )
 
     author = (status.get("author") or "").strip().lower()
@@ -540,6 +540,78 @@ def record_section_approval(
         "[storage] Gate '%s' signed %s/%s by %s (release_ready=%s, author=%s)",
         role, module_key, section_key, approver, release_ready,
         status.get("author", "system"),
+    )
+    return status
+
+
+def admin_seed_publish_status(
+    bucket_name: str,
+    program: ProgramInfo,
+    module_key: str,
+    section_key: str,
+    admin_email: str,
+    seed_reason: str,
+) -> dict:
+    """Admin-only action: create a publish_status.json for a section that was
+    generated before the validation-pipeline existed (e.g. via content_worker
+    without a /write validator pass).
+
+    This explicitly names the admin who vouches for the section and the reason,
+    creating a clear audit trail.  It does NOT auto-approve existing sections
+    silently — the admin takes personal accountability in the audit log.
+
+    Enforces:
+      - No existing publish_status (sections that already went through /write
+        must not be overridden this way).
+      - admin_email and seed_reason are required (audit trail).
+    """
+    if not admin_email or not admin_email.strip():
+        raise ValueError("admin_email is required.")
+    if not seed_reason or len(seed_reason.strip()) < 5:
+        raise ValueError("seed_reason is required (min 5 chars) for audit trail.")
+
+    existing = load_publish_status(bucket_name, program, module_key, section_key)
+    if existing is not None:
+        raise ValueError(
+            f"publish_status already exists for {module_key}/{section_key}. "
+            "Use /write to re-run the validator instead of seeding."
+        )
+
+    prefix = program_prefix(program)
+    bkt    = gcs().bucket(bucket_name)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    gcs_path = f"{prefix}/ctd/{module_key}/{section_key}/document.md"
+
+    status: dict = {
+        "run_id":                 f"admin-seed-{now_iso}",
+        "author":                 "system",
+        "seeded_by_admin":        admin_email.strip(),
+        "seed_reason":            seed_reason.strip(),
+        "timestamp":              now_iso,
+        "module_key":             module_key,
+        "section_key":            section_key,
+        "gcs_path":               gcs_path,
+        "validation_gcs_path":    "",
+        "validation_passed":      True,
+        "section_issues":         [],
+        "publish_approved":       True,
+        "publish_blocked_reason": "",
+        "human_approved":         False,
+        "approver":               "",
+        "approved_at":            "",
+        "approval_reason":        "",
+        "gates":                  {},
+        "release_ready":          False,
+        "required_roles":         list(GATE_ROLES_REQUIRED),
+    }
+    status_path = _publish_status_path(prefix, module_key, section_key)
+    bkt.blob(status_path).upload_from_string(
+        json.dumps(status, indent=2),
+        content_type="application/json",
+    )
+    logger.info(
+        "[storage] Admin '%s' seeded publish_status for %s/%s — reason: %s",
+        admin_email, module_key, section_key, seed_reason,
     )
     return status
 
