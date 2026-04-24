@@ -1389,8 +1389,21 @@ with gr.Blocks(title="Regulatory Authoring Platform") as demo:
     )
 
     # Step 5 — Read prior version
-    def _read_version_action(ver_label, section, ta_field, dis_field, drug_field, state):
-        """Load content for a selected prior version."""
+    def _read_version_action(*args):
+        """Load content for a selected prior version.
+
+        Accepts inputs variadically because Gradio can fire `.change` during
+        initial page cascade with fewer bound values than expected.
+        Expected order: (ver_label, section, ta_field, dis_field, drug_field, state).
+        """
+        ver_label    = args[0] if len(args) > 0 else None
+        section      = args[1] if len(args) > 1 else None
+        ta_field     = args[2] if len(args) > 2 else ""
+        dis_field    = args[3] if len(args) > 3 else ""
+        drug_field   = args[4] if len(args) > 4 else ""
+        state        = args[5] if len(args) > 5 else {}
+        if not isinstance(state, dict):
+            state = {}
         if not ver_label or not section:
             return ""
         prog = state.get("content_program") or {}
