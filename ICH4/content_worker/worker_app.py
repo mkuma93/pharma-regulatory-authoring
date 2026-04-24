@@ -131,6 +131,8 @@ class SchemaPatchRequest(BaseModel):
     drug_name: str
     bucket: str
     run_validator: bool = False
+    author: str = ""
+    run_id: str = ""
 
 
 @app.post("/schema-patch")
@@ -149,6 +151,8 @@ async def schema_patch(request: SchemaPatchRequest):
     dis  = request.disease_type
     drug = request.drug_name
     bucket = request.bucket
+    author = request.author
+    run_id = request.run_id
 
     if not _CLINICAL_ANALYST_URL:
         return {"status": "skipped", "reason": "CLINICAL_ANALYST_URL not configured"}
@@ -214,6 +218,8 @@ async def schema_patch(request: SchemaPatchRequest):
                     "drug_name":        drug,
                     "bucket":           bucket,
                     "placeholder_keys": changed_keys,
+                    "author":           author,
+                    "run_id":           run_id,
                 },
                 headers=_oidc_headers(analyst_aud),
             )

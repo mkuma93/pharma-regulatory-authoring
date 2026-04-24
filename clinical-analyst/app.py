@@ -110,6 +110,8 @@ class ResolveRequest(BaseModel):
         default_factory=list,
         description="Keys to resolve. Empty = resolve all keys found in manifest.",
     )
+    author: str = Field(default="", description="IAP user who triggered this run.")
+    run_id: str = Field(default="", description="Content-generation run identifier.")
 
 
 class ResolveResponse(BaseModel):
@@ -306,7 +308,49 @@ def _load_extensions(bucket: str) -> None:
         logger.warning("[ext] Failed to load extension module: %s", exc)
 
 
-def _persist_extension(fn_name: str, comp_type: str, fn_code: str, bucket: str) -> None:
+_FUNCTION_MANIFEST_PATH = "system/function_manifest.json"
+
+
+def _update_function_manifest(
+    bucket: str, comp_type: str, fn_name: str,
+    author: str = "", run_id: str = "",
+) -> None:
+    """Upsert an entry in the function manifest (comp_type → metadata)."""
+    try:
+        mblob   = _gcs_client().bucket(bucket).blob(_FUNCTION_MANIFEST_PATH)
+        manifest: dict[str, dict] = (
+            json.loads(mblob.download_as_text()) if mblob.exists() else {}
+        )
+        now = datetime.now(timezone.utc).isoformat()
+        if comp_type not in manifest:
+            # First time this comp_type is created
+            manifest[comp_type] = {
+                "fn_name":      fn_name,
+                "created_at":   now,
+                "created_by":   author or "system",
+                "run_id":       run_id,
+                "source":       "clinical-analyst/resolve",
+                "version":      1,
+            }
+        else:
+            # Subsequent regeneration: bump version, record who overwrote it
+            manifest[comp_type]["version"]     = manifest[comp_type].get("version", 1) + 1
+            manifest[comp_type]["updated_at"]  = now
+            manifest[comp_type]["updated_by"]  = author or "system"
+            manifest[comp_type]["fn_name"]      = fn_name
+        mblob.upload_from_string(
+            json.dumps(manifest, indent=2), content_type="application/json"
+        )
+        logger.info("[ext] function_manifest updated for '%s' (v%s)",
+                    comp_type, manifest[comp_type]["version"])
+    except Exception as exc:
+        logger.warning("[ext] function_manifest update failed for '%s': %s", comp_type, exc)
+
+
+def _persist_extension(
+    fn_name: str, comp_type: str, fn_code: str, bucket: str,
+    author: str = "", run_id: str = "",
+) -> None:
     """Append a new function to the GCS extension module and hot-register it."""
     with _EXT_MODULE_LOCK:
         try:
@@ -323,6 +367,8 @@ def _persist_extension(fn_name: str, comp_type: str, fn_code: str, bucket: str) 
         except Exception as exc:
             logger.warning("[ext] GCS persist failed for '%s': %s", comp_type, exc)
             return
+
+    _update_function_manifest(bucket, comp_type, fn_name, author=author, run_id=run_id)
 
     # Hot-register in memory
     ns: dict = {"pd": pd}
@@ -569,20 +615,24 @@ def _plan_and_execute(
     placeholder_meta: dict[str, dict],
     llm: ChatOpenAI,
     bucket: str,
-) -> tuple[dict[str, str], dict[str, str]]:
+    author: str = "",
+    run_id: str = "",
+) -> tuple[dict[str, str], dict[str, str], dict[str, dict]]:
     """LLM plans intent → executor runs it → range validator checks.
 
-    Returns (resolved, suggested).
+    Returns (resolved, suggested, provenance).
+    provenance: {key: {comp_type, fn_name, source}} — records which function
+    produced each resolved value so documents are fully traceable.
     """
     if df.empty or not placeholder_meta:
-        return {}, {}
+        return {}, {}, {}
 
     computable_meta = {
         k: v for k, v in placeholder_meta.items()
         if not any(k.lower().endswith(sfx) for sfx in _NARRATIVE_SUFFIXES)
     }
     if not computable_meta:
-        return {}, {}
+        return {}, {}, {}
 
     schema       = _build_schema(df)
     schema_json  = json.dumps(schema, indent=2)
@@ -612,6 +662,7 @@ def _plan_and_execute(
     df_columns = set(df.columns)
     results:   dict[str, str] = {}
     suggested: dict[str, str] = {}
+    provenance: dict[str, dict] = {}  # key → {comp_type, fn_name, source}
 
     for step in plan:
         key = step.get("key", "")
@@ -646,7 +697,10 @@ def _plan_and_execute(
                 if code:
                     approved, reason = _validate_extension_code(code, llm)
                     if approved:
-                        _persist_extension(_derive_fn_name(comp_type), comp_type, code, bucket)
+                        _persist_extension(
+                            _derive_fn_name(comp_type), comp_type, code, bucket,
+                            author=author, run_id=run_id,
+                        )
                     else:
                         logger.warning("[ext] Rejected '%s': %s", comp_type, reason)
                         # If validator says to use a builtin, reroute — but only for
@@ -716,13 +770,18 @@ def _plan_and_execute(
             continue
 
         results[key] = value
+        provenance[key] = {
+            "comp_type": step["computation"],
+            "fn_name":   _derive_fn_name(step["computation"]),
+            "source":    "builtin" if step["computation"] in _BUILTIN_COMPUTATIONS else "generated",
+        }
         logger.info("[resolve] %s → %s", key, value[:80])
 
     unresolved = [k for k in computable_meta if k not in results and k not in suggested]
     if unresolved:
         logger.warning("[resolve] %d unresolved: %s", len(unresolved), unresolved)
 
-    return results, suggested
+    return results, suggested, provenance
 
 
 # ── GCS helpers ───────────────────────────────────────────────────────────────
@@ -1033,18 +1092,23 @@ def resolve(req: ResolveRequest) -> ResolveResponse:
     for pk, meta in placeholder_meta.items():
         file_groups.setdefault(meta["gcs_path"], {})[pk] = meta
 
-    llm_client   = _llm()
-    resolved:     dict[str, str] = {}
-    all_suggested: dict[str, str] = {}
+    llm_client    = _llm()
+    resolved:      dict[str, str]  = {}
+    all_suggested: dict[str, str]  = {}
+    all_provenance: dict[str, dict] = {}
 
     for gcs_path, ph_meta in file_groups.items():
         df = _load_csv(bucket, gcs_path)
         if df is None or df.empty:
             logger.warning("[resolve] Skipping empty/missing CSV: %s", gcs_path)
             continue
-        comp, sugg = _plan_and_execute(df, ph_meta, llm_client, bucket)
+        comp, sugg, prov = _plan_and_execute(
+            df, ph_meta, llm_client, bucket,
+            author=req.author, run_id=req.run_id,
+        )
         resolved.update(comp)
         all_suggested.update(sugg)
+        all_provenance.update(prov)
         logger.info(
             "[resolve] %s: resolved %d/%d keys, %d suggested",
             gcs_path, len(comp), len(ph_meta), len(sugg),
@@ -1063,6 +1127,32 @@ def resolve(req: ResolveRequest) -> ResolveResponse:
     except Exception as exc:
         logger.error("[resolve] GCS save failed: %s", exc)
         raise HTTPException(status_code=500, detail=f"Failed to save resolved values: {exc}") from exc
+
+    # Save provenance sidecar — records which function produced each value
+    provenance_path = f"{prefix}/analysis/placeholder_provenance.json"
+    try:
+        now = datetime.now(timezone.utc).isoformat()
+        provenance_doc = {
+            "run_id":    req.run_id,
+            "author":    req.author or "system",
+            "resolved_at": now,
+            "values": {
+                k: {
+                    "value":     resolved.get(k, ""),
+                    "comp_type": v.get("comp_type", ""),
+                    "fn_name":   v.get("fn_name", ""),
+                    "source":    v.get("source", ""),
+                }
+                for k, v in all_provenance.items()
+            },
+        }
+        _gcs_client().bucket(bucket).blob(provenance_path).upload_from_string(
+            json.dumps(provenance_doc, indent=2), content_type="application/json"
+        )
+        logger.info("[resolve] Saved provenance (%d keys) to gs://%s/%s",
+                    len(all_provenance), bucket, provenance_path)
+    except Exception as exc:
+        logger.warning("[resolve] Provenance save failed (non-fatal): %s", exc)
 
     return ResolveResponse(
         resolved_values=resolved,
