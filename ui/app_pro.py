@@ -423,7 +423,12 @@ def _action_generate(ta: str, dis: str, drug: str, state: dict, log: str):
         "state":            state,
     })
     new_state = {**state, **result.get("state_patch", {}), "generation_in_progress": True}
-    msg = result.get("reply", "Generation started.")
+    run_id = (new_state.get("content_run_id") or "")[:8]
+    msg = (
+        f"⏳ **Content generation queued** for **{ta} / {dis} / {drug}**"
+        + (f" (run `{run_id}…`)" if run_id else "")
+        + ".\n\nThis takes 5–15 minutes. The status banner above will update automatically."
+    )
     new_log = _log(log, f"⏳ Generation started for {ta} / {dis} / {drug}…")
     return new_state, new_log, _generation_status_html(new_state, ""), msg
 
@@ -551,7 +556,27 @@ def _action_read_section(
         f"/templates/{module}/{section_key}.md",
     ) if gcs_path else ""
     meta     = _section_meta_html(content, module, section_key, template_path)
-    return content, evidence, meta
+
+    # Strip boilerplate scaffolding headers (Purpose / ICH M4 Requirements /
+    # "Content Template" heading) — keep only the generated subsection content.
+    import re as _re
+    stripped = _re.sub(
+        r"^#[^\n]*\n[^\n]*\n\n---\n\n.*?## Content Template\n",
+        "",
+        content,
+        flags=_re.DOTALL,
+    )
+    display_content = stripped.strip() if stripped.strip() else content
+
+    # Highlight [DATA PENDING] markers so they stand out rather than
+    # looking like normal prose template text.
+    display_content = _re.sub(
+        r"\[DATA PENDING[^\]]*\]",
+        lambda m: f"**⚠️ {m.group(0)}**",
+        display_content,
+    )
+
+    return display_content, evidence, meta
 
 
 # ── Auto-poll ──────────────────────────────────────────────────────────────────
@@ -859,9 +884,9 @@ with gr.Blocks(title="Regulatory Authoring Platform") as demo:
                 "Module 5 — Clinical Study Reports)."
             ))
             with gr.Row():
-                _s5_ta_disp   = gr.Textbox(label="Therapeutic Area",    interactive=False, scale=1)
-                _s5_dis_disp  = gr.Textbox(label="Disease / Indication", interactive=False, scale=1)
-                _s5_drug_disp = gr.Textbox(label="Drug Name",            interactive=False, scale=1)
+                _s5_ta_disp   = gr.Textbox(label="Therapeutic Area",    interactive=True, scale=1, placeholder="e.g. neurology")
+                _s5_dis_disp  = gr.Textbox(label="Disease / Indication", interactive=True, scale=1, placeholder="e.g. bells_palsy")
+                _s5_drug_disp = gr.Textbox(label="Drug Name",            interactive=True, scale=1, placeholder="e.g. prednisolone")
             with gr.Row():
                 _s5_load_btn = gr.Button("🔄  Load Sections", variant="secondary", scale=1)
                 _s5_load_msg = gr.Markdown(value="")
@@ -888,6 +913,7 @@ with gr.Blocks(title="Regulatory Authoring Platform") as demo:
     # Page load
     # ══════════════════════════════════════════════════════════════════════════
     def _on_load(bucket: str, browser_session: str):
+        import json as _json
         state, sid = _init_session(bucket or _DEFAULT_BUCKET, browser_session)
         prog = state.get("content_program") or {}
         ta   = prog.get("therapeutic_area", "")
@@ -896,8 +922,11 @@ with gr.Blocks(title="Regulatory Authoring Platform") as demo:
         log  = f"[{_ts()}]  Session loaded — ID: {sid[:8]}…"
         s1b  = _framework_status_html(state)
         s2b  = _program_status_html(state)
+        # Preserve the full JSON browser session (session_id + content_program).
+        # Writing just `sid` here would clobber the stored content_program on reload.
+        new_browser_session = _json.dumps({"session_id": sid, "content_program": prog}) if prog else sid
         return (
-            state, sid, log,
+            state, new_browser_session, log,
             s1b, s2b,
             gr.update(value=ta), gr.update(value=dis), gr.update(value=drug),  # step 2
             gr.update(value=ta), gr.update(value=dis), gr.update(value=drug),  # step 3
@@ -992,30 +1021,32 @@ with gr.Blocks(title="Regulatory Authoring Platform") as demo:
     )
 
     # Step 5 — Load sections
-    def _load_sections_action(state):
+    def _load_sections_action(ta_field, dis_field, drug_field, state):
+        # Prefer the displayed field values (user may have typed them directly);
+        # fall back to content_program in state.
         prog = state.get("content_program") or {}
-        ta   = prog.get("therapeutic_area", "")
-        dis  = prog.get("disease_type",     "")
-        drug = prog.get("drug_name",        "")
+        ta   = (ta_field   or prog.get("therapeutic_area", "")).strip()
+        dis  = (dis_field  or prog.get("disease_type",     "")).strip()
+        drug = (drug_field or prog.get("drug_name",        "")).strip()
         return _action_load_sections(ta, dis, drug, state)
 
     _s5_load_btn.click(
         fn=_load_sections_action,
-        inputs=[_state],
+        inputs=[_s5_ta_disp, _s5_dis_disp, _s5_drug_disp, _state],
         outputs=[_s5_dropdown, _s5_load_msg],
     )
 
     # Step 5 — Read section (returns content + evidence panel + metadata)
-    def _read_section_action(selection, state):
+    def _read_section_action(selection, ta_field, dis_field, drug_field, state):
         prog = state.get("content_program") or {}
-        ta   = prog.get("therapeutic_area", "")
-        dis  = prog.get("disease_type",     "")
-        drug = prog.get("drug_name",        "")
+        ta   = (ta_field   or prog.get("therapeutic_area", "")).strip()
+        dis  = (dis_field  or prog.get("disease_type",     "")).strip()
+        drug = (drug_field or prog.get("drug_name",        "")).strip()
         return _action_read_section(selection, ta, dis, drug, state)
 
     _s5_dropdown.change(
         fn=_read_section_action,
-        inputs=[_s5_dropdown, _state],
+        inputs=[_s5_dropdown, _s5_ta_disp, _s5_dis_disp, _s5_drug_disp, _state],
         outputs=[_s5_content, _s5_evidence, _s5_meta],
     )
 
