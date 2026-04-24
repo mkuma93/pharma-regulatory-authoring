@@ -68,6 +68,22 @@ _GCP_PROJECT            = os.environ.get("GCP_PROJECT_ID", "pharma-reguatory-aut
 _CONTENT_PUBSUB_TOPIC   = os.environ.get("CONTENT_PUBSUB_TOPIC", "ich4-content-generation")
 _CONTENT_STATUS_TIMEOUT = int(os.environ.get("CONTENT_STATUS_TIMEOUT_SECONDS", str(30 * 60)))
 
+_ALLOWED_LLM_MODELS: frozenset[str] = frozenset({
+    "gpt-4o",
+    "gpt-4o-mini",
+    "gpt-4-turbo",
+    "gpt-4",
+    "gemini-2.0-flash",
+    "gemini-1.5-pro",
+    "gemini-1.5-flash",
+})
+
+if _LLM_MODEL not in _ALLOWED_LLM_MODELS:
+    raise ValueError(
+        f"LLM_MODEL '{_LLM_MODEL}' is not in the allowlist {sorted(_ALLOWED_LLM_MODELS)}. "
+        "Set the LLM_MODEL environment variable to an approved model."
+    )
+
 
 def _load_secret(project: str, secret_name: str) -> str | None:
     """Fetch the latest version of a secret from GCP Secret Manager."""
@@ -301,6 +317,45 @@ def _ast_safe(code: str) -> str | None:
     return None
 
 
+def _safe_exec(code: str, source_label: str) -> dict:
+    """Compile and execute ``code`` in a heavily restricted namespace.
+
+    Only ``pd`` (pandas) and ``np`` (numpy) are provided as globals.
+    All builtins are removed except a minimal safe set, and ``__import__``
+    is explicitly blocked so imported-module techniques cannot be used.
+
+    Raises ``ValueError`` if the AST safety check fails.
+    Raises ``RuntimeError`` for any exec-time error.
+    """
+    ast_err = _ast_safe(code)
+    if ast_err:
+        raise ValueError(f"AST safety check failed ({source_label}): {ast_err}")
+
+    _SAFE_BUILTINS = {
+        "len": len, "int": int, "float": float, "str": str,
+        "round": round, "range": range, "enumerate": enumerate,
+        "zip": zip, "list": list, "dict": dict, "tuple": tuple,
+        "bool": bool, "abs": abs, "min": min, "max": max, "sum": sum,
+        "isinstance": isinstance, "hasattr": hasattr,
+        "__import__": _blocked_import,
+    }
+    ns: dict = {
+        "pd": pd,
+        "np": np,
+        "__builtins__": _SAFE_BUILTINS,
+    }
+    try:
+        compiled = compile(code, source_label, "exec")
+        exec(compiled, ns)  # noqa: S102
+    except Exception as exc:
+        raise RuntimeError(f"exec failed ({source_label}): {exc}") from exc
+    return ns
+
+
+def _blocked_import(*args, **kwargs):
+    raise ImportError("Dynamic imports are not allowed in extension functions")
+
+
 def _load_extensions(bucket: str) -> None:
     """Load and exec the extension module from GCS, registering functions."""
     try:
@@ -309,15 +364,16 @@ def _load_extensions(bucket: str) -> None:
             logger.info("[ext] No extension module found at %s — starting fresh", _EXTENSION_GCS_PATH)
             return
         code = blob.download_as_text()
-        ns: dict = {"pd": pd}
-        exec(compile(code, _EXTENSION_GCS_PATH, "exec"), ns)  # noqa: S102
+        ns = _safe_exec(code, _EXTENSION_GCS_PATH)
         registry: dict = ns.get("_REGISTRY", {})
         with _COMPUTATION_MAP_LOCK:
             _COMPUTATION_MAP.update(registry)
         logger.info("[ext] Loaded %d extension function(s): %s",
                     len(registry), list(registry.keys()))
-    except Exception as exc:
+    except (ValueError, RuntimeError) as exc:
         logger.warning("[ext] Failed to load extension module: %s", exc)
+    except Exception as exc:
+        logger.warning("[ext] Unexpected error loading extension module: %s", exc)
 
 
 _FUNCTION_MANIFEST_PATH = "system/function_manifest.json"
@@ -406,15 +462,16 @@ def _persist_extension(
             logger.warning("[ext] Codegen prompt save failed for '%s': %s", comp_type, exc)
 
     # Hot-register in memory
-    ns: dict = {"pd": pd}
     try:
-        exec(compile(fn_code, "<generated>", "exec"), ns)  # noqa: S102
+        ns = _safe_exec(fn_code, "<generated>")
         fn = ns.get(fn_name)
         if fn:
             with _COMPUTATION_MAP_LOCK:
                 _COMPUTATION_MAP[comp_type] = fn
             logger.info("[ext] Hot-registered '%s'", comp_type)
-    except Exception as exc:
+        else:
+            logger.warning("[ext] Hot-register: function '%s' not found in generated code", fn_name)
+    except (ValueError, RuntimeError) as exc:
         logger.warning("[ext] Hot-register failed for '%s': %s", comp_type, exc)
 
 
@@ -524,7 +581,12 @@ def _validate_extension_code(code: str, llm: ChatOpenAI) -> tuple[bool, str]:
         raw = str(response.content).strip()
         # Strip markdown fences if present
         raw = re.sub(r"^```[a-z]*\n?|```$", "", raw, flags=re.MULTILINE).strip()
-        verdict = json.loads(raw)
+        try:
+            verdict = json.loads(raw)
+        except json.JSONDecodeError as je:
+            return False, f"LLM returned non-JSON: {je} — raw: {raw[:200]}"
+        if not isinstance(verdict, dict):
+            return False, f"LLM verdict is not a dict (got {type(verdict).__name__})"
         return bool(verdict.get("approved")), str(verdict.get("reason", ""))
     except Exception as exc:
         return False, f"validator error: {exc}"

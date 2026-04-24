@@ -37,6 +37,7 @@ from datetime import datetime, timezone
 
 import httpx
 from fastapi import FastAPI, Request
+from google.cloud import exceptions as gcp_exceptions
 from google.cloud import storage
 from pydantic import BaseModel
 
@@ -327,8 +328,15 @@ async def generate(request: Request):
         if existing.get("status") == "done" and existing.get("run_id") == run_id:
             logger.info("[worker] Skipping duplicate run_id=%s", run_id)
             return {"status": "duplicate"}
-    except Exception:
+    except gcp_exceptions.NotFound:
         pass  # first run — status file doesn't exist yet
+    except gcp_exceptions.PermissionDenied as exc:
+        logger.error("[worker] Permission denied reading status — check IAM: %s", exc)
+        raise
+    except json.JSONDecodeError as exc:
+        logger.warning("[worker] Corrupted status file — will overwrite: %s", exc)
+    except Exception as exc:
+        logger.warning("[worker] Could not read idempotency status (%s): %s", type(exc).__name__, exc)
 
     _write_status(bucket, status_path, {
         "status": "running", "run_id": run_id, "step": "starting",

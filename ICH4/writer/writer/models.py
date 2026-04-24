@@ -1,15 +1,46 @@
 """Pydantic models for the writer service."""
 from __future__ import annotations
 
+import re
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+_PROGRAM_FIELD_RE = re.compile(r"^[a-z0-9][a-z0-9_\-]{0,127}$")
+
+
+def _validate_program_field(v: str, field_name: str) -> str:
+    """Reject values that could be used for path traversal."""
+    normalized = v.strip().lower().replace(" ", "_")
+    if not _PROGRAM_FIELD_RE.match(normalized):
+        raise ValueError(
+            f"{field_name} must contain only letters, digits, hyphens and "
+            f"underscores (got {v!r})"
+        )
+    if ".." in normalized or "/" in normalized or "\\" in normalized:
+        raise ValueError(f"{field_name} must not contain path separators")
+    return normalized
 
 
 class ProgramInfo(BaseModel):
     therapeutic_area: str
     disease_type: str
     drug_name: str
+
+    @field_validator("therapeutic_area", mode="before")
+    @classmethod
+    def _check_ta(cls, v: str) -> str:
+        return _validate_program_field(str(v), "therapeutic_area")
+
+    @field_validator("disease_type", mode="before")
+    @classmethod
+    def _check_dis(cls, v: str) -> str:
+        return _validate_program_field(str(v), "disease_type")
+
+    @field_validator("drug_name", mode="before")
+    @classmethod
+    def _check_drug(cls, v: str) -> str:
+        return _validate_program_field(str(v), "drug_name")
 
 
 class SectionDocument(BaseModel):

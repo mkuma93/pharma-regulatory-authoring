@@ -12,10 +12,16 @@ At local-dev time the helpers gracefully return "" when the header is absent.
 """
 
 from __future__ import annotations
+
+import os
 from typing import Mapping
 
 
 _HDR = "x-goog-authenticated-user-email"
+
+# When ENFORCE_IAP=true (set on Cloud Run), requests without a valid IAP
+# identity header are rejected.  Defaults to false for local development.
+ENFORCE_IAP: bool = os.getenv("ENFORCE_IAP", "false").lower() == "true"
 
 
 def iap_user_from_headers(headers: Mapping[str, str] | None) -> str:
@@ -48,8 +54,17 @@ def resolve_author(body_author: str, headers: Mapping[str, str] | None) -> str:
       1. Explicit ``body_author`` from the request payload (if non-empty).
       2. IAP-authenticated user email from the request headers.
       3. Empty string (caller may substitute "system" for display).
+
+    When ``ENFORCE_IAP`` is ``True`` a missing IAP identity raises
+    ``PermissionError`` so callers can surface it as an HTTP 403.
     """
     clean = (body_author or "").strip()
     if clean:
         return clean
-    return iap_user_from_headers(headers)
+    identity = iap_user_from_headers(headers)
+    if not identity and ENFORCE_IAP:
+        raise PermissionError(
+            "IAP identity header is required but was not present. "
+            "Ensure Cloud Run IAP is configured and the request is authenticated."
+        )
+    return identity

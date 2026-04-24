@@ -65,8 +65,15 @@ def _oidc_headers(base_url: str) -> dict[str, str]:
             ["gcloud", "auth", "print-identity-token"],
             capture_output=True, text=True, timeout=10
         )
+        if result.returncode != 0:
+            raise RuntimeError(f"gcloud exited {result.returncode}: {result.stderr.strip()}")
         token = result.stdout.strip()
-        if token:
+        # Validate token looks like a JWT (3 base64url segments separated by dots)
+        if token and token.count(".") == 2 and all(
+            c in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_="
+            for part in token.split(".")
+            for c in part
+        ):
             return {"Authorization": f"Bearer {token}"}
     except Exception:
         pass
