@@ -9,6 +9,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy service code
 COPY clinical-analyst/app.py app.py
+COPY system/bq_audit.py      bq_audit.py
 
 # PORT is injected by Cloud Run at runtime; 8080 is the default.
 # Do NOT hardcode a fixed PORT here — Cloud Run picks the port.

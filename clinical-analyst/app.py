@@ -44,6 +44,12 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
+try:
+    from bq_audit import emit_function_registered, emit_placeholder_resolved  # noqa: F401
+except ImportError:
+    def emit_function_registered(**_): pass   # noqa: E704
+    def emit_placeholder_resolved(**_): pass  # noqa: E704
+
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(name)s  %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -370,6 +376,7 @@ def _persist_extension(
             return
 
     _update_function_manifest(bucket, comp_type, fn_name, author=author, run_id=run_id)
+    emit_function_registered(run_id=run_id, author=author, comp_type=comp_type, fn_name=fn_name)
 
     # Archive the codegen prompt alongside the function
     if codegen_messages:
@@ -1145,6 +1152,19 @@ def resolve(req: ResolveRequest) -> ResolveResponse:
         resolved.update(comp)
         all_suggested.update(sugg)
         all_provenance.update(prov)
+        for key, prov_info in prov.items():
+            emit_placeholder_resolved(
+                run_id=req.run_id,
+                author=req.author,
+                therapeutic_area=req.therapeutic_area,
+                disease_type=req.disease_type,
+                drug_name=req.drug_name,
+                placeholder_key=key,
+                comp_type=prov_info.get("comp_type", ""),
+                fn_name=prov_info.get("fn_name", ""),
+                csv_source=gcs_path,
+                resolved_value=str(comp.get(key, "")),
+            )
         if planner_msgs:
             all_planner_prompts.append({
                 "csv_source": gcs_path,

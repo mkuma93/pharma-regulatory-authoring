@@ -40,6 +40,12 @@ from fastapi import FastAPI, Request
 from google.cloud import storage
 from pydantic import BaseModel
 
+try:
+    from bq_audit import emit_generation_run, emit_validation_issue  # noqa: F401
+except ImportError:
+    def emit_generation_run(**_): pass    # noqa: E704
+    def emit_validation_issue(**_): pass  # noqa: E704
+
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(name)s  %(message)s")
 
@@ -585,6 +591,31 @@ async def generate(request: Request):
         logger.info("[worker] Saved validation report to gs://%s/%s", bucket, validation_latest_path)
     except Exception as exc:
         logger.warning("[worker] Validation report save failed (non-fatal): %s", exc)
+
+    # ── Emit audit events ─────────────────────────────────────────────────────
+    issues = final_validation.get("issues", [])
+    emit_generation_run(
+        run_id=run_id,
+        author=author or "system",
+        therapeutic_area=ta,
+        disease_type=dis,
+        drug_name=drug,
+        sections_written=all_sections_written,
+        sections_failed=all_sections_failed,
+        validation_passed=bool(final_validation.get("passed", False)),
+        validation_issue_count=len(issues),
+    )
+    for issue in issues:
+        emit_validation_issue(
+            run_id=run_id,
+            author=author or "system",
+            therapeutic_area=ta,
+            disease_type=dis,
+            drug_name=drug,
+            section_key=issue.get("section_key", ""),
+            severity=issue.get("severity", ""),
+            issue_message=issue.get("message", ""),
+        )
 
     # ── Write final done status ───────────────────────────────────────────────
     _write_status(bucket, status_path, {

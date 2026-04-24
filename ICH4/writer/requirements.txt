@@ -25,3 +25,6 @@ python-dotenv>=1.0.0
 
 # === JSON repair (handles malformed LLM responses) ===
 json-repair>=0.30.0
+
+# BigQuery (audit events — streams when BQ_AUDIT_DATASET env var is set)
+google-cloud-bigquery>=3.0.0

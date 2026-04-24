@@ -10,5 +10,6 @@ WORKDIR /app
 COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
 COPY worker_app.py .
+COPY bq_audit.py   .
 ENV PYTHONPATH=/app
 CMD ["sh", "-c", "python worker_app.py"]

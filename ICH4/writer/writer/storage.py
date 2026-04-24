@@ -17,6 +17,11 @@ from datetime import datetime, timezone
 from .gcs_client import gcs, program_prefix
 from .models import ProgramInfo, SectionDocument
 
+try:
+    from bq_audit import emit_document_version  # injected via Dockerfile COPY
+except ImportError:
+    def emit_document_version(**_): pass  # noqa: E704 — no-op when running locally
+
 logger = logging.getLogger(__name__)
 
 
@@ -143,6 +148,17 @@ def save_document(
                 "prompt_path": prompt_path,
             })
             _save_version_manifest(bkt, vprefix, manifest)
+            emit_document_version(
+                run_id=run_id,
+                author=author or "system",
+                therapeutic_area=program.therapeutic_area,
+                disease_type=program.disease_type,
+                drug_name=program.drug_name,
+                module_key=doc.module_key,
+                section_key=doc.section_key,
+                version=next_version,
+                gcs_path=versioned_path,
+            )
             logger.info(
                 "[storage] Snapshotted v%d → gs://%s/%s (author=%s)",
                 next_version, bucket_name, versioned_path, author or "system",

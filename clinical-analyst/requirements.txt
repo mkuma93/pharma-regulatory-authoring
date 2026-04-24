@@ -8,3 +8,6 @@ google-cloud-secret-manager>=2.16.0
 langchain-openai>=0.1.0
 langchain-core>=0.2.0
 openai>=1.0.0
+
+# BigQuery (audit events — streams when BQ_AUDIT_DATASET env var is set)
+google-cloud-bigquery>=3.0.0
