@@ -17,6 +17,9 @@ Event types and the BQ columns they populate:
   document_version      — every time writer saves a new document snapshot
   generation_run        — one row per completed content-generation run
   validation_issue      — one row per ValidationIssue in the final report
+  validation_persisted  — one row per ValidationResult written to GCS (immutable)
+  publish_status        — one row per publish-gate decision (approved/blocked)
+  section_approved      — one row per human approval (approver, witness, reason)
   function_registered   — when clinical-analyst generates & persists a new executor
   placeholder_resolved  — one row per placeholder resolved by clinical-analyst
 
@@ -41,6 +44,11 @@ BQ_TABLE_SCHEMA (run once to create the table):
     validation_issue_count INT64,
     severity            STRING,
     issue_message       STRING,
+    -- publish gate / approval --
+    publish_approved    BOOL,
+    publish_blocked_reason STRING,
+    approver            STRING,
+    approval_reason     STRING,
     -- computation / provenance --
     comp_type           STRING,
     fn_name             STRING,
@@ -258,3 +266,91 @@ def emit_placeholder_resolved(
         "csv_source":       csv_source,
         "resolved_value":   resolved_value[:500] if resolved_value else "",  # truncate for BQ
     })
+
+
+def emit_validation_persisted(
+    *,
+    run_id: str,
+    author: str,
+    therapeutic_area: str,
+    disease_type: str,
+    drug_name: str,
+    gcs_path: str,
+    validation_passed: bool,
+    validation_issue_count: int,
+) -> None:
+    """Emit when a ValidationResult is written to GCS (append-only per run)."""
+    emit_audit_event({
+        "event_type":            "validation_persisted",
+        "run_id":                run_id,
+        "author":                author or "system",
+        "therapeutic_area":      therapeutic_area,
+        "disease_type":          disease_type,
+        "drug_name":             drug_name,
+        "gcs_path":              gcs_path,
+        "validation_passed":     validation_passed,
+        "validation_issue_count": validation_issue_count,
+    })
+
+
+def emit_publish_status(
+    *,
+    run_id: str,
+    author: str,
+    therapeutic_area: str,
+    disease_type: str,
+    drug_name: str,
+    module_key: str,
+    section_key: str,
+    gcs_path: str,
+    publish_approved: bool,
+    publish_blocked_reason: str = "",
+) -> None:
+    """Emit when the publish gate decides approved/blocked for a section."""
+    emit_audit_event({
+        "event_type":             "publish_status",
+        "run_id":                 run_id,
+        "author":                 author or "system",
+        "therapeutic_area":       therapeutic_area,
+        "disease_type":           disease_type,
+        "drug_name":              drug_name,
+        "module_key":             module_key,
+        "section_key":            section_key,
+        "gcs_path":               gcs_path,
+        "publish_approved":       publish_approved,
+        "publish_blocked_reason": publish_blocked_reason[:500],
+    })
+
+
+def emit_section_approved(
+    *,
+    run_id: str,
+    author: str,
+    approver: str,
+    therapeutic_area: str,
+    disease_type: str,
+    drug_name: str,
+    module_key: str,
+    section_key: str,
+    gcs_path: str,
+    approval_reason: str = "",
+) -> None:
+    """Emit when a human approver signs off on a section (witnessed approval).
+
+    ``author`` is the original content author; ``approver`` must be a distinct
+    user (enforced by the writer /approve endpoint) for segregation of duties.
+    """
+    emit_audit_event({
+        "event_type":       "section_approved",
+        "run_id":           run_id,
+        "author":           author or "system",
+        "approver":         approver,
+        "therapeutic_area": therapeutic_area,
+        "disease_type":     disease_type,
+        "drug_name":        drug_name,
+        "module_key":       module_key,
+        "section_key":      section_key,
+        "gcs_path":         gcs_path,
+        "approval_reason":  approval_reason[:500],
+    })
+

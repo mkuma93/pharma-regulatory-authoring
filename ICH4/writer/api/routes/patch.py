@@ -11,9 +11,15 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
+
+try:
+    from iap_identity import resolve_author  # injected via Dockerfile COPY
+except ImportError:  # pragma: no cover — local dev fallback
+    def resolve_author(body_author: str, headers) -> str:  # noqa: E704
+        return (body_author or "").strip()
 
 from config.settings import settings
 from writer.generator import write_section
@@ -66,7 +72,7 @@ def _section_key_from_path(gcs_path: str) -> str:
 
 
 @router.post("/patch", response_model=WriterResponse)
-def patch(request: PatchRequest) -> WriterResponse:
+def patch(request: PatchRequest, http_request: Request) -> WriterResponse:
     """Patch existing CTD sections after a clinical data schema change.
 
     For each section, the call loads the previously generated document and
@@ -80,6 +86,9 @@ def patch(request: PatchRequest) -> WriterResponse:
     bucket_name = request.bucket_name or settings.gcs_bucket_name
     if not bucket_name:
         raise HTTPException(status_code=422, detail="bucket_name is required.")
+
+    # A2 — IAP identity fallback.
+    request.author = resolve_author(request.author, http_request.headers)
 
     llm = ChatOpenAI(
         model=settings.llm_model,

@@ -15,6 +15,7 @@ COPY ICH4/writer/writer/     writer/
 COPY ICH4/writer/validator/  validator/
 COPY ICH4/writer/config/     config/
 COPY system/bq_audit.py      bq_audit.py
+COPY system/iap_identity.py  iap_identity.py
 
 ENV PYTHONPATH=/app
 ENV PORT=8080

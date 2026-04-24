@@ -7,13 +7,24 @@ import json
 import logging
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel
+from fastapi import APIRouter, HTTPException, Query, Request
+from pydantic import BaseModel, Field
+
+try:
+    from iap_identity import resolve_author  # injected via Dockerfile COPY
+except ImportError:  # pragma: no cover — local dev fallback
+    def resolve_author(body_author: str, headers) -> str:  # noqa: E704
+        return (body_author or "").strip()
 
 from config.settings import settings
 from writer.gcs_client import gcs
 from writer.models import ProgramInfo
-from writer.storage import list_generated_paths, load_template
+from writer.storage import (
+    list_generated_paths,
+    load_publish_status,
+    load_template,
+    record_section_approval,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -33,6 +44,7 @@ class DocumentListResponse(BaseModel):
 class DocumentReadResponse(BaseModel):
     gcs_path: str
     content: str
+    publish_status: dict | None = None
 
 
 @router.get("/documents", response_model=DocumentListResponse)
@@ -107,7 +119,12 @@ def read_document(
         logger.error("Failed to read document %s: %s", gcs_path, exc)
         raise HTTPException(status_code=404, detail=f"Section not found: {gcs_path}") from exc
 
-    return DocumentReadResponse(gcs_path=gcs_path, content=content)
+    publish_status = load_publish_status(bucket, program, module, section_key)
+    return DocumentReadResponse(
+        gcs_path=gcs_path,
+        content=content,
+        publish_status=publish_status,
+    )
 
 
 # ── Version history ───────────────────────────────────────────────────────────
@@ -310,3 +327,131 @@ def get_clinical_manifest(
         total += len(cols)
 
     return ManifestResponse(sources=sources, total_columns=total)
+
+
+# ── Publish status / validation report / human approval (A1 + A6) ────────────
+
+class PublishStatusResponse(BaseModel):
+    section_key: str
+    status: dict | None
+
+
+@router.get("/documents/publish_status", response_model=PublishStatusResponse)
+def get_publish_status(
+    therapeutic_area: str = Query(...),
+    disease_type: str = Query(...),
+    drug_name: str = Query(...),
+    section_key: str = Query(...),
+    module: str = Query(...),
+    bucket_name: str = Query(default=None),
+) -> PublishStatusResponse:
+    """Return the publish_status.json sidecar for a section (or null if none)."""
+    bucket = bucket_name or settings.gcs_bucket_name
+    if not bucket:
+        raise HTTPException(status_code=422, detail="bucket_name is required.")
+    program = ProgramInfo(
+        therapeutic_area=therapeutic_area,
+        disease_type=disease_type,
+        drug_name=drug_name,
+    )
+    status = load_publish_status(bucket, program, module, section_key)
+    return PublishStatusResponse(section_key=section_key, status=status)
+
+
+class ValidationReportResponse(BaseModel):
+    gcs_path: str
+    report: dict
+
+
+@router.get("/documents/validation/latest", response_model=ValidationReportResponse)
+def get_latest_validation(
+    therapeutic_area: str = Query(...),
+    disease_type: str = Query(...),
+    drug_name: str = Query(...),
+    bucket_name: str = Query(default=None),
+) -> ValidationReportResponse:
+    """Return the most recent ValidationResult for a program."""
+    bucket = bucket_name or settings.gcs_bucket_name
+    if not bucket:
+        raise HTTPException(status_code=422, detail="bucket_name is required.")
+
+    from writer.gcs_client import program_prefix
+    program = ProgramInfo(
+        therapeutic_area=therapeutic_area,
+        disease_type=disease_type,
+        drug_name=drug_name,
+    )
+    path = f"{program_prefix(program)}/validation/latest.json"
+    blob = gcs().bucket(bucket).blob(path)
+    try:
+        if not blob.exists():
+            raise HTTPException(status_code=404, detail="No validation report yet.")
+        report = json.loads(blob.download_as_text())
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to load report: {exc}") from exc
+    return ValidationReportResponse(gcs_path=path, report=report)
+
+
+class ApproveRequest(BaseModel):
+    therapeutic_area: str
+    disease_type: str
+    drug_name: str
+    section_key: str
+    module: str
+    approver: str = Field(..., description="Email of approver; must differ from author.")
+    approval_reason: str = ""
+    run_id: str = ""
+    bucket_name: str | None = None
+
+
+class ApproveResponse(BaseModel):
+    approved: bool
+    status: dict
+
+
+@router.post("/documents/approve", response_model=ApproveResponse)
+def approve_section(req: ApproveRequest, http_request: Request) -> ApproveResponse:
+    """Human approval gate — enforces approver ≠ author (A6 segregation of duties).
+
+    Preconditions:
+      - publish_status.json exists for this section (i.e. /write ran the validator).
+      - validator did not block (publish_approved=True in sidecar).
+      - ``approver`` email differs from the original ``author``.
+
+    On success, the publish_status sidecar is flipped to ``human_approved=True``
+    and an immutable ``approvals/…json`` record is written with witness metadata.
+    """
+    bucket = req.bucket_name or settings.gcs_bucket_name
+    if not bucket:
+        raise HTTPException(status_code=422, detail="bucket_name is required.")
+    # A2 — IAP identity: if the caller omitted ``approver`` in the body, use
+    # the IAP-authenticated user email. Regulators expect the approver to be a
+    # real human, never the service account.
+    req.approver = resolve_author(req.approver, http_request.headers)
+    if not req.approver:
+        raise HTTPException(
+            status_code=422,
+            detail="approver is required (body field or IAP header).",
+        )
+    program = ProgramInfo(
+        therapeutic_area=req.therapeutic_area,
+        disease_type=req.disease_type,
+        drug_name=req.drug_name,
+    )
+    try:
+        status = record_section_approval(
+            bucket_name=bucket,
+            program=program,
+            module_key=req.module,
+            section_key=req.section_key,
+            approver=req.approver,
+            approval_reason=req.approval_reason,
+            run_id=req.run_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Approval failed: {exc}") from exc
+    return ApproveResponse(approved=True, status=status)

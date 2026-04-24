@@ -11,5 +11,6 @@ COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/pytho
 COPY --from=builder /usr/local/bin /usr/local/bin
 COPY ICH4/content_worker/worker_app.py .
 COPY system/bq_audit.py                .
+COPY system/iap_identity.py            .
 ENV PYTHONPATH=/app
 CMD ["sh", "-c", "python worker_app.py"]

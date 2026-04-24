@@ -38,7 +38,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 import pandas as pd
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from google.cloud import pubsub_v1, storage
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
@@ -49,6 +49,12 @@ try:
 except ImportError:
     def emit_function_registered(**_): pass   # noqa: E704
     def emit_placeholder_resolved(**_): pass  # noqa: E704
+
+try:
+    from iap_identity import resolve_author  # injected via Dockerfile COPY
+except ImportError:  # pragma: no cover — local dev fallback
+    def resolve_author(body_author: str, headers) -> str:  # noqa: E704
+        return (body_author or "").strip()
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(name)s  %(message)s")
 logger = logging.getLogger(__name__)
@@ -1060,7 +1066,7 @@ def health():
 
 
 @app.post("/resolve", response_model=ResolveResponse)
-def resolve(req: ResolveRequest) -> ResolveResponse:
+def resolve(req: ResolveRequest, http_request: Request) -> ResolveResponse:
     """Pre-compute all {{placeholder}} values for a program before writing.
 
     Reads the clinical manifest, dispatches LLM tool-calling once per CSV
@@ -1073,6 +1079,9 @@ def resolve(req: ResolveRequest) -> ResolveResponse:
     bucket = req.bucket or _DEFAULT_BUCKET
     if not bucket:
         raise HTTPException(status_code=422, detail="bucket is required.")
+
+    # A2 — IAP identity fallback.
+    req.author = resolve_author(req.author, http_request.headers)
 
     prefix   = _program_prefix(req.therapeutic_area, req.disease_type, req.drug_name)
     manifest = _load_manifest(bucket, prefix)
@@ -1383,7 +1392,7 @@ def _load_content_status(bucket: str, ta: str, dis: str, drug: str) -> dict:
 
 
 @app.post("/trigger", response_model=ActionResponse)
-def trigger(req: TriggerRequest) -> ActionResponse:
+def trigger(req: TriggerRequest, http_request: Request) -> ActionResponse:
     """Trigger CTD content generation for a drug program.
 
     1. If ``force_no_clinical`` is False, verifies clinical data is loaded.
@@ -1396,6 +1405,9 @@ def trigger(req: TriggerRequest) -> ActionResponse:
     bucket = (req.bucket or _DEFAULT_BUCKET).strip()
     if not bucket:
         raise HTTPException(status_code=422, detail="bucket is required.")
+
+    # A2 — IAP identity fallback.
+    req.author = resolve_author(req.author, http_request.headers)
 
     ta   = req.therapeutic_area.strip()
     dis  = req.disease_type.strip()

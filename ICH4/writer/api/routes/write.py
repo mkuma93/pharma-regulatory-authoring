@@ -4,8 +4,14 @@ from __future__ import annotations
 import concurrent.futures
 import logging
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from langchain_openai import ChatOpenAI
+
+try:
+    from iap_identity import resolve_author  # injected via Dockerfile COPY
+except ImportError:  # pragma: no cover — local dev fallback
+    def resolve_author(body_author: str, headers) -> str:  # noqa: E704
+        return (body_author or "").strip()
 
 from config.settings import settings
 from validator.graph import run_validator
@@ -16,6 +22,8 @@ from writer.storage import (
     load_template,
     parse_section_meta_from_path,
     save_document,
+    save_publish_status,
+    save_validation_result,
 )
 
 logger = logging.getLogger(__name__)
@@ -25,10 +33,14 @@ _VALIDATOR_TIMEOUT_SECONDS = 120  # 2-minute cap; prevents worker HTTP timeout o
 
 
 @router.post("/write", response_model=WriterResponse)
-def write(request: WriterRequest) -> WriterResponse:
+def write(request: WriterRequest, http_request: Request) -> WriterResponse:
     bucket_name = request.bucket_name or settings.gcs_bucket_name
     if not bucket_name:
         raise HTTPException(status_code=422, detail="bucket_name is required.")
+
+    # A2 — IAP identity: if request.author is empty, attribute this run to
+    # the IAP-authenticated end user instead of the Cloud Run service account.
+    request.author = resolve_author(request.author, http_request.headers)
 
     llm = ChatOpenAI(
         model=settings.llm_model,
@@ -129,6 +141,30 @@ def write(request: WriterRequest) -> WriterResponse:
             issues=[],
             summary="Validator not requested.",
         )
+
+    # ── Persist ValidationResult + write publish_status sidecars ─────────────
+    # (A1 traceability — regulator-visible artifacts for every run)
+    if documents:
+        try:
+            validation_path = save_validation_result(
+                bucket_name=bucket_name,
+                program=request.program,
+                validation=validation,
+                run_id=request.run_id,
+                author=request.author,
+                section_keys=[d.section_key for d in documents],
+            )
+            save_publish_status(
+                bucket_name=bucket_name,
+                program=request.program,
+                documents=documents,
+                validation=validation,
+                validation_gcs_path=validation_path,
+                run_id=request.run_id,
+                author=request.author,
+            )
+        except Exception as exc:
+            logger.warning("[write] Failed to persist validation artifacts: %s", exc)
 
     return WriterResponse(
         documents=documents,

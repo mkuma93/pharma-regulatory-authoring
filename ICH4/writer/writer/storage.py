@@ -15,12 +15,23 @@ import logging
 from datetime import datetime, timezone
 
 from .gcs_client import gcs, program_prefix
-from .models import ProgramInfo, SectionDocument
+from .models import ProgramInfo, SectionDocument, ValidationResult
 
 try:
     from bq_audit import emit_document_version  # injected via Dockerfile COPY
 except ImportError:
     def emit_document_version(**_): pass  # noqa: E704 — no-op when running locally
+
+try:
+    from bq_audit import (  # noqa: E501
+        emit_validation_persisted,
+        emit_publish_status,
+        emit_section_approved,
+    )
+except ImportError:
+    def emit_validation_persisted(**_): pass   # noqa: E704
+    def emit_publish_status(**_): pass         # noqa: E704
+    def emit_section_approved(**_): pass       # noqa: E704
 
 logger = logging.getLogger(__name__)
 
@@ -192,3 +203,279 @@ def save_document(
         )
 
     return gcs_path
+
+
+# ── Validation result + publish gate ─────────────────────────────────────────
+
+def _validation_run_path(prefix: str, run_id: str) -> str:
+    safe_run = run_id or "unknown"
+    return f"{prefix}/validation/runs/{safe_run}/report.json"
+
+
+def _validation_latest_path(prefix: str) -> str:
+    return f"{prefix}/validation/latest.json"
+
+
+def _publish_status_path(prefix: str, module_key: str, section_key: str) -> str:
+    return f"{prefix}/ctd/{module_key}/{section_key}/publish_status.json"
+
+
+def save_validation_result(
+    bucket_name: str,
+    program: ProgramInfo,
+    validation: ValidationResult,
+    run_id: str,
+    author: str,
+    section_keys: list[str],
+) -> str:
+    """Persist a `ValidationResult` to GCS as an immutable per-run artifact.
+
+    Writes two blobs:
+      - validation/runs/{run_id}/report.json   (append-only per run)
+      - validation/latest.json                 (mirror for UI convenience)
+
+    Returns the immutable per-run path.
+    """
+    prefix   = program_prefix(program)
+    bkt      = gcs().bucket(bucket_name)
+    run_path = _validation_run_path(prefix, run_id)
+
+    payload = {
+        "run_id":           run_id,
+        "author":           author or "system",
+        "timestamp":        datetime.now(timezone.utc).isoformat(),
+        "therapeutic_area": program.therapeutic_area,
+        "disease_type":     program.disease_type,
+        "drug_name":        program.drug_name,
+        "section_keys":     section_keys,
+        "passed":           validation.passed,
+        "summary":          validation.summary,
+        "issues": [
+            {
+                "severity":    iss.severity,
+                "section_key": iss.section_key,
+                "message":     iss.message,
+            }
+            for iss in validation.issues
+        ],
+    }
+
+    body = json.dumps(payload, indent=2)
+    bkt.blob(run_path).upload_from_string(body, content_type="application/json")
+    bkt.blob(_validation_latest_path(prefix)).upload_from_string(
+        body, content_type="application/json",
+    )
+
+    emit_validation_persisted(
+        run_id=run_id,
+        author=author or "system",
+        therapeutic_area=program.therapeutic_area,
+        disease_type=program.disease_type,
+        drug_name=program.drug_name,
+        gcs_path=run_path,
+        validation_passed=validation.passed,
+        validation_issue_count=len(validation.issues),
+    )
+    logger.info(
+        "[storage] Validation report saved gs://%s/%s (passed=%s issues=%d)",
+        bucket_name, run_path, validation.passed, len(validation.issues),
+    )
+    return run_path
+
+
+def save_publish_status(
+    bucket_name: str,
+    program: ProgramInfo,
+    documents: list[SectionDocument],
+    validation: ValidationResult,
+    validation_gcs_path: str,
+    run_id: str,
+    author: str,
+) -> dict[str, dict]:
+    """Write a publish_status.json sidecar per section based on validator output.
+
+    Rules for the demo publish gate:
+      - A section is `approved=False` (blocked) if:
+          * the overall validation failed AND the section has any error issue, OR
+          * the section has any ``severity=="error"`` issue.
+      - A section is `approved=True` otherwise (warnings/info allowed).
+      - Approval-by-human (A6) later flips `approved=True` via /approve endpoint
+        only when ``reviewer_approved`` is present and approver != author.
+
+    Returns a dict ``{section_key: publish_status_dict}``.
+    """
+    prefix = program_prefix(program)
+    bkt    = gcs().bucket(bucket_name)
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    # Group issues by section for per-section reasoning
+    issues_by_section: dict[str, list[dict]] = {}
+    for iss in validation.issues:
+        issues_by_section.setdefault(iss.section_key, []).append({
+            "severity":    iss.severity,
+            "message":     iss.message,
+        })
+
+    results: dict[str, dict] = {}
+    for doc in documents:
+        section_issues = issues_by_section.get(doc.section_key, [])
+        has_error = any(i["severity"] == "error" for i in section_issues)
+        approved  = (validation.passed or not has_error) and not has_error
+        blocked_reason = ""
+        if not approved:
+            error_msgs = [i["message"] for i in section_issues if i["severity"] == "error"]
+            blocked_reason = "; ".join(error_msgs[:3]) or "validator reported errors"
+
+        status = {
+            "run_id":                run_id,
+            "author":                author or "system",
+            "timestamp":             now_iso,
+            "module_key":            doc.module_key,
+            "section_key":           doc.section_key,
+            "gcs_path":              doc.gcs_path,
+            "validation_gcs_path":   validation_gcs_path,
+            "validation_passed":     validation.passed,
+            "section_issues":        section_issues,
+            "publish_approved":      approved,
+            "publish_blocked_reason": blocked_reason,
+            # Human approval (A6): filled by /approve endpoint
+            "human_approved":        False,
+            "approver":              "",
+            "approved_at":           "",
+            "approval_reason":       "",
+        }
+        status_path = _publish_status_path(prefix, doc.module_key, doc.section_key)
+        bkt.blob(status_path).upload_from_string(
+            json.dumps(status, indent=2),
+            content_type="application/json",
+        )
+        emit_publish_status(
+            run_id=run_id,
+            author=author or "system",
+            therapeutic_area=program.therapeutic_area,
+            disease_type=program.disease_type,
+            drug_name=program.drug_name,
+            module_key=doc.module_key,
+            section_key=doc.section_key,
+            gcs_path=doc.gcs_path,
+            publish_approved=approved,
+            publish_blocked_reason=blocked_reason,
+        )
+        results[doc.section_key] = status
+        logger.info(
+            "[storage] Publish status %s: %s (reason=%s)",
+            doc.section_key,
+            "APPROVED" if approved else "BLOCKED",
+            blocked_reason or "-",
+        )
+    return results
+
+
+def load_publish_status(
+    bucket_name: str,
+    program: ProgramInfo,
+    module_key: str,
+    section_key: str,
+) -> dict | None:
+    """Return the publish_status.json dict for a section, or None if missing."""
+    prefix = program_prefix(program)
+    bkt    = gcs().bucket(bucket_name)
+    blob   = bkt.blob(_publish_status_path(prefix, module_key, section_key))
+    try:
+        if not blob.exists():
+            return None
+        return json.loads(blob.download_as_text())
+    except Exception as exc:
+        logger.warning("[storage] Could not load publish_status for %s: %s", section_key, exc)
+        return None
+
+
+def record_section_approval(
+    bucket_name: str,
+    program: ProgramInfo,
+    module_key: str,
+    section_key: str,
+    approver: str,
+    approval_reason: str,
+    run_id: str,
+) -> dict:
+    """Human approval (A6) — flips ``human_approved=True`` on publish_status.
+
+    Enforces segregation of duties: approver must differ from ``author``
+    of the latest publish_status.  Also writes an immutable audit record
+    to ``approvals/{timestamp}_{section_key}_{approver}.json``.
+
+    Raises ``ValueError`` on self-approval or when no publish_status exists.
+    """
+    prefix = program_prefix(program)
+    bkt    = gcs().bucket(bucket_name)
+
+    status = load_publish_status(bucket_name, program, module_key, section_key)
+    if status is None:
+        raise ValueError(
+            f"No publish_status for {module_key}/{section_key} — "
+            "must run /write with a validator before approval."
+        )
+
+    author = (status.get("author") or "").strip().lower()
+    if not approver or not approver.strip():
+        raise ValueError("approver email is required.")
+    if approver.strip().lower() == author:
+        raise ValueError(
+            f"Self-approval blocked: approver '{approver}' is the same as author."
+        )
+    if not status.get("publish_approved", False):
+        raise ValueError(
+            f"Section is publish-blocked by validator "
+            f"(reason: {status.get('publish_blocked_reason', 'unknown')}). "
+            "Re-run /write to fix errors before approving."
+        )
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    status["human_approved"]  = True
+    status["approver"]        = approver
+    status["approved_at"]     = now_iso
+    status["approval_reason"] = approval_reason
+
+    # Overwrite sidecar
+    bkt.blob(_publish_status_path(prefix, module_key, section_key)).upload_from_string(
+        json.dumps(status, indent=2),
+        content_type="application/json",
+    )
+
+    # Immutable witnessed approval record
+    approval_blob_name = (
+        f"{prefix}/approvals/{now_iso.replace(':', '-')}_{section_key}_{approver.replace('@', '_at_')}.json"
+    )
+    bkt.blob(approval_blob_name).upload_from_string(
+        json.dumps({
+            "run_id":          run_id or status.get("run_id", ""),
+            "author":          status.get("author", ""),
+            "approver":        approver,
+            "approved_at":     now_iso,
+            "module_key":      module_key,
+            "section_key":     section_key,
+            "gcs_path":        status.get("gcs_path", ""),
+            "approval_reason": approval_reason,
+            "validation_gcs_path": status.get("validation_gcs_path", ""),
+        }, indent=2),
+        content_type="application/json",
+    )
+
+    emit_section_approved(
+        run_id=run_id or status.get("run_id", ""),
+        author=status.get("author", "system"),
+        approver=approver,
+        therapeutic_area=program.therapeutic_area,
+        disease_type=program.disease_type,
+        drug_name=program.drug_name,
+        module_key=module_key,
+        section_key=section_key,
+        gcs_path=status.get("gcs_path", ""),
+        approval_reason=approval_reason,
+    )
+    logger.info(
+        "[storage] Section approved %s/%s by %s (author=%s)",
+        module_key, section_key, approver, status.get("author", "system"),
+    )
+    return status
