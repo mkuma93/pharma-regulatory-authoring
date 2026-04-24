@@ -40,6 +40,13 @@ from fastapi import FastAPI, Request
 from google.cloud import storage
 from pydantic import BaseModel
 
+try:
+    from bq_audit import emit_generation_run, emit_generation_start, emit_validation_issue  # noqa: F401
+except ImportError:
+    def emit_generation_run(**_): pass    # noqa: E704
+    def emit_generation_start(**_): pass  # noqa: E704
+    def emit_validation_issue(**_): pass  # noqa: E704
+
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(name)s  %(message)s")
 
@@ -131,6 +138,8 @@ class SchemaPatchRequest(BaseModel):
     drug_name: str
     bucket: str
     run_validator: bool = False
+    author: str = ""
+    run_id: str = ""
 
 
 @app.post("/schema-patch")
@@ -149,6 +158,8 @@ async def schema_patch(request: SchemaPatchRequest):
     dis  = request.disease_type
     drug = request.drug_name
     bucket = request.bucket
+    author = request.author
+    run_id = request.run_id
 
     if not _CLINICAL_ANALYST_URL:
         return {"status": "skipped", "reason": "CLINICAL_ANALYST_URL not configured"}
@@ -214,6 +225,8 @@ async def schema_patch(request: SchemaPatchRequest):
                     "drug_name":        drug,
                     "bucket":           bucket,
                     "placeholder_keys": changed_keys,
+                    "author":           author,
+                    "run_id":           run_id,
                 },
                 headers=_oidc_headers(analyst_aud),
             )
@@ -244,6 +257,8 @@ async def schema_patch(request: SchemaPatchRequest):
                         "drug_name":        drug,
                     },
                     "bucket_name":     bucket,
+                    "run_id":          run_id,
+                    "author":          author,
                     "sections":        affected_sections,
                     "changed_keys":    changed_keys,
                     "resolved_values": resolved_values,
@@ -291,6 +306,7 @@ async def generate(request: Request):
     bucket     = msg.get("bucket", "")
     session_id = msg.get("session_id", "default")
     run_id     = msg.get("run_id", "")
+    author     = msg.get("author", "")   # IAP user email, set by UI on trigger
     program    = msg.get("program", {})
 
     ta   = program.get("therapeutic_area", "")
@@ -317,6 +333,14 @@ async def generate(request: Request):
     _write_status(bucket, status_path, {
         "status": "running", "run_id": run_id, "step": "starting",
     })
+    emit_generation_start(
+        run_id=run_id,
+        author=author or "system",
+        therapeutic_area=ta,
+        disease_type=dis,
+        drug_name=drug,
+        session_id=session_id,
+    )
     logger.info("[worker] Content generation started  %s/%s/%s  session=%s", ta, dis, drug, session_id)
 
     # ── ICH M4E(R2) evidence-ordered generation ───────────────────────────────
@@ -404,6 +428,13 @@ async def generate(request: Request):
                         "status": "failed", "run_id": run_id, "error": detail,
                     })
                     if r.status_code < 500:
+                        emit_generation_run(
+                            run_id=run_id, author=author or "system",
+                            therapeutic_area=ta, disease_type=dis, drug_name=drug,
+                            sections_written=all_sections_written,
+                            sections_failed=all_sections_failed,
+                            validation_passed=False, validation_issue_count=0,
+                        )
                         return {"status": "failed", "reason": detail}
                     raise httpx.HTTPStatusError(detail, request=r.request, response=r)
 
@@ -428,6 +459,13 @@ async def generate(request: Request):
                     "run_id": run_id,
                     "error":  detail,
                 })
+                emit_generation_run(
+                    run_id=run_id, author=author or "system",
+                    therapeutic_area=ta, disease_type=dis, drug_name=drug,
+                    sections_written=all_sections_written,
+                    sections_failed=all_sections_failed,
+                    validation_passed=False, validation_issue_count=0,
+                )
                 return {"status": "failed", "reason": detail}
 
             # ── Step B: Save templates to GCS ────────────────────────────────
@@ -470,6 +508,8 @@ async def generate(request: Request):
                         "sections":        section_keys,
                         "run_validator":   pass_idx == total_passes - 1,
                         "resolved_values": resolved_values,
+                        "run_id":          run_id,
+                        "author":          author,
                     },
                     headers=_oidc_headers(writer_aud),
                 )
@@ -482,6 +522,13 @@ async def generate(request: Request):
                         "status": "failed", "run_id": run_id, "error": detail,
                     })
                     if r.status_code < 500:
+                        emit_generation_run(
+                            run_id=run_id, author=author or "system",
+                            therapeutic_area=ta, disease_type=dis, drug_name=drug,
+                            sections_written=all_sections_written,
+                            sections_failed=all_sections_failed,
+                            validation_passed=False, validation_issue_count=0,
+                        )
                         return {"status": "failed", "reason": detail}
                     raise httpx.HTTPStatusError(detail, request=r.request, response=r)
 
@@ -541,6 +588,17 @@ async def generate(request: Request):
         _write_status(bucket, status_path, {
             "status": "failed", "run_id": run_id, "error": f"transient: {exc}",
         })
+        emit_generation_run(
+            run_id=run_id,
+            author=author or "system",
+            therapeutic_area=ta,
+            disease_type=dis,
+            drug_name=drug,
+            sections_written=all_sections_written,
+            sections_failed=all_sections_failed,
+            validation_passed=False,
+            validation_issue_count=0,
+        )
         raise  # 5xx → Pub/Sub retries
 
     except Exception as exc:
@@ -548,9 +606,83 @@ async def generate(request: Request):
             _write_status(bucket, status_path, {
                 "status": "failed", "run_id": run_id, "error": str(exc),
             })
+            emit_generation_run(
+                run_id=run_id,
+                author=author or "system",
+                therapeutic_area=ta,
+                disease_type=dis,
+                drug_name=drug,
+                sections_written=all_sections_written,
+                sections_failed=all_sections_failed,
+                validation_passed=False,
+                validation_issue_count=0,
+            )
             logger.error("[worker] Unexpected error: %s", exc, exc_info=True)
             return {"status": "failed", "reason": str(exc)}
+        # HTTPStatusError (5xx) bubbled up from inner pass loop — emit audit
+        # event before re-raising so Pub/Sub retry is still traceable.
+        emit_generation_run(
+            run_id=run_id,
+            author=author or "system",
+            therapeutic_area=ta,
+            disease_type=dis,
+            drug_name=drug,
+            sections_written=all_sections_written,
+            sections_failed=all_sections_failed,
+            validation_passed=False,
+            validation_issue_count=0,
+        )
         raise
+
+    # ── Save full validation report to GCS (non-fatal) ───────────────────────
+    prefix = _program_prefix(ta, dis, drug)
+    validation_report_path = f"{prefix}/content_status/{session_id}_validation.json"
+    validation_latest_path = f"{prefix}/content_status/validation_report.json"
+    try:
+        report_payload = json.dumps({
+            "run_id":          run_id,
+            "author":          author or "system",
+            "generated_at":    datetime.now(timezone.utc).isoformat(),
+            "passed":          final_validation.get("passed", False),
+            "summary":         final_validation.get("summary", ""),
+            "sections_written": all_sections_written,
+            "sections_failed": all_sections_failed,
+            "issues":          final_validation.get("issues", []),
+        }, indent=2)
+        _gcs_client.bucket(bucket).blob(validation_report_path).upload_from_string(
+            report_payload, content_type="application/json"
+        )
+        _gcs_client.bucket(bucket).blob(validation_latest_path).upload_from_string(
+            report_payload, content_type="application/json"
+        )
+        logger.info("[worker] Saved validation report to gs://%s/%s", bucket, validation_latest_path)
+    except Exception as exc:
+        logger.warning("[worker] Validation report save failed (non-fatal): %s", exc)
+
+    # ── Emit audit events ─────────────────────────────────────────────────────
+    issues = final_validation.get("issues", [])
+    emit_generation_run(
+        run_id=run_id,
+        author=author or "system",
+        therapeutic_area=ta,
+        disease_type=dis,
+        drug_name=drug,
+        sections_written=all_sections_written,
+        sections_failed=all_sections_failed,
+        validation_passed=bool(final_validation.get("passed", False)),
+        validation_issue_count=len(issues),
+    )
+    for issue in issues:
+        emit_validation_issue(
+            run_id=run_id,
+            author=author or "system",
+            therapeutic_area=ta,
+            disease_type=dis,
+            drug_name=drug,
+            section_key=issue.get("section_key", ""),
+            severity=issue.get("severity", ""),
+            issue_message=issue.get("message", ""),
+        )
 
     # ── Write final done status ───────────────────────────────────────────────
     _write_status(bucket, status_path, {
@@ -560,6 +692,7 @@ async def generate(request: Request):
         "sections_failed":    all_sections_failed,
         "validation_passed":  final_validation.get("passed", False),
         "validation_summary": final_validation.get("summary", ""),
+        "validation_report_path": f"gs://{bucket}/{validation_latest_path}",
     })
     logger.info(
         "[worker] Generation complete  written=%d  validation_passed=%s",

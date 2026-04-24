@@ -9,9 +9,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy service code
 COPY clinical-analyst/app.py app.py
+COPY system/bq_audit.py      bq_audit.py
+COPY system/iap_identity.py  iap_identity.py
 
-ENV PORT=8084
-
-EXPOSE 8084
+# PORT is injected by Cloud Run at runtime; 8080 is the default.
+# Do NOT hardcode a fixed PORT here — Cloud Run picks the port.
+EXPOSE 8080
 
 CMD ["python", "app.py"]

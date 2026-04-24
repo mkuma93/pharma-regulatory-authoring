@@ -38,11 +38,23 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 import pandas as pd
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from google.cloud import pubsub_v1, storage
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
+
+try:
+    from bq_audit import emit_function_registered, emit_placeholder_resolved  # noqa: F401
+except ImportError:
+    def emit_function_registered(**_): pass   # noqa: E704
+    def emit_placeholder_resolved(**_): pass  # noqa: E704
+
+try:
+    from iap_identity import resolve_author  # injected via Dockerfile COPY
+except ImportError:  # pragma: no cover — local dev fallback
+    def resolve_author(body_author: str, headers) -> str:  # noqa: E704
+        return (body_author or "").strip()
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(name)s  %(message)s")
 logger = logging.getLogger(__name__)
@@ -110,6 +122,8 @@ class ResolveRequest(BaseModel):
         default_factory=list,
         description="Keys to resolve. Empty = resolve all keys found in manifest.",
     )
+    author: str = Field(default="", description="IAP user who triggered this run.")
+    run_id: str = Field(default="", description="Content-generation run identifier.")
 
 
 class ResolveResponse(BaseModel):
@@ -306,7 +320,50 @@ def _load_extensions(bucket: str) -> None:
         logger.warning("[ext] Failed to load extension module: %s", exc)
 
 
-def _persist_extension(fn_name: str, comp_type: str, fn_code: str, bucket: str) -> None:
+_FUNCTION_MANIFEST_PATH = "system/function_manifest.json"
+
+
+def _update_function_manifest(
+    bucket: str, comp_type: str, fn_name: str,
+    author: str = "", run_id: str = "",
+) -> None:
+    """Upsert an entry in the function manifest (comp_type → metadata)."""
+    try:
+        mblob   = _gcs_client().bucket(bucket).blob(_FUNCTION_MANIFEST_PATH)
+        manifest: dict[str, dict] = (
+            json.loads(mblob.download_as_text()) if mblob.exists() else {}
+        )
+        now = datetime.now(timezone.utc).isoformat()
+        if comp_type not in manifest:
+            # First time this comp_type is created
+            manifest[comp_type] = {
+                "fn_name":      fn_name,
+                "created_at":   now,
+                "created_by":   author or "system",
+                "run_id":       run_id,
+                "source":       "clinical-analyst/resolve",
+                "version":      1,
+            }
+        else:
+            # Subsequent regeneration: bump version, record who overwrote it
+            manifest[comp_type]["version"]     = manifest[comp_type].get("version", 1) + 1
+            manifest[comp_type]["updated_at"]  = now
+            manifest[comp_type]["updated_by"]  = author or "system"
+            manifest[comp_type]["fn_name"]      = fn_name
+        mblob.upload_from_string(
+            json.dumps(manifest, indent=2), content_type="application/json"
+        )
+        logger.info("[ext] function_manifest updated for '%s' (v%s)",
+                    comp_type, manifest[comp_type]["version"])
+    except Exception as exc:
+        logger.warning("[ext] function_manifest update failed for '%s': %s", comp_type, exc)
+
+
+def _persist_extension(
+    fn_name: str, comp_type: str, fn_code: str, bucket: str,
+    author: str = "", run_id: str = "",
+    codegen_messages: list[dict] | None = None,
+) -> None:
     """Append a new function to the GCS extension module and hot-register it."""
     with _EXT_MODULE_LOCK:
         try:
@@ -323,6 +380,30 @@ def _persist_extension(fn_name: str, comp_type: str, fn_code: str, bucket: str) 
         except Exception as exc:
             logger.warning("[ext] GCS persist failed for '%s': %s", comp_type, exc)
             return
+
+    _update_function_manifest(bucket, comp_type, fn_name, author=author, run_id=run_id)
+    emit_function_registered(run_id=run_id, author=author, comp_type=comp_type, fn_name=fn_name)
+
+    # Archive the codegen prompt alongside the function
+    if codegen_messages:
+        try:
+            prompt_blob = _gcs_client().bucket(bucket).blob(
+                f"system/prompts/{comp_type}_codegen.json"
+            )
+            prompt_blob.upload_from_string(
+                json.dumps({
+                    "comp_type":    comp_type,
+                    "fn_name":      fn_name,
+                    "generated_at": datetime.now(timezone.utc).isoformat(),
+                    "author":       author or "system",
+                    "run_id":       run_id,
+                    "messages":     codegen_messages,
+                }, indent=2),
+                content_type="application/json",
+            )
+            logger.info("[ext] Saved codegen prompt for '%s'", comp_type)
+        except Exception as exc:
+            logger.warning("[ext] Codegen prompt save failed for '%s': %s", comp_type, exc)
 
     # Hot-register in memory
     ns: dict = {"pd": pd}
@@ -399,26 +480,33 @@ def _generate_extension_code(
     step: dict,
     schema: list[dict],
     llm: ChatOpenAI,
-) -> str | None:
-    """Ask LLM to write a new executor function. Returns source code or None."""
+) -> tuple[str | None, list[dict]]:
+    """Ask LLM to write a new executor function.
+
+    Returns (source_code_or_None, serialised_messages) so callers can
+    archive the prompt that produced the function.
+    """
     comp_type = step.get("computation", "")
     fn_name   = _derive_fn_name(comp_type)
     step_fields = ", ".join(f'"{k}"' for k in step if k != "data_json")
 
+    messages = [
+        SystemMessage(content=_CODEGEN_SYSTEM.format(fn_name=fn_name)),
+        HumanMessage(content=_CODEGEN_USER.format(
+            suggestion=suggestion,
+            schema_json=json.dumps(schema, indent=2),
+            step_fields=step_fields,
+            fn_name=fn_name,
+        )),
+    ]
+    serialised = [{"role": m.type, "content": m.content} for m in messages]
+
     try:
-        response = llm.invoke([
-            SystemMessage(content=_CODEGEN_SYSTEM.format(fn_name=fn_name)),
-            HumanMessage(content=_CODEGEN_USER.format(
-                suggestion=suggestion,
-                schema_json=json.dumps(schema, indent=2),
-                step_fields=step_fields,
-                fn_name=fn_name,
-            )),
-        ])
-        return str(response.content).strip()
+        response = llm.invoke(messages)
+        return str(response.content).strip(), serialised
     except Exception as exc:
         logger.warning("[ext] Code generation failed: %s", exc)
-        return None
+        return None, serialised
 
 
 def _validate_extension_code(code: str, llm: ChatOpenAI) -> tuple[bool, str]:
@@ -569,20 +657,26 @@ def _plan_and_execute(
     placeholder_meta: dict[str, dict],
     llm: ChatOpenAI,
     bucket: str,
-) -> tuple[dict[str, str], dict[str, str]]:
+    author: str = "",
+    run_id: str = "",
+) -> tuple[dict[str, str], dict[str, str], dict[str, dict], list[dict]]:
     """LLM plans intent → executor runs it → range validator checks.
 
-    Returns (resolved, suggested).
+    Returns (resolved, suggested, provenance, planner_messages).
+    provenance: {key: {comp_type, fn_name, source}} — records which function
+    produced each resolved value so documents are fully traceable.
+    planner_messages: serialised system+user messages sent to the planner LLM,
+    for audit archiving alongside placeholder_provenance.json.
     """
     if df.empty or not placeholder_meta:
-        return {}, {}
+        return {}, {}, {}, []
 
     computable_meta = {
         k: v for k, v in placeholder_meta.items()
         if not any(k.lower().endswith(sfx) for sfx in _NARRATIVE_SUFFIXES)
     }
     if not computable_meta:
-        return {}, {}
+        return {}, {}, {}, []
 
     schema       = _build_schema(df)
     schema_json  = json.dumps(schema, indent=2)
@@ -590,16 +684,19 @@ def _plan_and_execute(
         f"  {k}: {v['description']}" for k, v in computable_meta.items()
     )
 
+    planner_messages = [
+        SystemMessage(content=_PLANNER_SYSTEM),
+        HumanMessage(content=_PLANNER_USER.format(
+            schema_json=schema_json, placeholder_list=placeholder_list,
+        )),
+    ]
+    serialised_planner = [{"role": m.type, "content": m.content} for m in planner_messages]
+
     try:
-        raw = str(llm.invoke([
-            SystemMessage(content=_PLANNER_SYSTEM),
-            HumanMessage(content=_PLANNER_USER.format(
-                schema_json=schema_json, placeholder_list=placeholder_list,
-            )),
-        ]).content).strip()
+        raw = str(llm.invoke(planner_messages).content).strip()
     except Exception as exc:
         logger.warning("[resolve] planner LLM failed: %s", exc)
-        return {}, {}
+        return {}, {}, {}, serialised_planner
 
     try:
         plan: list[dict] = json.loads(raw)
@@ -607,11 +704,12 @@ def _plan_and_execute(
             raise ValueError("not a list")
     except Exception as exc:
         logger.warning("[resolve] bad planner JSON: %s | raw: %s", exc, raw[:200])
-        return {}, {}
+        return {}, {}, {}, serialised_planner
 
     df_columns = set(df.columns)
     results:   dict[str, str] = {}
     suggested: dict[str, str] = {}
+    provenance: dict[str, dict] = {}  # key → {comp_type, fn_name, source}
 
     for step in plan:
         key = step.get("key", "")
@@ -642,11 +740,15 @@ def _plan_and_execute(
             comp_type  = re.sub(r"[^a-z0-9_]", "_", key.lower())
 
             if comp_type not in _COMPUTATION_MAP:
-                code = _generate_extension_code(suggestion, step, schema, llm)
+                code, codegen_msgs = _generate_extension_code(suggestion, step, schema, llm)
                 if code:
                     approved, reason = _validate_extension_code(code, llm)
                     if approved:
-                        _persist_extension(_derive_fn_name(comp_type), comp_type, code, bucket)
+                        _persist_extension(
+                            _derive_fn_name(comp_type), comp_type, code, bucket,
+                            author=author, run_id=run_id,
+                            codegen_messages=codegen_msgs,
+                        )
                     else:
                         logger.warning("[ext] Rejected '%s': %s", comp_type, reason)
                         # If validator says to use a builtin, reroute — but only for
@@ -716,13 +818,18 @@ def _plan_and_execute(
             continue
 
         results[key] = value
+        provenance[key] = {
+            "comp_type": step["computation"],
+            "fn_name":   _derive_fn_name(step["computation"]),
+            "source":    "builtin" if step["computation"] in _BUILTIN_COMPUTATIONS else "generated",
+        }
         logger.info("[resolve] %s → %s", key, value[:80])
 
     unresolved = [k for k in computable_meta if k not in results and k not in suggested]
     if unresolved:
         logger.warning("[resolve] %d unresolved: %s", len(unresolved), unresolved)
 
-    return results, suggested
+    return results, suggested, provenance, serialised_planner
 
 
 # ── GCS helpers ───────────────────────────────────────────────────────────────
@@ -959,7 +1066,7 @@ def health():
 
 
 @app.post("/resolve", response_model=ResolveResponse)
-def resolve(req: ResolveRequest) -> ResolveResponse:
+def resolve(req: ResolveRequest, http_request: Request) -> ResolveResponse:
     """Pre-compute all {{placeholder}} values for a program before writing.
 
     Reads the clinical manifest, dispatches LLM tool-calling once per CSV
@@ -972,6 +1079,9 @@ def resolve(req: ResolveRequest) -> ResolveResponse:
     bucket = req.bucket or _DEFAULT_BUCKET
     if not bucket:
         raise HTTPException(status_code=422, detail="bucket is required.")
+
+    # A2 — IAP identity fallback.
+    req.author = resolve_author(req.author, http_request.headers)
 
     prefix   = _program_prefix(req.therapeutic_area, req.disease_type, req.drug_name)
     manifest = _load_manifest(bucket, prefix)
@@ -1033,18 +1143,42 @@ def resolve(req: ResolveRequest) -> ResolveResponse:
     for pk, meta in placeholder_meta.items():
         file_groups.setdefault(meta["gcs_path"], {})[pk] = meta
 
-    llm_client   = _llm()
-    resolved:     dict[str, str] = {}
-    all_suggested: dict[str, str] = {}
+    llm_client    = _llm()
+    resolved:      dict[str, str]   = {}
+    all_suggested: dict[str, str]   = {}
+    all_provenance: dict[str, dict] = {}
+    all_planner_prompts: list[dict] = []  # one entry per CSV group
 
     for gcs_path, ph_meta in file_groups.items():
         df = _load_csv(bucket, gcs_path)
         if df is None or df.empty:
             logger.warning("[resolve] Skipping empty/missing CSV: %s", gcs_path)
             continue
-        comp, sugg = _plan_and_execute(df, ph_meta, llm_client, bucket)
+        comp, sugg, prov, planner_msgs = _plan_and_execute(
+            df, ph_meta, llm_client, bucket,
+            author=req.author, run_id=req.run_id,
+        )
         resolved.update(comp)
         all_suggested.update(sugg)
+        all_provenance.update(prov)
+        for key, prov_info in prov.items():
+            emit_placeholder_resolved(
+                run_id=req.run_id,
+                author=req.author,
+                therapeutic_area=req.therapeutic_area,
+                disease_type=req.disease_type,
+                drug_name=req.drug_name,
+                placeholder_key=key,
+                comp_type=prov_info.get("comp_type", ""),
+                fn_name=prov_info.get("fn_name", ""),
+                csv_source=gcs_path,
+                resolved_value=str(comp.get(key, "")),
+            )
+        if planner_msgs:
+            all_planner_prompts.append({
+                "csv_source": gcs_path,
+                "messages":   planner_msgs,
+            })
         logger.info(
             "[resolve] %s: resolved %d/%d keys, %d suggested",
             gcs_path, len(comp), len(ph_meta), len(sugg),
@@ -1063,6 +1197,49 @@ def resolve(req: ResolveRequest) -> ResolveResponse:
     except Exception as exc:
         logger.error("[resolve] GCS save failed: %s", exc)
         raise HTTPException(status_code=500, detail=f"Failed to save resolved values: {exc}") from exc
+
+    # Save provenance sidecar — records which function produced each value
+    provenance_path = f"{prefix}/analysis/placeholder_provenance.json"
+    try:
+        now = datetime.now(timezone.utc).isoformat()
+        provenance_doc = {
+            "run_id":    req.run_id,
+            "author":    req.author or "system",
+            "resolved_at": now,
+            "values": {
+                k: {
+                    "value":     resolved.get(k, ""),
+                    "comp_type": v.get("comp_type", ""),
+                    "fn_name":   v.get("fn_name", ""),
+                    "source":    v.get("source", ""),
+                }
+                for k, v in all_provenance.items()
+            },
+        }
+        _gcs_client().bucket(bucket).blob(provenance_path).upload_from_string(
+            json.dumps(provenance_doc, indent=2), content_type="application/json"
+        )
+        logger.info("[resolve] Saved provenance (%d keys) to gs://%s/%s",
+                    len(all_provenance), bucket, provenance_path)
+    except Exception as exc:
+        logger.warning("[resolve] Provenance save failed (non-fatal): %s", exc)
+
+    # Save the planner prompts used for this resolve run (one per CSV group)
+    if all_planner_prompts:
+        planner_prompt_path = f"{prefix}/analysis/planner_prompts.json"
+        try:
+            _gcs_client().bucket(bucket).blob(planner_prompt_path).upload_from_string(
+                json.dumps({
+                    "run_id":     req.run_id,
+                    "author":     req.author or "system",
+                    "saved_at":   datetime.now(timezone.utc).isoformat(),
+                    "groups":     all_planner_prompts,
+                }, indent=2),
+                content_type="application/json",
+            )
+            logger.info("[resolve] Saved planner prompts to gs://%s/%s", bucket, planner_prompt_path)
+        except Exception as exc:
+            logger.warning("[resolve] Planner prompt save failed (non-fatal): %s", exc)
 
     return ResolveResponse(
         resolved_values=resolved,
@@ -1120,6 +1297,10 @@ class TriggerRequest(BaseModel):
     therapeutic_area: str
     disease_type: str
     drug_name: str
+    author: str = Field(
+        default="",
+        description="IAP-authenticated user email — propagated to version manifest.",
+    )
     force_no_clinical: bool = Field(
         default=False,
         description="Proceed even when no clinical manifest is found.",
@@ -1134,7 +1315,7 @@ class ActionResponse(BaseModel):
 
 
 def _publish_content_generation(
-    bucket: str, ta: str, dis: str, drug: str, session_id: str
+    bucket: str, ta: str, dis: str, drug: str, session_id: str, author: str = ""
 ) -> str:
     run_id    = str(uuid.uuid4())
     publisher = pubsub_v1.PublisherClient()
@@ -1143,6 +1324,7 @@ def _publish_content_generation(
         "bucket":     bucket,
         "session_id": session_id,
         "run_id":     run_id,
+        "author":     author,
         "program": {
             "therapeutic_area": ta,
             "disease_type":     dis,
@@ -1210,7 +1392,7 @@ def _load_content_status(bucket: str, ta: str, dis: str, drug: str) -> dict:
 
 
 @app.post("/trigger", response_model=ActionResponse)
-def trigger(req: TriggerRequest) -> ActionResponse:
+def trigger(req: TriggerRequest, http_request: Request) -> ActionResponse:
     """Trigger CTD content generation for a drug program.
 
     1. If ``force_no_clinical`` is False, verifies clinical data is loaded.
@@ -1223,6 +1405,9 @@ def trigger(req: TriggerRequest) -> ActionResponse:
     bucket = (req.bucket or _DEFAULT_BUCKET).strip()
     if not bucket:
         raise HTTPException(status_code=422, detail="bucket is required.")
+
+    # A2 — IAP identity fallback.
+    req.author = resolve_author(req.author, http_request.headers)
 
     ta   = req.therapeutic_area.strip()
     dis  = req.disease_type.strip()
@@ -1270,7 +1455,7 @@ def trigger(req: TriggerRequest) -> ActionResponse:
         msg_prefix = "⚠️ Proceeding without clinical data — placeholders will appear as `[NOT FILLED]`.\n\n"
 
     try:
-        run_id = _publish_content_generation(bucket, ta, dis, drug, req.session_id)
+        run_id = _publish_content_generation(bucket, ta, dis, drug, req.session_id, req.author)
     except Exception as exc:
         logger.error("[trigger] Pub/Sub publish failed: %s", exc)
         raise HTTPException(status_code=500, detail=f"Failed to queue content job: {exc}") from exc

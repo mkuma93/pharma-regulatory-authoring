@@ -20,6 +20,11 @@ class SectionDocument(BaseModel):
     section_label: str
     content: str = Field(..., description="Final regulatory prose, no remaining {{placeholders}}")
     gcs_path: str = Field(default="", description="GCS path where this document was saved")
+    prompt_messages: list[dict] = Field(
+        default_factory=list,
+        description="Serialised LLM messages (system + user) that produced this document.",
+        exclude=True,  # not included in API response
+    )
 
 
 class ValidationIssue(BaseModel):
@@ -51,6 +56,14 @@ class WriterRequest(BaseModel):
             "Pre-computed placeholder values from clinical-analyst /resolve. "
             "Keys present here will not be re-dispatched to the hybrid analyst."
         ),
+    )
+    run_id: str = Field(
+        default="",
+        description="Content-generation run identifier — stored in version manifest.",
+    )
+    author: str = Field(
+        default="",
+        description="User who triggered the write, extracted from IAP header.",
     )
 
 

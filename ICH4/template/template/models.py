@@ -31,6 +31,11 @@ class SectionTemplate(BaseModel):
     section_key: str
     section_label: str
     content: str = Field(..., description="Full markdown template with {{placeholder}} syntax")
+    prompt_messages: list[dict] = Field(
+        default_factory=list,
+        description="Serialised LLM messages that produced this template.",
+        exclude=True,
+    )
 
     @property
     def gcs_path_suffix(self) -> str:

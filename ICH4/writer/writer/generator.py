@@ -26,40 +26,39 @@ authorities. Accuracy and evidence-grounding are mandatory.
 
 TASK
 ────
-Fill every {{placeholder}} in the template provided using ONLY the clinical evidence
-supplied in the "CLINICAL DATA FOR PLACEHOLDERS" section below.
+Fill every {{placeholder}} in the template provided. Generate complete, regulatory-quality
+prose for every placeholder. Leaving placeholders empty or unfilled is NOT acceptable.
 
-STRICT EVIDENCE RULES — THESE ARE NON-NEGOTIABLE
-─────────────────────────────────────────────────
-1. EVIDENCE-ONLY FIGURES
-   Every numeric value (N, %, mean, p-value, OR, CI, NNT, AE rate, etc.)
-   MUST come verbatim from the supplied clinical data.
-   ► If no clinical data supports a numeric placeholder → write:
+PLACEHOLDER TYPES AND RULES
+────────────────────────────
+There are TWO types of placeholders. Apply the correct rule for each:
+
+TYPE A — NARRATIVE / OVERVIEW / REPORT PLACEHOLDERS
+   These describe study designs, regulatory rationale, mechanism of action, background
+   context, overview summaries, PK/PD principles, safety profiles, benefit-risk
+   assessments, or section-level reports (e.g., biopharmaceutic_reports, safety_overview,
+   pk_studies_reports, efficacy_overview, benefit_risk_conclusions, etc.).
+   ► RULE A: ALWAYS generate appropriate, publication-quality regulatory prose for these
+     placeholders, informed by the drug class, indication, ICH guidelines, and any
+     clinical data provided. Do NOT write [DATA PENDING] for narrative placeholders.
+   ► Base the prose on established scientific/regulatory knowledge of the drug and indication.
+   ► You MUST produce substantive prose — 1 to 5 paragraphs as appropriate to the section.
+
+TYPE B — SPECIFIC NUMERIC / STATISTICAL VALUE PLACEHOLDERS
+   These require exact figures: patient counts (N), percentages, p-values, ORs, CIs,
+   NNTs, hazard ratios, AE rates, or any other specific quantitative result that
+   MUST come from an actual study.
+   ► RULE B: Use ONLY values from the "CLINICAL DATA FOR PLACEHOLDERS" section below.
+   ► If no clinical data supports a specific statistic → write:
        [DATA PENDING — {placeholder_key}: no source data supplied]
    ► NEVER invent, estimate, or extrapolate a number.
 
-2. NO-HALLUCINATION FOR SPECIFIC CLAIMS
-   Do NOT state that drug X produced a specific efficacy result, safety rate,
-   or demographic stat unless that exact value appears in the supplied data.
-   ► Unsupported specific claims are a regulatory integrity violation.
-
-3. REGULATORY CONTEXT PLACEHOLDERS
-   For placeholders describing regulatory process, pharmacology mechanism,
-   or study design rationale (not numeric outcomes), you MAY write concise
-   evidence-informed prose consistent with the drug class and indication.
-   ► Clearly distinguish mechanism/context prose from outcome data.
-   ► Avoid superlatives ("best-in-class", "superior", "revolutionary").
-
-4. NARRATIVE PLACEHOLDERS WITH PARTIAL DATA
-   If data is available for some — but not all — sub-points of a narrative
-   placeholder, write the data-supported sentences first, then append:
-       [DATA PENDING — remaining content: author to supply with study references]
-
-5. CROSS-REFERENCE REQUIREMENT
+CROSS-REFERENCE REQUIREMENT (both types)
+─────────────────────────────────────────
    For every efficacy or safety figure you include, append an inline source tag:
        (Source: {filename}, {column_name})
    where filename and column_name come from the supplied clinical data header.
-   If you cannot tag a figure with a source, it must be [DATA PENDING].
+   If you cannot tag a specific figure with a source, it must be [DATA PENDING].
 
 FORMATTING
 ──────────
@@ -230,10 +229,17 @@ def write_section(
             {k: f"[DATA PENDING — {k}: no source data supplied]" for k in remaining},
         )
 
+    # Serialise messages for audit archiving
+    serialised_messages = [
+        {"role": m.type, "content": m.content}
+        for m in messages
+    ]
+
     return SectionDocument(
         module_key=module_key,
         module_label=module_label,
         section_key=section_key,
         section_label=section_label,
         content=filled_content,
+        prompt_messages=serialised_messages,
     )
