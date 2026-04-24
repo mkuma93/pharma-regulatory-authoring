@@ -118,12 +118,29 @@ def save_document(
             next_version = len(manifest) + 1
             versioned_path = f"{vprefix}/v{next_version}.md"
             bkt.copy_blob(current_blob, bkt, versioned_path)
+
+            # Save the prompt that produced this version alongside the snapshot
+            prompt_path = ""
+            if doc.prompt_messages:
+                prompt_path = f"{vprefix}/v{next_version}_prompt.json"
+                bkt.blob(prompt_path).upload_from_string(
+                    json.dumps({
+                        "version":   next_version,
+                        "run_id":    run_id,
+                        "author":    author or "system",
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "messages":  doc.prompt_messages,
+                    }, indent=2),
+                    content_type="application/json",
+                )
+
             manifest.append({
-                "version":   next_version,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "run_id":    run_id,
-                "author":    author,
-                "gcs_path":  versioned_path,
+                "version":     next_version,
+                "timestamp":   datetime.now(timezone.utc).isoformat(),
+                "run_id":      run_id,
+                "author":      author,
+                "gcs_path":    versioned_path,
+                "prompt_path": prompt_path,
             })
             _save_version_manifest(bkt, vprefix, manifest)
             logger.info(

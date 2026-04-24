@@ -37,6 +37,19 @@ def save_templates(
         blob.upload_from_string(tmpl.content, content_type="text/markdown; charset=utf-8")
         paths.append(gcs_path)
 
+        # Save the prompt that generated this template alongside the .md
+        if tmpl.prompt_messages:
+            prompt_path = gcs_path[:-3] + "_prompt.json"  # e.g. module2/2.5_clinical_overview_prompt.json
+            bkt.blob(prompt_path).upload_from_string(
+                json.dumps({
+                    "section_key":  tmpl.section_key,
+                    "module_key":   tmpl.module_key,
+                    "generated_at": date.today().isoformat(),
+                    "messages":     tmpl.prompt_messages,
+                }, indent=2),
+                content_type="application/json",
+            )
+
     manifest = TemplateManifest(
         program=program,
         generated_date=date.today().isoformat(),

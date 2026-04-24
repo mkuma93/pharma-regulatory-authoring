@@ -653,6 +653,9 @@ def generate_program_templates(
             SystemMessage(content=_get_module_persona(module.key)),
             HumanMessage(content=prompt),
         ]
+        serialised_messages = [
+            {"role": m.type, "content": m.content} for m in messages
+        ]
 
         try:
             response = llm.invoke(messages)
@@ -681,6 +684,7 @@ def generate_program_templates(
                         section_key=item["section_key"],
                         section_label=item["section_label"],
                         content=content,
+                        prompt_messages=serialised_messages,
                     )
                 )
 

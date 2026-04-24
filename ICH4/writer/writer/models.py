@@ -20,6 +20,11 @@ class SectionDocument(BaseModel):
     section_label: str
     content: str = Field(..., description="Final regulatory prose, no remaining {{placeholders}}")
     gcs_path: str = Field(default="", description="GCS path where this document was saved")
+    prompt_messages: list[dict] = Field(
+        default_factory=list,
+        description="Serialised LLM messages (system + user) that produced this document.",
+        exclude=True,  # not included in API response
+    )
 
 
 class ValidationIssue(BaseModel):

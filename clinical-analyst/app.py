@@ -350,6 +350,7 @@ def _update_function_manifest(
 def _persist_extension(
     fn_name: str, comp_type: str, fn_code: str, bucket: str,
     author: str = "", run_id: str = "",
+    codegen_messages: list[dict] | None = None,
 ) -> None:
     """Append a new function to the GCS extension module and hot-register it."""
     with _EXT_MODULE_LOCK:
@@ -369,6 +370,27 @@ def _persist_extension(
             return
 
     _update_function_manifest(bucket, comp_type, fn_name, author=author, run_id=run_id)
+
+    # Archive the codegen prompt alongside the function
+    if codegen_messages:
+        try:
+            prompt_blob = _gcs_client().bucket(bucket).blob(
+                f"system/prompts/{comp_type}_codegen.json"
+            )
+            prompt_blob.upload_from_string(
+                json.dumps({
+                    "comp_type":    comp_type,
+                    "fn_name":      fn_name,
+                    "generated_at": datetime.now(timezone.utc).isoformat(),
+                    "author":       author or "system",
+                    "run_id":       run_id,
+                    "messages":     codegen_messages,
+                }, indent=2),
+                content_type="application/json",
+            )
+            logger.info("[ext] Saved codegen prompt for '%s'", comp_type)
+        except Exception as exc:
+            logger.warning("[ext] Codegen prompt save failed for '%s': %s", comp_type, exc)
 
     # Hot-register in memory
     ns: dict = {"pd": pd}
@@ -445,26 +467,33 @@ def _generate_extension_code(
     step: dict,
     schema: list[dict],
     llm: ChatOpenAI,
-) -> str | None:
-    """Ask LLM to write a new executor function. Returns source code or None."""
+) -> tuple[str | None, list[dict]]:
+    """Ask LLM to write a new executor function.
+
+    Returns (source_code_or_None, serialised_messages) so callers can
+    archive the prompt that produced the function.
+    """
     comp_type = step.get("computation", "")
     fn_name   = _derive_fn_name(comp_type)
     step_fields = ", ".join(f'"{k}"' for k in step if k != "data_json")
 
+    messages = [
+        SystemMessage(content=_CODEGEN_SYSTEM.format(fn_name=fn_name)),
+        HumanMessage(content=_CODEGEN_USER.format(
+            suggestion=suggestion,
+            schema_json=json.dumps(schema, indent=2),
+            step_fields=step_fields,
+            fn_name=fn_name,
+        )),
+    ]
+    serialised = [{"role": m.type, "content": m.content} for m in messages]
+
     try:
-        response = llm.invoke([
-            SystemMessage(content=_CODEGEN_SYSTEM.format(fn_name=fn_name)),
-            HumanMessage(content=_CODEGEN_USER.format(
-                suggestion=suggestion,
-                schema_json=json.dumps(schema, indent=2),
-                step_fields=step_fields,
-                fn_name=fn_name,
-            )),
-        ])
-        return str(response.content).strip()
+        response = llm.invoke(messages)
+        return str(response.content).strip(), serialised
     except Exception as exc:
         logger.warning("[ext] Code generation failed: %s", exc)
-        return None
+        return None, serialised
 
 
 def _validate_extension_code(code: str, llm: ChatOpenAI) -> tuple[bool, str]:
@@ -617,22 +646,24 @@ def _plan_and_execute(
     bucket: str,
     author: str = "",
     run_id: str = "",
-) -> tuple[dict[str, str], dict[str, str], dict[str, dict]]:
+) -> tuple[dict[str, str], dict[str, str], dict[str, dict], list[dict]]:
     """LLM plans intent → executor runs it → range validator checks.
 
-    Returns (resolved, suggested, provenance).
+    Returns (resolved, suggested, provenance, planner_messages).
     provenance: {key: {comp_type, fn_name, source}} — records which function
     produced each resolved value so documents are fully traceable.
+    planner_messages: serialised system+user messages sent to the planner LLM,
+    for audit archiving alongside placeholder_provenance.json.
     """
     if df.empty or not placeholder_meta:
-        return {}, {}, {}
+        return {}, {}, {}, []
 
     computable_meta = {
         k: v for k, v in placeholder_meta.items()
         if not any(k.lower().endswith(sfx) for sfx in _NARRATIVE_SUFFIXES)
     }
     if not computable_meta:
-        return {}, {}, {}
+        return {}, {}, {}, []
 
     schema       = _build_schema(df)
     schema_json  = json.dumps(schema, indent=2)
@@ -640,16 +671,19 @@ def _plan_and_execute(
         f"  {k}: {v['description']}" for k, v in computable_meta.items()
     )
 
+    planner_messages = [
+        SystemMessage(content=_PLANNER_SYSTEM),
+        HumanMessage(content=_PLANNER_USER.format(
+            schema_json=schema_json, placeholder_list=placeholder_list,
+        )),
+    ]
+    serialised_planner = [{"role": m.type, "content": m.content} for m in planner_messages]
+
     try:
-        raw = str(llm.invoke([
-            SystemMessage(content=_PLANNER_SYSTEM),
-            HumanMessage(content=_PLANNER_USER.format(
-                schema_json=schema_json, placeholder_list=placeholder_list,
-            )),
-        ]).content).strip()
+        raw = str(llm.invoke(planner_messages).content).strip()
     except Exception as exc:
         logger.warning("[resolve] planner LLM failed: %s", exc)
-        return {}, {}
+        return {}, {}, {}, serialised_planner
 
     try:
         plan: list[dict] = json.loads(raw)
@@ -657,7 +691,7 @@ def _plan_and_execute(
             raise ValueError("not a list")
     except Exception as exc:
         logger.warning("[resolve] bad planner JSON: %s | raw: %s", exc, raw[:200])
-        return {}, {}
+        return {}, {}, {}, serialised_planner
 
     df_columns = set(df.columns)
     results:   dict[str, str] = {}
@@ -693,13 +727,14 @@ def _plan_and_execute(
             comp_type  = re.sub(r"[^a-z0-9_]", "_", key.lower())
 
             if comp_type not in _COMPUTATION_MAP:
-                code = _generate_extension_code(suggestion, step, schema, llm)
+                code, codegen_msgs = _generate_extension_code(suggestion, step, schema, llm)
                 if code:
                     approved, reason = _validate_extension_code(code, llm)
                     if approved:
                         _persist_extension(
                             _derive_fn_name(comp_type), comp_type, code, bucket,
                             author=author, run_id=run_id,
+                            codegen_messages=codegen_msgs,
                         )
                     else:
                         logger.warning("[ext] Rejected '%s': %s", comp_type, reason)
@@ -781,7 +816,7 @@ def _plan_and_execute(
     if unresolved:
         logger.warning("[resolve] %d unresolved: %s", len(unresolved), unresolved)
 
-    return results, suggested, provenance
+    return results, suggested, provenance, serialised_planner
 
 
 # ── GCS helpers ───────────────────────────────────────────────────────────────
@@ -1093,22 +1128,28 @@ def resolve(req: ResolveRequest) -> ResolveResponse:
         file_groups.setdefault(meta["gcs_path"], {})[pk] = meta
 
     llm_client    = _llm()
-    resolved:      dict[str, str]  = {}
-    all_suggested: dict[str, str]  = {}
+    resolved:      dict[str, str]   = {}
+    all_suggested: dict[str, str]   = {}
     all_provenance: dict[str, dict] = {}
+    all_planner_prompts: list[dict] = []  # one entry per CSV group
 
     for gcs_path, ph_meta in file_groups.items():
         df = _load_csv(bucket, gcs_path)
         if df is None or df.empty:
             logger.warning("[resolve] Skipping empty/missing CSV: %s", gcs_path)
             continue
-        comp, sugg, prov = _plan_and_execute(
+        comp, sugg, prov, planner_msgs = _plan_and_execute(
             df, ph_meta, llm_client, bucket,
             author=req.author, run_id=req.run_id,
         )
         resolved.update(comp)
         all_suggested.update(sugg)
         all_provenance.update(prov)
+        if planner_msgs:
+            all_planner_prompts.append({
+                "csv_source": gcs_path,
+                "messages":   planner_msgs,
+            })
         logger.info(
             "[resolve] %s: resolved %d/%d keys, %d suggested",
             gcs_path, len(comp), len(ph_meta), len(sugg),
@@ -1153,6 +1194,23 @@ def resolve(req: ResolveRequest) -> ResolveResponse:
                     len(all_provenance), bucket, provenance_path)
     except Exception as exc:
         logger.warning("[resolve] Provenance save failed (non-fatal): %s", exc)
+
+    # Save the planner prompts used for this resolve run (one per CSV group)
+    if all_planner_prompts:
+        planner_prompt_path = f"{prefix}/analysis/planner_prompts.json"
+        try:
+            _gcs_client().bucket(bucket).blob(planner_prompt_path).upload_from_string(
+                json.dumps({
+                    "run_id":     req.run_id,
+                    "author":     req.author or "system",
+                    "saved_at":   datetime.now(timezone.utc).isoformat(),
+                    "groups":     all_planner_prompts,
+                }, indent=2),
+                content_type="application/json",
+            )
+            logger.info("[resolve] Saved planner prompts to gs://%s/%s", bucket, planner_prompt_path)
+        except Exception as exc:
+            logger.warning("[resolve] Planner prompt save failed (non-fatal): %s", exc)
 
     return ResolveResponse(
         resolved_values=resolved,

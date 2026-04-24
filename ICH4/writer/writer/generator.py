@@ -229,10 +229,17 @@ def write_section(
             {k: f"[DATA PENDING — {k}: no source data supplied]" for k in remaining},
         )
 
+    # Serialise messages for audit archiving
+    serialised_messages = [
+        {"role": m.type, "content": m.content}
+        for m in messages
+    ]
+
     return SectionDocument(
         module_key=module_key,
         module_label=module_label,
         section_key=section_key,
         section_label=section_label,
         content=filled_content,
+        prompt_messages=serialised_messages,
     )
