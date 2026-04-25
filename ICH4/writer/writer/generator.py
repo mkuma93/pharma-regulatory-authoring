@@ -87,7 +87,7 @@ REMINDER:
   The statistics are your source — do NOT write [DATA PENDING] for narrative placeholders.
 • TYPE B (specific numeric values — percentages, p-values, patient counts, CIs):
   Use ONLY exact figures from the "CLINICAL DATA" section above, with source tag.
-  If a specific statistic has no source data: [DATA PENDING — {placeholder_key}: no source data supplied]
+  If a specific statistic has no source data: [DATA PENDING — {{placeholder_key}}: no source data supplied]
 ─────────────────────────────────────────────────────────────────────────────────
 """
 

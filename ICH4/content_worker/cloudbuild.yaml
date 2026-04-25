@@ -52,7 +52,7 @@ steps:
       - -t
       - "$_REGION-docker.pkg.dev/$_PROJECT_ID/$_AR_REPO/$_WORKER_NAME:$_TAG"
       - -f
-      - ICH4/content_worker/Dockerfile
+      - Dockerfile
       - .
 
   # 4. Push image
