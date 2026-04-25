@@ -1,5 +1,302 @@
 # pharma-regulatory-authoring
 
+LLM-powered platform for **ICH M4(R4) CTD** regulatory authoring. Automates folder structure generation, clinical data integration, section content writing, cross-module validation, and a 3-gate approval workflow — all through a single Gradio chat interface backed by Cloud Run microservices.
+
+**Live demo** → [`https://reguatory-ui-pro-74ugcbbbya-uc.a.run.app`](https://reguatory-ui-pro-74ugcbbbya-uc.a.run.app)
+
+---
+
+## Example — Bell's Palsy / Prednisolone CTD (end-to-end)
+
+This walkthrough uses the bundled demo program (neurology / bells_palsy / prednisolone, 494-patient RCT).
+
+### 1. Open the platform
+
+Navigate to the live link above. The Gradio UI loads instantly — no login required.
+
+### 2. Load the demo program
+
+Type in the chat:
+
+```
+Show me the status of neurology / bells_palsy / prednisolone
+```
+
+The coordinator routes this to the CTD API and returns the content-generation status for all 17 sections.
+
+### 3. Browse generated CTD documents
+
+Switch to the **📄 Generated Documents** tab:
+
+1. **Therapeutic Area** → `neurology`
+2. **Disease** → `bells_palsy`
+3. **Drug Name** → `prednisolone`
+4. Click **Load Sections** — 17 sections appear grouped by module
+5. Select **2.7.3 Summary of Clinical Efficacy** from the dropdown
+6. Full ICH M4E(R2)-compliant markdown renders inline
+
+Key content you will see in section 2.7:
+- Primary endpoint: **72.5% (358/494)** complete facial recovery at 3 months for prednisolone vs **51.6% (255/494)** for placebo (p < 0.001)
+- House-Brackmann scale mean: **2.1 ± 0.8** (prednisolone arm) vs **2.9 ± 1.0** (placebo)
+- Benefit-risk summary with ICH M4E(R2) section headings
+
+### 4. Check the validation report
+
+Switch to the **✅ Validation** tab. Select the same program and click **Load Report**.
+
+You will see:
+- **Run**: `c0f8955f` — 2026-04-25
+- **Errors**: 8 (all `DATA PENDING` — expected for non-clinical modules 3/4 not yet written)
+- **Warnings**: 0 ✅ — no cross-module data inconsistencies or hallucinated statistics
+
+### 5. Review the 3-gate approval chain
+
+Switch to the **🔏 Review & Approve** tab for section `2.7.3 Summary of Clinical Efficacy`.
+
+The three approval gates are already signed:
+
+| # | Role | Reviewer | Timestamp | Comment |
+|---|---|---|---|---|
+| 1 | Clinical Statistician | `statistician@demo.com` | 2026-04-25 13:23 UTC | "Demographics and efficacy figures verified against SAP v1.3. HB scale scores, recovery rates and CIs align with source CSV data." |
+| 2 | Medical Writer | `admin@demo.com` | 2026-04-25 13:25 UTC | "Narrative aligns with clinical data. Section structure and content meets ICH M4E(R2) requirements for clinical summary." |
+| 3 | QA/Compliance Officer | `qa.compliance@demo.com` | 2026-04-25 13:26 UTC | "Document meets ICH M4E(R2) requirements." |
+
+**Result: ✅ RELEASED v1 · 3 signatures on file · authored by system**
+
+### 6. Try a content generation run (optional)
+
+```
+Generate content for neurology / bells_palsy / prednisolone
+```
+
+The coordinator dispatches a Pub/Sub message to `ich4-content-worker`. The UI auto-polls every 20 seconds and posts a completion message when all sections are written. A new validation run is triggered automatically.
+
+---
+
+## Architecture
+
+```
+User (browser — public URL)
+     │
+     ▼
+┌────────────────────────────────────────┐
+│           reguatory-ui-pro             │
+│  Gradio chat shell + LangGraph         │
+│  coordinator (intent classification)   │
+└──────┬──────────┬───────────┬──────────┘
+       │          │           │
+       ▼          ▼           ▼
+┌──────────┐ ┌────────────┐ ┌──────────────────┐
+│ ctd-api  │ │ich4-writer │ │clinical-analyst  │
+│ FastAPI  │ │FastAPI     │ │FastAPI           │
+│ (struct) │ │(doc gen +  │ │(CSV stats + LLM) │
+└──────────┘ │ validator +│ └──────────────────┘
+             │ doc reader)│
+             └─────┬──────┘
+                   │ Pub/Sub
+             ┌─────▼──────────────┐
+             │ ich4-content-worker│
+             │ (Pub/Sub consumer) │
+             └─────┬──────────────┘
+                   │
+       ┌───────────┼───────────┐
+       ▼           ▼           ▼
+ ┌──────────┐ ┌──────────┐  (GCS)
+ │ich4-index│ │ich4-temp-│
+ │ (ICH RAG)│ │late      │
+ └──────────┘ └──────────┘
+```
+
+All services run on **Cloud Run**. Documents and session state live in **GCS**.
+
+---
+
+## Services
+
+| Service | Directory | Cloud Run name | Role |
+|---|---|---|---|
+| **UI** | `ui/` | `reguatory-ui-pro` | Gradio chat + LangGraph coordinator + document viewer + approval UI |
+| **CTD API** | `ctd_structure/api/` | `ctd-api` | CTD structure, scaffold, session state, Pub/Sub dispatch |
+| **ICH4 Writer** | `ICH4/writer/` | `ich4-writer` | Section writing, data analyst tools, validator, document reader |
+| **Clinical Analyst** | `clinical-analyst/` | `clinical-analyst` | Clinical CSV analysis (pandas + GPT-4o), placeholder resolver |
+| **Content Worker** | `ICH4/content_worker/` | `ich4-content-worker` | Pub/Sub-driven async pipeline orchestrator |
+| **ICH4 Index** | `ICH4/index/` | `ich4-index` | Semantic search over ICH M4 guidelines (RAG) |
+| **ICH4 Template** | `ICH4/template/` | `ich4-template` | ICH-grounded section template generator |
+| **Content Pipeline** | `ICH4/content_pipeline/` | `ich4-content-pipeline` | Aggregates index + template writer |
+
+---
+
+## Intent Routing
+
+The coordinator (`ui/coordinator.py`) classifies every chat message and routes it:
+
+| Intent | Downstream | Description |
+|---|---|---|
+| `extract` | `POST ctd-api/extract` | Publish ICH M4 folder hierarchy extraction job |
+| `approve` | `POST ctd-api/approve` | Commit canonical CTD structure to GCS |
+| `write` | `POST ctd-api/write` | Dispatch content-generation Pub/Sub job |
+| `status` | `GET ctd-api/status_query` | Human-readable generation status |
+| `rewrite_section` | `POST ich4-writer/write` | Regenerate a specific section |
+| `analyze_data` | `POST clinical-analyst/analyze` | Statistical + narrative clinical analysis |
+| `clarify` / `help` | _(UI only)_ | Slot clarification or help text |
+
+---
+
+## Cross-Module Validator
+
+After every write, the LangGraph validator (`ICH4/writer/validator/`) cross-checks:
+
+- Drug name consistency across modules
+- Demographic figures (n, mean age, sex split) match clinical data ground-truth
+- Efficacy statistics (recovery rate, HB scale scores, CIs) match source CSV
+- No unfilled `{{placeholder}}` markers remain
+- No hallucinated numbers — uses **4-level pharma-safe fragment matching**:
+
+| Level | Pattern | Example |
+|---|---|---|
+| 1 | Exact string | `72.5% (358/494)` |
+| 2 | Parenthesised fraction | `(358/494)` |
+| 3 | Number + `%` | `72.5%` |
+| 4 | Number ± spread | `3.7 ± 1.1` |
+
+Bare numeric tokens (e.g. `72.5`) are intentionally excluded — CTD documents contain those in unrelated contexts (dosages, clearances, ratios).
+
+---
+
+## 3-Gate Approval Workflow
+
+Sections progress through three mandatory gates before reaching **RELEASED** status:
+
+```
+DRAFT → [Gate 1: Clinical Statistician] → [Gate 2: Medical Writer] → [Gate 3: QA/Compliance] → RELEASED
+```
+
+Each gate records: reviewer email · timestamp · comment · gate index. All signatures are stored in GCS at `approval/history.json` and surfaced in the **🔏 Review & Approve** UI tab.
+
+---
+
+## Clinical Data
+
+### Placeholder Resolver
+
+`POST /resolve` on the clinical analyst computes ground-truth values from the CSV manifest (proportions, mean ± SD) and returns them to the validator. Columns with `role: treatment_group` are automatically excluded — these are treatment-allocation columns (e.g. "Received Acyclovir") that should never appear as stats in the narrative.
+
+### CSV Column Mapping
+
+Upload a trial CSV via the **🔬 Clinical Data Upload** panel. The LLM mapper identifies columns, maps them to CTD placeholder keys, and writes a `manifest.json` to GCS. Uses `json-repair` with up to 3 retries for malformed LLM JSON.
+
+---
+
+## GCS Layout
+
+```
+gs://pharma-reguatory-author-life-science/
+├── ctd_structure/
+│   ├── ctd/                              # Canonical ICH M4 folder template
+│   └── users/{session_id}/
+│       ├── session_state.json
+│       ├── extraction_status.json
+│       └── ctd/
+└── therapeutic-area/
+    └── {ta}/{disease}/{drug}/
+        ├── ctd/module{2,5}/              # Generated section content (.md)
+        ├── clinical_data/
+        │   ├── {trial}.csv
+        │   └── manifest.json             # Column mappings + placeholder keys + roles
+        ├── templates/                    # ICH-grounded section templates
+        ├── content_status/
+        │   ├── {session_id}.json
+        │   └── latest.json              # Always mirrors the most recent run
+        ├── validation/latest.json        # Latest per-section validation report
+        ├── approval/history.json         # Full approval audit trail
+        └── approval/state.json           # Current gate + status
+```
+
+---
+
+## GCP Infrastructure
+
+| Resource | Value |
+|---|---|
+| Project | `pharma-reguatory-author` |
+| Region | `us-central1` |
+| Compute | Cloud Run (all services) |
+| Storage | GCS `pharma-reguatory-author-life-science` |
+| Messaging | Pub/Sub `ctd-extraction`, `ich4-content-generation` |
+| Secrets | Secret Manager: `OPENAI_API_KEY` |
+| Registry | Artifact Registry `us-central1-docker.pkg.dev/pharma-reguatory-author/ich4` |
+| LLM | OpenAI `gpt-4o` / `gpt-4o-mini` |
+
+---
+
+## Deploy
+
+Each service has its own `cloudbuild.yaml`. Submit from the **repo root**:
+
+```bash
+# UI
+gcloud builds submit . --config=ui/cloudbuild.yaml --project=pharma-reguatory-author
+
+# CTD API
+gcloud builds submit . --config=ctd_structure/api/cloudbuild.yaml --project=pharma-reguatory-author
+
+# Clinical Analyst
+gcloud builds submit . --config=clinical-analyst/cloudbuild.yaml --project=pharma-reguatory-author
+
+# ICH4 Writer (doc gen + validator + document reader)
+gcloud builds submit . --config=ICH4/writer/cloudbuild.yaml --project=pharma-reguatory-author
+
+# ICH4 Content Worker
+gcloud builds submit . --config=ICH4/content_worker/cloudbuild.yaml --project=pharma-reguatory-author
+
+# ICH4 Index
+gcloud builds submit . --config=ICH4/index/cloudbuild.yaml --project=pharma-reguatory-author
+
+# ICH4 Template
+gcloud builds submit . --config=ICH4/template/cloudbuild.yaml --project=pharma-reguatory-author
+
+# ICH4 Content Pipeline
+gcloud builds submit . --config=ICH4/content_pipeline/cloudbuild.yaml --project=pharma-reguatory-author
+```
+
+---
+
+## Project Layout
+
+```
+life-science/
+├── ui/                         # Gradio UI + LangGraph coordinator + approval UI
+│   ├── app_pro.py              # Full production UI
+│   ├── coordinator.py          # LangGraph graph (understand → decide)
+│   ├── Dockerfile
+│   └── cloudbuild.yaml
+├── ctd_structure/
+│   ├── api/                    # FastAPI CTD backend
+│   ├── scaffold.py
+│   └── structure.py
+├── clinical-analyst/           # Clinical data analysis + placeholder resolver
+│   └── app.py
+├── ICH4/
+│   ├── index/                  # ICH guidelines RAG
+│   ├── template/               # ICH-grounded template generator
+│   ├── writer/
+│   │   ├── validator/          # LangGraph cross-module validator
+│   │   └── writer/             # Section generator + data analyst tools
+│   ├── content_pipeline/
+│   └── content_worker/         # Pub/Sub consumer
+├── clinical/                   # CSV → CTD column mapper
+├── ctd/                        # Local ICH M4 reference structure
+├── scripts/                    # Utility scripts
+└── tests/
+```
+
+---
+
+## Clinical Data Privacy
+
+Patient-level CSV files are **not committed** to this repository. Upload them at runtime via the **🔬 Clinical Data Upload** panel. Files are stored in GCS under `therapeutic-area/{ta}/{disease}/{drug}/clinical_data/`.
+# pharma-regulatory-authoring
+
 LLM-powered platform for ICH M4(R4) CTD (Common Technical Document) regulatory authoring. Automates folder structure generation, clinical data integration, section content generation, cross-module validation, and in-browser document reading — all from a single Gradio chat interface backed by Cloud Run microservices.
 
 ---
