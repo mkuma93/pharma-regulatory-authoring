@@ -113,6 +113,51 @@ def _consensus(values: list[str]) -> str | None:
     return Counter(values).most_common(1)[0][0]
 
 
+# ── Clinical value presence check ─────────────────────────────────────────────
+
+def _clinical_value_in_text(expected: str, text: str) -> bool:
+    """Return True if *expected* (a resolved clinical value) is present in *text*.
+
+    Uses domain-specific fragment matching ordered from most to least specific.
+    Bare leading numeric tokens (e.g. "72.5") are intentionally NOT used because
+    in CTD documents such numbers appear in unrelated contexts — dosages, ratios,
+    clearances — which would produce silent false-negatives for hallucinated values.
+
+    Matching levels (first match wins):
+      1. Exact string                 "72.5% (358/494)"
+      2. Parenthesised fraction       "(358/494)"     — unique to a trial result
+      3. Number + % sign              "72.5%"         — specific to a proportion
+      4. Number + ± variability       "3.7 ± 1.1"     — specific to a clinical measure
+         (normalises Unicode ± and +/-)
+    """
+    # Level 1 — exact
+    if expected in text:
+        return True
+
+    # Level 2 — parenthesised fraction  e.g. (358/494)
+    frac = re.search(r"\(\d+/\d+\)", expected)
+    if frac and frac.group(0) in text:
+        return True
+
+    # Level 3 — number with % sign  e.g. "72.5%"
+    pct = re.search(r"\d[\d\.]*\s*%", expected)
+    if pct:
+        # normalise whitespace between number and %
+        token = re.sub(r"\s+", "", pct.group(0))          # "72.5%"
+        text_norm = re.sub(r"\s+", "", text)
+        if token in text_norm:
+            return True
+
+    # Level 4 — number with ± variability  e.g. "3.7 ± 1.1"
+    pm = re.search(r"(\d[\d\.]+)\s*[±]\s*(\d[\d\.]+)", expected)
+    if pm:
+        pattern = rf"{re.escape(pm.group(1))}\s*[±+\-/]\s*{re.escape(pm.group(2))}"
+        if re.search(pattern, text):
+            return True
+
+    return False
+
+
 # ── Node 1: extract_key_values ────────────────────────────────────────────────
 
 def extract_key_values(state: ValidatorState) -> dict:
@@ -532,21 +577,26 @@ def check_against_resolved(state: ValidatorState) -> dict:
             # resolved_values uses clinical placeholder keys (full_recovery_3_months …).
             # These namespaces rarely overlap for disease-specific metrics.
             #
-            # Anti-hallucination check: extract the leading numeric token from the
-            # ground-truth value (e.g. "72.5% (358/494)" → "72.5") and search for
-            # it verbatim in the written text.
-            #   • Exact literal found → value IS written; suppress false-positive warning.
-            #   • Not found          → value is genuinely absent OR the LLM used a
-            #                          different (possibly hallucinated) number; warn.
+            # Anti-hallucination check: search for the ground-truth value using
+            # progressively less specific fragments.  In pharma CTD documents bare
+            # numeric tokens (e.g. "72.5") are dangerously non-specific — they appear
+            # in doses, clearances, ratios, etc.  We therefore require domain-specific
+            # structural context before suppressing a warning:
             #
-            # This avoids suppressing real hallucination: if the LLM wrote "71.3%"
-            # when the ground truth is "72.5%", the numeric token "72.5" is absent
-            # from all_text and the warning fires correctly.
+            #   Level 1 — exact string            "72.5% (358/494)"   → most specific
+            #   Level 2 — parenthesised fraction   "(358/494)"         → unique to trial
+            #   Level 3 — number with % sign       "72.5%"             → moderately specific
+            #   Level 4 — number with ± variability "3.7 ± 1.1"        → clinical measure
+            #
+            # A bare leading number ("72.5") is NOT used as a fallback because it can
+            # match unrelated content (dosage "72.5 mg", ratio "3.7-fold") and would
+            # silently pass a section where the actual recovery/endpoint figure is absent.
+            #
+            # Only if one of the above fragments is found do we suppress the warning.
+            # If none match, the warning fires — the value is either genuinely absent
+            # or the LLM wrote a different (possibly hallucinated) number.
             expected_str = str(expected).strip()
-            # Extract leading numeric token (digits, dot, optional %)
-            numeric_match = re.match(r"(\d[\d\.]*\s*%?)", expected_str)
-            numeric_token = numeric_match.group(1).strip() if numeric_match else expected_str
-            if numeric_token and numeric_token in all_text:
+            if _clinical_value_in_text(expected_str, all_text):
                 continue
             issues.append(ValidationIssue(
                 severity="warning",
