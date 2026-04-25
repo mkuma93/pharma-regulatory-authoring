@@ -269,6 +269,9 @@ def analyse_dataframe(
         return {}
 
     # Execute each tool call deterministically
+    full_data_json = df.to_json(orient="records")
+    assigned_keys: set[str] = set()
+
     for tool_call in getattr(response, "tool_calls", []):
         tool_name = tool_call["name"]
         tool_args = tool_call["args"]
@@ -277,9 +280,8 @@ def analyse_dataframe(
             logger.warning("[data_analyst] Unknown tool requested: %s", tool_name)
             continue
 
-        # Replace sample_rows_json placeholder with full-dataset JSON for accuracy
+        # Replace sample_rows_json with full-dataset JSON for accuracy
         # (the LLM echoes back the sample rows — we substitute the full df)
-        full_data_json = df.to_json(orient="records")
         tool_args = {**tool_args, "data_json": full_data_json}
 
         try:
@@ -288,12 +290,12 @@ def analyse_dataframe(
             logger.warning("[data_analyst] Tool %s failed: %s", tool_name, exc)
             continue
 
-        # Map result back to the placeholder key.
-        # The LLM doesn't return the key explicitly, so we match by column name
-        # to the placeholder whose description references that column.
-        matched_key = _match_placeholder(tool_args, placeholder_descriptions)
+        # Map result back to the placeholder key using the column name.
+        # Descriptions are now the CSV column names so we can do exact matching.
+        matched_key = _match_placeholder(tool_args, placeholder_descriptions, assigned_keys)
         if matched_key:
             results[matched_key] = result_str
+            assigned_keys.add(matched_key)
             logger.info("[data_analyst] %s → %s", matched_key, result_str[:80])
 
     return results
@@ -302,19 +304,37 @@ def analyse_dataframe(
 def _match_placeholder(
     tool_args: dict,
     placeholder_descriptions: dict[str, str],
+    assigned_keys: set[str] | None = None,
 ) -> str | None:
-    """Heuristically match a tool call back to a placeholder key.
+    """Map a tool call back to a placeholder key using the CSV column name.
 
-    Strategy: find the placeholder whose description contains the column name
-    used in the tool call.  Falls back to the first unmatched placeholder.
+    Since ``placeholder_descriptions`` values are now the actual CSV column
+    names (not role labels), we can do reliable exact + partial matching.
+
+    ``assigned_keys`` prevents multiple tool calls from overwriting the same
+    placeholder key when the LLM makes duplicate or ambiguous calls.
     """
     column = tool_args.get("column") or tool_args.get("row_column") or ""
-    col_lower = column.lower()
+    col_lower = column.lower().strip()
 
-    for key, desc in placeholder_descriptions.items():
-        if col_lower in desc.lower() or key.lower() in col_lower:
+    def _available(key: str) -> bool:
+        return assigned_keys is None or key not in assigned_keys
+
+    if col_lower:
+        # Pass 1: exact case-insensitive match — description IS the column name
+        for key, desc in placeholder_descriptions.items():
+            if _available(key) and col_lower == desc.lower().strip():
+                return key
+
+        # Pass 2: partial overlap (column name is a substring of description or vice versa)
+        for key, desc in placeholder_descriptions.items():
+            if _available(key):
+                desc_lower = desc.lower().strip()
+                if col_lower in desc_lower or desc_lower in col_lower:
+                    return key
+
+    # Fallback: first unassigned key
+    for key in placeholder_descriptions:
+        if _available(key):
             return key
-
-    # If no match by name, return the first key that hasn't been assigned yet
-    # (handles cases where column names don't overlap with placeholder names)
-    return next(iter(placeholder_descriptions), None)
+    return None

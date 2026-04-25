@@ -81,10 +81,13 @@ Section: {section_key} — {section_label}
 {clinical_context}
 
 ─────────────────────────────────────────────────────────────────────────────────
-REMINDER: Fill ONLY with values traceable to the clinical data above.
-Any numeric value without a source in the data above MUST be written as:
-  [DATA PENDING — {{placeholder_key}}: no source data supplied]
-Do NOT invent or estimate figures. Return completed Markdown only.
+REMINDER:
+• TYPE A (narrative/overview/report placeholders): Write complete, publication-quality
+  regulatory prose using the statistics from "CLINICAL DATA" above as evidence.
+  The statistics are your source — do NOT write [DATA PENDING] for narrative placeholders.
+• TYPE B (specific numeric values — percentages, p-values, patient counts, CIs):
+  Use ONLY exact figures from the "CLINICAL DATA" section above, with source tag.
+  If a specific statistic has no source data: [DATA PENDING — {placeholder_key}: no source data supplied]
 ─────────────────────────────────────────────────────────────────────────────────
 """
 
@@ -100,8 +103,7 @@ def _fmt_clinical_context(context: dict[str, str]) -> str:
     parts: list[str] = []
     for key, data in context.items():
         parts.append(
-            f"--- Source for {{{{  {key}  }}}} ---\n"
-            f"(Use ONLY the figures below for this placeholder)\n"
+            f"--- Clinical data for {{{{  {key}  }}}} ---\n"
             f"{data}"
         )
     return "\n\n".join(parts)

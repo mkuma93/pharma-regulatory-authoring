@@ -70,6 +70,28 @@ def _csv_rows_for_columns(
         return []
 
 
+def _build_master_context(
+    resolved_values: dict[str, str],
+    key_to_col: dict[str, str],
+    source_filename: str = "",
+) -> str:
+    """Build a human-readable clinical statistics block from resolved placeholder values.
+
+    Uses ``key_to_col`` (manifest placeholder_key → CSV column_name) to annotate
+    each statistic with its source column name so the writer LLM can write
+    evidence-based narrative prose with proper source attribution.
+    """
+    lines: list[str] = [
+        "Clinical trial data — use these statistics to write evidence-based regulatory prose:",
+    ]
+    if source_filename:
+        lines.append(f"(Source: {source_filename} — randomized controlled trial)")
+    for k, v in resolved_values.items():
+        col_name = key_to_col.get(k, k.replace("_", " ").title())
+        lines.append(f"  {col_name}: {v}")
+    return "\n".join(lines)
+
+
 def build_clinical_context(
     bucket_name: str,
     program: ProgramInfo,
@@ -84,6 +106,11 @@ def build_clinical_context(
     is supplied) to compute real statistics (proportions, mean±SD, etc.) from
     the clinical CSV via safe LLM tool-calling — no arbitrary code execution.
     Falls back to raw column row snippets when no LLM is provided.
+
+    For narrative/report placeholder keys that have no direct column mapping in
+    the manifest (e.g. ``efficacy_safety_reports``, ``clinical_efficacy_summary``),
+    injects a *human-readable* annotated statistics block so the writer LLM can
+    reference real figures in its prose rather than writing DATA PENDING.
     Returns empty dict if no manifest is found.
     """
     # Start with pre-resolved values; hybrid analyst fills whatever is missing
@@ -98,8 +125,21 @@ def build_clinical_context(
     if not manifest:
         return context
 
-    # Build lookup: placeholder_key → list of {column_name, gcs_path, role}
-    # A placeholder may map to MULTIPLE columns (aggregate/narrative keys).
+    # Build reverse lookup: manifest placeholder_key → CSV column_name
+    # (used to annotate the master context block with human-readable names)
+    key_to_col: dict[str, str] = {}
+    source_filename = ""
+    for source in manifest.get("sources", []):
+        if not source_filename:
+            source_filename = source.get("filename", "")
+        for mapping in source.get("column_mappings", []):
+            pk = mapping.get("placeholder_key", "")
+            cn = mapping.get("column_name", "")
+            if pk and cn:
+                key_to_col[pk] = cn
+
+    # Build lookup: template placeholder_key → list of {column_name, gcs_path, role}
+    # Only populated for template keys that ARE in the manifest.
     placeholder_meta: dict[str, list[dict]] = {}
     for source in manifest.get("sources", []):
         gcs_path = source.get("gcs_path", "")
@@ -113,18 +153,24 @@ def build_clinical_context(
                     "role": mapping.get("role", ""),
                 })
 
+    # Build the annotated master block once — used as fallback for narrative
+    # placeholder keys that have no direct CSV column mapping.
+    master_block: str | None = None
+    if resolved_values:
+        master_block = _build_master_context(resolved_values, key_to_col, source_filename)
+
     if not placeholder_meta:
-        # Fallback: inject resolved_values as context for any remaining narrative keys
-        if resolved_values:
-            stats_block = "Pre-resolved clinical statistics:\n" + "\n".join(
-                f"  {k}: {v}" for k, v in resolved_values.items()
-            )
+        # No template placeholder keys match the manifest.  This is common for
+        # narrative/report sections (e.g. 2.5, 5.3) whose keys like
+        # ``efficacy_safety_reports`` differ from the manifest's specific stat keys.
+        # Inject the annotated master block so the writer LLM can reference real
+        # statistics (with column names) when generating narrative prose.
+        if master_block:
             for pk in remaining_keys:
-                context[pk] = stats_block
+                context[pk] = master_block
         return context
 
     # Group by CSV file so we load each file once
-    # Maps gcs_path → set of column names needed from that file
     file_columns: dict[str, set[str]] = {}
     for col_list in placeholder_meta.values():
         for entry in col_list:
@@ -140,18 +186,19 @@ def build_clinical_context(
     filename_short: dict[str, str] = {p: p.rsplit("/", 1)[-1] for p in file_dfs}
 
     # ── data_analyst: compute real statistics when LLM is available ──────────
-    # Groups placeholder_descriptions by CSV file so each file is analysed once.
+    # Uses column names (not role labels) as descriptions so the tool-call
+    # matcher can do exact column-name matching back to placeholder keys.
     if llm is not None:
         for gcs_path, df in file_dfs.items():
-            # Collect placeholder keys whose source is this CSV file
             ph_descs: dict[str, str] = {}
             for pk, col_list in placeholder_meta.items():
                 if pk in context:
                     continue  # already resolved upstream
                 for entry in col_list:
                     if entry["gcs_path"] == gcs_path:
-                        desc = entry.get("role") or entry["column_name"]
-                        ph_descs[pk] = desc
+                        # Use the actual CSV column name as the description so
+                        # _match_placeholder can do exact name matching.
+                        ph_descs[pk] = entry["column_name"]
                         break
             if ph_descs:
                 try:
@@ -167,10 +214,10 @@ def build_clinical_context(
                         filename_short.get(gcs_path, gcs_path), exc,
                     )
 
-    # Build context: accumulate raw column snippets for any keys still missing
+    # Raw column snippet fallback for manifest-mapped keys not yet computed
     for pk, col_list in placeholder_meta.items():
         if pk in context:
-            continue  # already computed by data_analyst above
+            continue
         parts: list[str] = []
         for entry in col_list:
             gp = entry["gcs_path"]
@@ -186,13 +233,11 @@ def build_clinical_context(
         if parts:
             context[pk] = "\n\n".join(parts)
 
-    # Fallback for any remaining_keys still not covered: inject resolved_values
-    if resolved_values:
-        stats_block = "Pre-resolved clinical statistics:\n" + "\n".join(
-            f"  {k}: {v}" for k, v in resolved_values.items()
-        )
+    # For any remaining narrative keys with no column mapping, inject the
+    # annotated master block so they have real statistics to reference.
+    if master_block:
         for pk in remaining_keys:
             if pk not in context:
-                context[pk] = stats_block
+                context[pk] = master_block
 
     return context
