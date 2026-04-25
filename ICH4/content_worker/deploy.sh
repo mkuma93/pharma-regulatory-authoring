@@ -7,6 +7,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(dirname "$(dirname "${SCRIPT_DIR}")")"
 PROJECT_ID="${PROJECT_ID:-pharma-reguatory-author}"
 REGION="${REGION:-us-central1}"
 AR_REPO="${AR_REPO:-ich4}"
@@ -27,7 +28,7 @@ echo "    Clinical analyst     : ${CLINICAL_ANALYST_URL}"
 echo "    Pub/Sub topic        : ${PUBSUB_TOPIC}"
 echo ""
 
-gcloud builds submit "${SCRIPT_DIR}" \
+gcloud builds submit "${REPO_ROOT}" \
   --config="${SCRIPT_DIR}/cloudbuild.yaml" \
   --substitutions="\
 _PROJECT_ID=${PROJECT_ID},\
