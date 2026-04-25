@@ -708,6 +708,86 @@ def admin_seed_publish_status(
     return status
 
 
+def load_section_history(
+    bucket_name: str,
+    program: ProgramInfo,
+    module_key: str,
+    section_key: str,
+) -> list[dict]:
+    """Return a chronological audit trail for a section.
+
+    Reads every immutable witness record from:
+      - ``{prefix}/rejections/{section_key}/``   → event_type = "rejection"
+      - ``{prefix}/approvals/{section_key}/``    → event_type = "approval"
+      - ``{prefix}/ctd/{module_key}/{section_key}/versions/manifest.json``
+        → event_type = "generation"
+
+    Each event dict has at minimum:
+      event_type, timestamp, actor, role, reason, run_id
+    Sorted oldest-first.
+    """
+    prefix = program_prefix(program)
+    bkt    = gcs().bucket(bucket_name)
+    events: list[dict] = []
+
+    # ── rejections ────────────────────────────────────────────────────────────
+    rej_prefix = f"{prefix}/rejections/{section_key}/"
+    for blob in bkt.list_blobs(prefix=rej_prefix):
+        try:
+            data = json.loads(blob.download_as_text())
+            events.append({
+                "event_type": "rejection",
+                "timestamp":  data.get("rejected_at", ""),
+                "actor":      data.get("reviewer", ""),
+                "role":       ROLE_LABELS.get(data.get("role", ""), data.get("role", "")),
+                "reason":     data.get("rejection_reason", ""),
+                "run_id":     data.get("run_id", ""),
+                "author":     data.get("author", ""),
+            })
+        except Exception:
+            pass
+
+    # ── approvals ─────────────────────────────────────────────────────────────
+    apv_prefix = f"{prefix}/approvals/{section_key}/"
+    for blob in bkt.list_blobs(prefix=apv_prefix):
+        try:
+            data = json.loads(blob.download_as_text())
+            events.append({
+                "event_type": "approval",
+                "timestamp":  data.get("approved_at", ""),
+                "actor":      data.get("approver", ""),
+                "role":       ROLE_LABELS.get(data.get("role", ""), data.get("role", "")),
+                "reason":     data.get("approval_reason", ""),
+                "run_id":     data.get("run_id", ""),
+                "author":     data.get("author", ""),
+                "release_ready": bool(data.get("release_ready", False)),
+            })
+        except Exception:
+            pass
+
+    # ── generation versions (manifest) ────────────────────────────────────────
+    manifest_blob = bkt.blob(
+        f"{prefix}/ctd/{module_key}/{section_key}/versions/manifest.json"
+    )
+    try:
+        if manifest_blob.exists():
+            for entry in json.loads(manifest_blob.download_as_text()):
+                events.append({
+                    "event_type": "generation",
+                    "timestamp":  entry.get("timestamp", ""),
+                    "actor":      entry.get("author", ""),
+                    "role":       "Author",
+                    "reason":     f"Version {entry.get('version', '?')} generated",
+                    "run_id":     entry.get("run_id", ""),
+                    "version":    entry.get("version", ""),
+                })
+    except Exception:
+        pass
+
+    events.sort(key=lambda e: e.get("timestamp", ""))
+    return events
+
+
 def load_gate_status(
     bucket_name: str,
     program: ProgramInfo,

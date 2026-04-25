@@ -27,6 +27,7 @@ from writer.storage import (
     list_generated_paths,
     load_gate_status,
     load_publish_status,
+    load_section_history,
     load_template,
     record_section_approval,
     record_section_rejection,
@@ -668,6 +669,35 @@ def get_gate_status(
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     return GateStatusResponse(**data)
+
+
+@router.get("/documents/history")
+def get_section_history(
+    therapeutic_area: str = Query(...),
+    disease_type:     str = Query(...),
+    drug_name:        str = Query(...),
+    module:           str = Query(...),
+    section_key:      str = Query(...),
+    bucket_name:      str = Query(default=None),
+) -> list[dict]:
+    """Chronological audit trail for a section.
+
+    Returns all generation versions, approvals, and rejections sorted
+    oldest-first.  Each event has: event_type, timestamp, actor, role,
+    reason, run_id, author.
+    """
+    bucket = bucket_name or settings.gcs_bucket_name
+    if not bucket:
+        raise HTTPException(status_code=422, detail="bucket_name is required.")
+    program = ProgramInfo(
+        therapeutic_area=therapeutic_area,
+        disease_type=disease_type,
+        drug_name=drug_name,
+    )
+    try:
+        return load_section_history(bucket, program, module, section_key)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 # ── Manual edits: generated content + templates ──────────────────────────────

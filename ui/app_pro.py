@@ -1270,7 +1270,7 @@ with gr.Blocks(title="Regulatory Authoring Platform") as demo:
                     interactive=True, lines=2,
                 )
                 _s5_val_cite_btn = gr.Button(
-                    "📋  Use as approval reason", variant="secondary",
+                    "📋  Use as reason", variant="secondary",
                 )
             with gr.Accordion("�  Multi-Reviewer Validation Package", open=True):
                 gr.HTML(_info_box(
@@ -1302,8 +1302,8 @@ with gr.Blocks(title="Regulatory Authoring Platform") as demo:
                         interactive=True, scale=1,
                     )
                     _s5_gate_reason = gr.Textbox(
-                        label="Approval reason (required; min 3 chars)",
-                        placeholder="e.g. Demographics match SAP v2.1; CI widths within protocol",
+                        label="Reason (required; min 3 chars)",
+                        placeholder="e.g. Demographics match SAP v2.1; CI widths within protocol — or rejection rationale",
                         interactive=True, scale=2,
                     )
                 with gr.Row():
@@ -1317,6 +1317,14 @@ with gr.Blocks(title="Regulatory Authoring Platform") as demo:
                         "🔄  Refresh gate status", variant="secondary", scale=1,
                     )
                 _s5_gate_msg = gr.Markdown(value="")
+            with gr.Accordion("📜  Review History (audit trail)", open=False):
+                gr.HTML(_info_box(
+                    "Complete chronological audit trail for the selected section: every "
+                    "generation (re-publish), reviewer approval, and rejection — oldest first. "
+                    "Each event is backed by an immutable witness record in GCS."
+                ))
+                _s5_history_btn  = gr.Button("📜  Load Review History", variant="secondary")
+                _s5_history_html = gr.HTML(value="")
                 # ── Admin: seed publish_status ──────────────────────────────
                 # NOTE: _s5_admin_reason, _s5_admin_seed_btn, _s5_admin_msg are
                 # placed OUTSIDE the Group so Gradio 5 always passes their values
@@ -1822,14 +1830,22 @@ with gr.Blocks(title="Regulatory Authoring Platform") as demo:
             rejected_by   = _esc(gate.get("rejected_by", "unknown"))
             rejected_role = _esc(_ROLE_LABEL_MAP.get(gate.get("rejected_role", ""), gate.get("rejected_role", "")))
             rejection_reason = _esc(gate.get("rejection_reason", ""))
+            rejected_at   = _esc((gate.get("rejected_at") or "")[:19])
             banner = (
                 f"<div style='padding:12px 16px;border-left:6px solid #dc2626;"
-                f"background:#fef2f2;color:#7f1d1d;border-radius:6px;font-weight:600;'>"
-                f"❌ REJECTED {ver_str} · by {rejected_by} ({rejected_role})"
-                f"<div style='font-weight:400;margin-top:4px;font-size:0.9em;'>"
-                f"Reason: {rejection_reason}</div>"
-                f"<div style='font-weight:400;margin-top:4px;font-size:0.85em;color:#991b1b;'>"
-                f"All approvals cleared — author must revise and re-generate before re-review.</div>"
+                f"background:#fef2f2;color:#7f1d1d;border-radius:6px;'>"
+                f"<div style='font-weight:700;font-size:1.05em;'>❌ REJECTED {ver_str}</div>"
+                f"<div style='margin-top:6px;font-size:0.9em;'>"
+                f"<strong>Rejected by:</strong> {rejected_by} ({rejected_role}) · {rejected_at}</div>"
+                f"<div style='margin-top:4px;font-size:0.9em;'>"
+                f"<strong>Reason:</strong> {rejection_reason}</div>"
+                f"<div style='margin-top:8px;padding:8px 10px;background:#fee2e2;"
+                f"border-radius:4px;font-size:0.88em;color:#991b1b;'>"
+                f"⚠️ <strong>Action required (author):</strong> All gate approvals have been cleared. "
+                f"The author must address the reviewer's concerns, then return to "
+                f"<strong>Step 4 → Generate</strong> to re-run the writer &amp; validator. "
+                f"Once a new version is generated the review cycle restarts. "
+                f"This rejection is permanently recorded in the audit trail.</div>"
                 f"</div>"
             )
         elif publish_blocked:
@@ -1916,7 +1932,7 @@ with gr.Blocks(title="Regulatory Authoring Platform") as demo:
             return b, c, "⚠️ Set a reviewer persona at the top of the page first."
         if not (reason or "").strip() or len(reason.strip()) < 3:
             b, c = _load_gate_state(selection, ta, dis, drug, state)
-            return b, c, "⚠️ Approval reason is required (min 3 chars)."
+            return b, c, "⚠️ Reason is required (min 3 chars)."
         prog = state.get("content_program") or {}
         ta   = (ta   or prog.get("therapeutic_area", "")).strip()
         dis  = (dis  or prog.get("disease_type",     "")).strip()
@@ -1961,7 +1977,7 @@ with gr.Blocks(title="Regulatory Authoring Platform") as demo:
             return b, c, "⚠️ Set a reviewer persona at the top of the page first."
         if not (reason or "").strip() or len(reason.strip()) < 3:
             b, c = _load_gate_state(selection, ta, dis, drug, state)
-            return b, c, "⚠️ Rejection reason is required (min 3 chars)."
+            return b, c, "⚠️ Reason is required (min 3 chars)."
         prog = state.get("content_program") or {}
         ta   = (ta   or prog.get("therapeutic_area", "")).strip()
         dis  = (dis  or prog.get("disease_type",     "")).strip()
@@ -1988,10 +2004,74 @@ with gr.Blocks(title="Regulatory Authoring Platform") as demo:
         )
         return b, c, msg
 
+    def _load_history_action(selection, ta, dis, drug, state):
+        if not selection:
+            return "<p style='color:#64748b;'>Select a section first.</p>"
+        prog = state.get("content_program") or {}
+        ta   = (ta   or prog.get("therapeutic_area", "")).strip()
+        dis  = (dis  or prog.get("disease_type",     "")).strip()
+        drug = (drug or prog.get("drug_name",        "")).strip()
+        section_key, module = _parse_section_key_module(selection)
+        bucket = state.get("bucket", _DEFAULT_BUCKET)
+        events = _writer_get("/documents/history", {
+            "therapeutic_area": ta, "disease_type": dis, "drug_name": drug,
+            "module": module, "section_key": section_key, "bucket_name": bucket,
+        })
+        if isinstance(events, dict) and "error" in events:
+            return f"<p style='color:#dc2626;'>❌ {_esc(str(events))}</p>"
+        if not events:
+            return "<p style='color:#64748b;'>No history found for this section yet.</p>"
+        _EVT_STYLE = {
+            "generation": ("🔄", "#dbeafe", "#1e40af", "#93c5fd"),
+            "approval":   ("✅", "#dcfce7", "#14532d", "#86efac"),
+            "rejection":  ("❌", "#fee2e2", "#7f1d1d", "#fca5a5"),
+        }
+        rows = []
+        for i, ev in enumerate(events):
+            etype = ev.get("event_type", "generation")
+            icon, bg, fg, border = _EVT_STYLE.get(etype, ("•", "#f1f5f9", "#334155", "#cbd5e1"))
+            ts     = _esc((ev.get("timestamp") or "")[:19].replace("T", " "))
+            actor  = _esc(ev.get("actor") or ev.get("author", ""))
+            role   = _esc(ev.get("role", ""))
+            reason = _esc(ev.get("reason", ""))
+            run_id = _esc((ev.get("run_id") or "")[:8])
+            label  = etype.capitalize()
+            if etype == "approval" and ev.get("release_ready"):
+                label = "Approval (RELEASED 🎉)"
+            rows.append(
+                f"<div style='display:flex;gap:12px;align-items:flex-start;"
+                f"padding:10px 12px;margin-bottom:6px;"
+                f"background:{bg};border-left:4px solid {border};border-radius:6px;'>"
+                f"<span style='font-size:1.2em;flex-shrink:0;'>{icon}</span>"
+                f"<div style='flex:1;'>"
+                f"<div style='font-weight:600;color:{fg};'>{label}"
+                f"<span style='font-weight:400;font-size:0.85em;color:{fg};opacity:0.8;'>"
+                f" · {ts}"
+                f"{'  ·  run ' + run_id if run_id else ''}</span></div>"
+                f"<div style='font-size:0.88em;color:{fg};margin-top:2px;'>"
+                f"<strong>{role}</strong>"
+                f"{': ' + actor if actor else ''}</div>"
+                f"{'<div style=\"font-size:0.85em;margin-top:3px;color:' + fg + ';\">' + reason + '</div>' if reason else ''}"
+                f"</div></div>"
+            )
+        return (
+            f"<div style='font-size:0.9em;'>"
+            f"<div style='font-weight:600;margin-bottom:8px;color:#334155;'>"
+            f"{len(events)} event(s) — {_esc(section_key)}</div>"
+            + "".join(rows)
+            + "</div>"
+        )
+
     _s5_gate_refresh_btn.click(
         fn=_load_gate_state,
         inputs=[_s5_dropdown, _s5_ta_disp, _s5_dis_disp, _s5_drug_disp, _state],
         outputs=[_s5_gate_banner, _s5_gate_cards],
+    )
+
+    _s5_history_btn.click(
+        fn=_load_history_action,
+        inputs=[_s5_dropdown, _s5_ta_disp, _s5_dis_disp, _s5_drug_disp, _state],
+        outputs=[_s5_history_html],
     )
 
     _s5_gate_approve_btn.click(
