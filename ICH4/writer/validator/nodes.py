@@ -530,11 +530,23 @@ def check_against_resolved(state: ValidatorState) -> dict:
         if found is None:
             # canonical_values uses generic field names (study_n, mean_age …) while
             # resolved_values uses clinical placeholder keys (full_recovery_3_months …).
-            # The namespaces rarely overlap for disease-specific metrics, so fall back
-            # to a raw-text search: if the expected value literal appears anywhere in
-            # the written sections the figure IS present — it just wasn't captured by
-            # the regex extractor.  Only warn when the value is genuinely absent.
-            if str(expected) in all_text:
+            # These namespaces rarely overlap for disease-specific metrics.
+            #
+            # Anti-hallucination check: extract the leading numeric token from the
+            # ground-truth value (e.g. "72.5% (358/494)" → "72.5") and search for
+            # it verbatim in the written text.
+            #   • Exact literal found → value IS written; suppress false-positive warning.
+            #   • Not found          → value is genuinely absent OR the LLM used a
+            #                          different (possibly hallucinated) number; warn.
+            #
+            # This avoids suppressing real hallucination: if the LLM wrote "71.3%"
+            # when the ground truth is "72.5%", the numeric token "72.5" is absent
+            # from all_text and the warning fires correctly.
+            expected_str = str(expected).strip()
+            # Extract leading numeric token (digits, dot, optional %)
+            numeric_match = re.match(r"(\d[\d\.]*\s*%?)", expected_str)
+            numeric_token = numeric_match.group(1).strip() if numeric_match else expected_str
+            if numeric_token and numeric_token in all_text:
                 continue
             issues.append(ValidationIssue(
                 severity="warning",
