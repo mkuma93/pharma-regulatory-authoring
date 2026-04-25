@@ -1175,19 +1175,12 @@ def resolve(req: ResolveRequest, http_request: Request) -> ResolveResponse:
                     "positive_value": mapping.get("positive_value"),  # from manifest
                 }
 
-    # Schema-only inference: for requested keys absent from manifest, let the
-    # planner try to derive them from the CSV schema (computation="suggest" likely).
-    if filter_keys:
-        first_gcs_path = next(
-            (s.get("gcs_path", "") for s in sources if s.get("gcs_path")), ""
-        )
-        for pk in filter_keys:
-            if pk not in placeholder_meta and first_gcs_path:
-                placeholder_meta[pk] = {
-                    "gcs_path":      first_gcs_path,
-                    "description":   f"Inferred — no manifest entry; derive from CSV schema",
-                    "positive_value": None,
-                }
+    # NOTE: keys in filter_keys that have no manifest entry are intentionally
+    # skipped.  These are structural/narrative template placeholders (e.g.
+    # mechanism_of_action, page_number, section_title) that cannot be derived
+    # from clinical CSV data.  Attempting to infer them caused the planner to
+    # assign real statistics (72.5%, 494, etc.) to wrong keys, polluting the
+    # validator's ground-truth with false cross-module mismatches.
 
     saved_path = f"{prefix}/analysis/placeholder_values.json"
 
