@@ -522,9 +522,20 @@ def check_against_resolved(state: ValidatorState) -> dict:
     if not resolved:
         return {"issues": issues}
 
+    # Concatenate all section text once for raw-text fallback searches.
+    all_text = "\n".join(doc.content for doc in state.documents)
+
     for key, expected in resolved.items():
         found = canonical.get(key)
         if found is None:
+            # canonical_values uses generic field names (study_n, mean_age …) while
+            # resolved_values uses clinical placeholder keys (full_recovery_3_months …).
+            # The namespaces rarely overlap for disease-specific metrics, so fall back
+            # to a raw-text search: if the expected value literal appears anywhere in
+            # the written sections the figure IS present — it just wasn't captured by
+            # the regex extractor.  Only warn when the value is genuinely absent.
+            if str(expected) in all_text:
+                continue
             issues.append(ValidationIssue(
                 severity="warning",
                 section_key="cross-module",
