@@ -425,9 +425,10 @@ A required element is ABSENT if it is not discussed at all or only appears as a 
 A required element is WEAK if it is mentioned but without supporting data or quantification.
 
 For each missing or weak required element, output exactly one line:
-  ISSUE|<severity>|<section_key>|<message>
+  ISSUE|<severity>|<section_key>|<message>|<reason>
   severity = "error"  if the element is completely absent
   severity = "warning" if the element is present but lacks data/quantification
+  reason   = a short remediation hint (what the author should add/fix)
 
 If a section has no coverage gaps, output nothing for that section.
 If ALL sections are complete, output exactly: NO_ISSUES
@@ -483,14 +484,18 @@ def check_ich_coverage(state: ValidatorState, llm: ChatOpenAI) -> dict:
             line = line.strip()
             if not line.startswith("ISSUE|"):
                 continue
-            parts = line.split("|", 3)
-            if len(parts) == 4:
-                _, sev, sec, msg = parts
+            parts = line.split("|", 4)
+            if len(parts) >= 4:
+                sev = parts[1]
+                sec = parts[2]
+                msg = parts[3]
+                reason = parts[4].strip() if len(parts) == 5 else ""
                 if sev in ("error", "warning", "info"):
                     issues.append(ValidationIssue(
                         severity=sev,  # type: ignore[arg-type]
                         section_key=sec.strip() or doc.section_key,
                         message=msg.strip(),
+                        reason=reason,
                     ))
 
     logger.info("[validator] ICH coverage check found %d issue(s).", len(issues))
@@ -594,11 +599,12 @@ Check for ALL of the following:
                      by any data cited from Module 5 study reports.
 
 For EACH issue found respond with exactly one line:
-  ISSUE|<severity>|<section_key>|<message>
+  ISSUE|<severity>|<section_key>|<message>|<reason>
 <severity>: error, warning, or info
   error   = factual contradictions, unsupported safety/efficacy claims, benefit-risk incoherence
   warning = ambiguous language, minor inconsistencies, missing citations
   info    = style/language notes
+<reason>: a short remediation hint (what the author should add/fix)
 If no issues are found respond with exactly: NO_ISSUES
 No other text.
 """
@@ -645,14 +651,18 @@ def llm_deep_check(state: ValidatorState, llm: ChatOpenAI) -> dict:
         line = line.strip()
         if not line.startswith("ISSUE|"):
             continue
-        parts = line.split("|", 3)
-        if len(parts) == 4:
-            _, sev, sec, msg = parts
+        parts = line.split("|", 4)
+        if len(parts) >= 4:
+            sev = parts[1]
+            sec = parts[2]
+            msg = parts[3]
+            reason = parts[4].strip() if len(parts) == 5 else ""
             if sev in ("error", "warning", "info"):
                 issues.append(ValidationIssue(
                     severity=sev,       # type: ignore[arg-type]
                     section_key=sec.strip(),
                     message=msg.strip(),
+                    reason=reason,
                 ))
 
     summary = (

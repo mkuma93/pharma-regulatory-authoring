@@ -514,7 +514,7 @@ async def generate(request: Request):
                         },
                         "bucket_name":     bucket,
                         "sections":        section_keys,
-                        "run_validator":   pass_idx == total_passes - 1,
+                        "run_validator":   True,  # validate every pass (not just the last)
                         "resolved_values": resolved_values,
                         "run_id":          run_id,
                         "author":          author,
@@ -543,12 +543,25 @@ async def generate(request: Request):
                 writer_data      = r.json()
                 sections_written = writer_data.get("sections_written", 0)
                 sections_failed  = writer_data.get("sections_failed", [])
-                final_validation = writer_data.get("validation", {})
+                pass_validation  = writer_data.get("validation", {})
                 all_sections_written += sections_written
                 all_sections_failed.extend(sections_failed)
+                # Merge issues across all passes; a single error in any pass
+                # marks the overall run as failed.
+                if pass_validation:
+                    merged_issues = (
+                        final_validation.get("issues", []) +
+                        pass_validation.get("issues", [])
+                    )
+                    final_validation = {
+                        "passed":  final_validation.get("passed", True) and pass_validation.get("passed", True),
+                        "summary": pass_validation.get("summary", ""),
+                        "issues":  merged_issues,
+                    }
                 logger.info(
-                    "[worker] Pass %s: written=%d  failed=%s",
+                    "[worker] Pass %s: written=%d  failed=%s  val_issues=%d",
                     pass_id, sections_written, sections_failed,
+                    len(pass_validation.get("issues", [])),
                 )
 
             # ── Step D: Ingest into program index (if configured) ─────────────

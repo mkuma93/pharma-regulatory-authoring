@@ -62,6 +62,7 @@ class ValidationIssue(BaseModel):
     severity: Literal["error", "warning", "info"]
     section_key: str
     message: str
+    reason: str = ""  # remediation hint shown in the UI Reason column
 
 
 class ValidationResult(BaseModel):

@@ -1,11 +1,15 @@
 """LangGraph validator graph for cross-module CTD consistency checking."""
 from __future__ import annotations
 
+import concurrent.futures
+import logging
 from functools import partial
 from typing import Any
 
 from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, START, END
+
+logger = logging.getLogger(__name__)
 
 from .nodes import (
     extract_key_values,
@@ -92,7 +96,31 @@ def run_validator(
         summary="",
     )
 
-    final_state = compiled.invoke(initial_state)
+    # Two LLM nodes run once per section (check_ich_coverage + llm_deep_check).
+    # With up to ~11 sections at 10-30s per LLM call, worst-case is ~660s.
+    # 600s (10 min) gives a safe ceiling without being indefinitely blocking.
+    _VALIDATOR_TIMEOUT_SECONDS = 600
+
+    def _invoke() -> Any:
+        return compiled.invoke(initial_state)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(_invoke)
+        try:
+            final_state = future.result(timeout=_VALIDATOR_TIMEOUT_SECONDS)
+        except concurrent.futures.TimeoutError:
+            logger.error(
+                "[validator] Timed out after %ds — returning failed result",
+                _VALIDATOR_TIMEOUT_SECONDS,
+            )
+            return ValidationResult(
+                passed=False,
+                issues=[],
+                summary=(
+                    f"Validator timed out after {_VALIDATOR_TIMEOUT_SECONDS}s. "
+                    "The document was NOT validated. Re-run validation manually."
+                ),
+            )
 
     # LangGraph .invoke() returns a plain dict, not the typed state object
     if isinstance(final_state, dict):
