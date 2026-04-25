@@ -29,6 +29,7 @@ from writer.storage import (
     load_publish_status,
     load_template,
     record_section_approval,
+    record_section_rejection,
     save_document_edit,
     save_template,
 )
@@ -546,6 +547,87 @@ def approve_section(req: ApproveRequest, http_request: Request) -> ApproveRespon
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Approval failed: {exc}") from exc
     return ApproveResponse(approved=True, status=status)
+
+
+class RejectRequest(BaseModel):
+    therapeutic_area: str
+    disease_type: str
+    drug_name: str
+    section_key: str
+    module: str
+    reviewer: str = Field(..., description="Email of reviewer; must differ from author.")
+    rejection_reason: str = Field(
+        ...,
+        min_length=3,
+        description="Required audit-trail reason for the rejection.",
+    )
+    role: str = Field(
+        default="qa_compliance",
+        description=(
+            "Reviewer role — one of: statistician, medical_writer, qa_compliance, "
+            "clinical_lead, regulatory, pharmacovigilance."
+        ),
+    )
+    run_id: str = ""
+    bucket_name: str | None = None
+
+
+class RejectResponse(BaseModel):
+    rejected: bool
+    status: dict
+
+
+@router.post("/documents/reject", response_model=RejectResponse)
+def reject_section(req: RejectRequest, http_request: Request) -> RejectResponse:
+    """Reviewer rejection gate — clears all approvals and blocks release.
+
+    Preconditions:
+      - publish_status.json exists for this section.
+      - ``reviewer`` email differs from the original ``author``.
+
+    On rejection, all gate approvals are cleared and the section is marked
+    publish-blocked until the author revises and re-generates.
+    """
+    bucket = req.bucket_name or settings.gcs_bucket_name
+    if not bucket:
+        raise HTTPException(status_code=422, detail="bucket_name is required.")
+    req.reviewer = resolve_author(req.reviewer, http_request.headers)
+    if not req.reviewer:
+        raise HTTPException(
+            status_code=422,
+            detail="reviewer is required (body field or IAP header).",
+        )
+    if not req.rejection_reason.strip():
+        raise HTTPException(
+            status_code=422,
+            detail="rejection_reason is required (audit trail).",
+        )
+    if req.role not in GATE_ROLES_ALL:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown role '{req.role}'. Allowed: {', '.join(GATE_ROLES_ALL)}.",
+        )
+    program = ProgramInfo(
+        therapeutic_area=req.therapeutic_area,
+        disease_type=req.disease_type,
+        drug_name=req.drug_name,
+    )
+    try:
+        status = record_section_rejection(
+            bucket_name=bucket,
+            program=program,
+            module_key=req.module,
+            section_key=req.section_key,
+            reviewer=req.reviewer,
+            rejection_reason=req.rejection_reason,
+            run_id=req.run_id,
+            role=req.role,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Rejection failed: {exc}") from exc
+    return RejectResponse(rejected=True, status=status)
 
 
 class GateStatusResponse(BaseModel):

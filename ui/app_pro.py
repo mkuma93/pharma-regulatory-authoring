@@ -1310,6 +1310,9 @@ with gr.Blocks(title="Regulatory Authoring Platform") as demo:
                     _s5_gate_approve_btn = gr.Button(
                         "✅  Sign as selected reviewer", variant="primary", scale=1,
                     )
+                    _s5_gate_reject_btn = gr.Button(
+                        "❌  Reject as selected reviewer", variant="stop", scale=1,
+                    )
                     _s5_gate_refresh_btn = gr.Button(
                         "🔄  Refresh gate status", variant="secondary", scale=1,
                     )
@@ -1812,9 +1815,24 @@ with gr.Blocks(title="Regulatory Authoring Platform") as demo:
         ver    = gate.get("current_version")
         ver_str = f"v{ver}" if ver is not None else "v?"
         release_ready = bool(gate.get("release_ready"))
+        rejected = bool(gate.get("rejected"))
         blocked_reason = (gate.get("publish_blocked_reason") or "").strip()
         publish_blocked = not gate.get("publish_approved", False) and bool(blocked_reason)
-        if publish_blocked:
+        if rejected:
+            rejected_by   = _esc(gate.get("rejected_by", "unknown"))
+            rejected_role = _esc(_ROLE_LABEL_MAP.get(gate.get("rejected_role", ""), gate.get("rejected_role", "")))
+            rejection_reason = _esc(gate.get("rejection_reason", ""))
+            banner = (
+                f"<div style='padding:12px 16px;border-left:6px solid #dc2626;"
+                f"background:#fef2f2;color:#7f1d1d;border-radius:6px;font-weight:600;'>"
+                f"❌ REJECTED {ver_str} · by {rejected_by} ({rejected_role})"
+                f"<div style='font-weight:400;margin-top:4px;font-size:0.9em;'>"
+                f"Reason: {rejection_reason}</div>"
+                f"<div style='font-weight:400;margin-top:4px;font-size:0.85em;color:#991b1b;'>"
+                f"All approvals cleared — author must revise and re-generate before re-review.</div>"
+                f"</div>"
+            )
+        elif publish_blocked:
             banner = (
                 f"<div style='padding:12px 16px;border-left:6px solid #dc2626;"
                 f"background:#fef2f2;color:#7f1d1d;border-radius:6px;font-weight:600;'>"
@@ -1934,6 +1952,42 @@ with gr.Blocks(title="Regulatory Authoring Platform") as demo:
             )
         return b, c, msg
 
+    def _reject_gate_action(selection, role, reason, ta, dis, drug, state, iap_user):
+        if not selection:
+            b, c = _render_gate_cards({})
+            return b, c, "⚠️ Select a section first."
+        if not (iap_user or "").strip():
+            b, c = _load_gate_state(selection, ta, dis, drug, state)
+            return b, c, "⚠️ Set a reviewer persona at the top of the page first."
+        if not (reason or "").strip() or len(reason.strip()) < 3:
+            b, c = _load_gate_state(selection, ta, dis, drug, state)
+            return b, c, "⚠️ Rejection reason is required (min 3 chars)."
+        prog = state.get("content_program") or {}
+        ta   = (ta   or prog.get("therapeutic_area", "")).strip()
+        dis  = (dis  or prog.get("disease_type",     "")).strip()
+        drug = (drug or prog.get("drug_name",        "")).strip()
+        section_key, module = _parse_section_key_module(selection)
+        bucket = state.get("bucket", _DEFAULT_BUCKET)
+        result = _writer_post(
+            "/documents/reject",
+            {
+                "therapeutic_area": ta, "disease_type": dis, "drug_name": drug,
+                "module": module, "section_key": section_key,
+                "reviewer": iap_user, "rejection_reason": reason.strip(),
+                "role": role, "bucket_name": bucket,
+            },
+            iap_user=iap_user,
+        )
+        b, c = _load_gate_state(selection, ta, dis, drug, state)
+        if "error" in result:
+            return b, c, f"❌ Rejection failed: {_esc(result.get('detail') or result['error'])}"
+        msg = (
+            f"🚫 Section **REJECTED** by **{_ROLE_LABEL_MAP.get(role, role)}** "
+            f"(`{_esc(iap_user)}`). All prior approvals cleared. "
+            f"Author must revise and re-generate."
+        )
+        return b, c, msg
+
     _s5_gate_refresh_btn.click(
         fn=_load_gate_state,
         inputs=[_s5_dropdown, _s5_ta_disp, _s5_dis_disp, _s5_drug_disp, _state],
@@ -1942,6 +1996,15 @@ with gr.Blocks(title="Regulatory Authoring Platform") as demo:
 
     _s5_gate_approve_btn.click(
         fn=_approve_gate_action,
+        inputs=[
+            _s5_dropdown, _s5_gate_role, _s5_gate_reason,
+            _s5_ta_disp, _s5_dis_disp, _s5_drug_disp, _state, _iap_user,
+        ],
+        outputs=[_s5_gate_banner, _s5_gate_cards, _s5_gate_msg],
+    )
+
+    _s5_gate_reject_btn.click(
+        fn=_reject_gate_action,
         inputs=[
             _s5_dropdown, _s5_gate_role, _s5_gate_reason,
             _s5_ta_disp, _s5_dis_disp, _s5_drug_disp, _state, _iap_user,

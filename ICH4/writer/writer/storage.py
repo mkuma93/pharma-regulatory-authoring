@@ -544,6 +544,98 @@ def record_section_approval(
     return status
 
 
+def record_section_rejection(
+    bucket_name: str,
+    program: ProgramInfo,
+    module_key: str,
+    section_key: str,
+    reviewer: str,
+    rejection_reason: str,
+    run_id: str,
+    role: str = "qa_compliance",
+) -> dict:
+    """Role-scoped rejection — clears all gates and blocks release.
+
+    Writes an immutable rejection witness record and resets ``publish_status``
+    so the author must revise and re-generate before any further approvals.
+
+    Enforces:
+      * publish_status.json exists
+      * ``reviewer`` != document author (segregation of duties)
+    """
+    if role not in GATE_ROLES_ALL:
+        raise ValueError(
+            f"Unknown role '{role}'. Allowed: {', '.join(GATE_ROLES_ALL)}."
+        )
+
+    status = load_publish_status(bucket_name, program, module_key, section_key)
+    if status is None:
+        raise ValueError(
+            f"No publish_status for {module_key}/{section_key} — "
+            "an admin must call /documents/admin/seed-publish-status first."
+        )
+
+    author = (status.get("author") or "").strip().lower()
+    reviewer_norm = (reviewer or "").strip().lower()
+    if not reviewer_norm:
+        raise ValueError("reviewer email is required.")
+    if reviewer_norm == author:
+        raise ValueError(
+            f"Self-rejection blocked: reviewer '{reviewer}' is the same as author."
+        )
+
+    prefix = program_prefix(program)
+    bkt    = gcs().bucket(bucket_name)
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    # Clear all gates and mark rejected so no approvals can proceed until revised
+    status["gates"]                 = {}
+    status["release_ready"]         = False
+    status["human_approved"]        = False
+    status["rejected"]              = True
+    status["rejected_by"]           = reviewer
+    status["rejected_at"]           = now_iso
+    status["rejected_role"]         = role
+    status["rejection_reason"]      = rejection_reason
+    status["publish_approved"]      = False
+    status["publish_blocked_reason"] = (
+        f"Rejected by {reviewer} ({ROLE_LABELS.get(role, role)}): {rejection_reason}"
+    )
+
+    bkt.blob(_publish_status_path(prefix, module_key, section_key)).upload_from_string(
+        json.dumps(status, indent=2),
+        content_type="application/json",
+    )
+
+    # Immutable rejection witness record
+    reviewer_safe = reviewer.replace("@", "_at_").replace("/", "_")
+    ts_safe       = now_iso.replace(":", "-")
+    rejection_blob_name = (
+        f"{prefix}/rejections/{section_key}/{role}__{ts_safe}__{reviewer_safe}.json"
+    )
+    bkt.blob(rejection_blob_name).upload_from_string(
+        json.dumps({
+            "run_id":           run_id or status.get("run_id", ""),
+            "author":           status.get("author", ""),
+            "reviewer":         reviewer,
+            "role":             role,
+            "role_label":       ROLE_LABELS.get(role, role),
+            "rejected_at":      now_iso,
+            "module_key":       module_key,
+            "section_key":      section_key,
+            "gcs_path":         status.get("gcs_path", ""),
+            "rejection_reason": rejection_reason,
+        }, indent=2),
+        content_type="application/json",
+    )
+
+    logger.info(
+        "[storage] Gate '%s' REJECTED %s/%s by %s (author=%s)",
+        role, module_key, section_key, reviewer, status.get("author", "system"),
+    )
+    return status
+
+
 def admin_seed_publish_status(
     bucket_name: str,
     program: ProgramInfo,
