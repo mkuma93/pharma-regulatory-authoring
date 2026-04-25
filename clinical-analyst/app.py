@@ -1160,20 +1160,33 @@ def resolve(req: ResolveRequest, http_request: Request) -> ResolveResponse:
 
     filter_keys: set[str] | None = set(req.placeholder_keys) if req.placeholder_keys else None
 
+    # Roles that are treatment-allocation bookkeeping; their values are never
+    # required to appear verbatim in CTD narrative text.  Excluding them from
+    # resolved_values prevents the cross-module validator from emitting false-
+    # positive warnings (e.g. "received_acyclovir not found in written text").
+    _SKIP_ROLES = {"treatment_group"}
+
     # Build placeholder metadata from manifest column_mappings
     placeholder_meta: dict[str, dict] = {}
     sources = manifest.get("sources", [])
     for source in sources:
         gcs_path = source.get("gcs_path", "")
         for mapping in source.get("column_mappings", []):
-            pk = mapping.get("placeholder_key", "")
-            cn = mapping.get("column_name", "")
-            if pk and cn and (filter_keys is None or pk in filter_keys):
-                placeholder_meta[pk] = {
-                    "gcs_path":      gcs_path,
-                    "description":   f"{mapping.get('role', '')} — column: {cn}",
-                    "positive_value": mapping.get("positive_value"),  # from manifest
-                }
+            pk   = mapping.get("placeholder_key", "")
+            cn   = mapping.get("column_name", "")
+            role = mapping.get("role", "")
+            if not pk or not cn:
+                continue
+            if role in _SKIP_ROLES:
+                logger.debug("[resolve] Skipping %s (role=%s) — not a CTD narrative value", pk, role)
+                continue
+            if filter_keys is not None and pk not in filter_keys:
+                continue
+            placeholder_meta[pk] = {
+                "gcs_path":      gcs_path,
+                "description":   f"{role} — column: {cn}",
+                "positive_value": mapping.get("positive_value"),  # from manifest
+            }
 
     # NOTE: keys in filter_keys that have no manifest entry are intentionally
     # skipped.  These are structural/narrative template placeholders (e.g.
