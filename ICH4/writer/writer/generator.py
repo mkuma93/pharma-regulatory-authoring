@@ -177,6 +177,7 @@ def write_section(
     clinical_ctx = build_clinical_context(
         bucket_name, program, placeholders,
         resolved_values=resolved_values,
+        llm=llm,
     )
 
     if prior_content is not None:

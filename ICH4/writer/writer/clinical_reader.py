@@ -12,9 +12,14 @@ from __future__ import annotations
 import io
 import logging
 from csv import DictReader
+from typing import TYPE_CHECKING
 
 import pandas as pd
 
+if TYPE_CHECKING:
+    from langchain_openai import ChatOpenAI
+
+from .data_analyst import analyse_dataframe
 from .gcs_client import gcs, program_prefix
 from .models import ProgramInfo
 
@@ -70,16 +75,15 @@ def build_clinical_context(
     program: ProgramInfo,
     placeholder_keys: list[str],
     resolved_values: dict[str, str] | None = None,
+    llm: ChatOpenAI | None = None,
 ) -> dict[str, str]:
     """Return a mapping  placeholder_key → value string for the writer LLM.
 
     Seeds from *resolved_values* (pre-computed by clinical-analyst /resolve).
-    For any keys not already resolved, falls back to raw row strings from GCS
-    so the writer LLM has enough context to write [DATA PENDING] rather than
-    hallucinating figures.
-
-    All statistical computation is owned by clinical-analyst — this function
-    never runs pandas tools or dispatches an LLM.
+    For unresolved keys, runs ``data_analyst.analyse_dataframe()`` (when *llm*
+    is supplied) to compute real statistics (proportions, mean±SD, etc.) from
+    the clinical CSV via safe LLM tool-calling — no arbitrary code execution.
+    Falls back to raw column row snippets when no LLM is provided.
     Returns empty dict if no manifest is found.
     """
     # Start with pre-resolved values; hybrid analyst fills whatever is missing
@@ -135,8 +139,38 @@ def build_clinical_context(
 
     filename_short: dict[str, str] = {p: p.rsplit("/", 1)[-1] for p in file_dfs}
 
-    # Build context: accumulate all column snippets for each placeholder key
+    # ── data_analyst: compute real statistics when LLM is available ──────────
+    # Groups placeholder_descriptions by CSV file so each file is analysed once.
+    if llm is not None:
+        for gcs_path, df in file_dfs.items():
+            # Collect placeholder keys whose source is this CSV file
+            ph_descs: dict[str, str] = {}
+            for pk, col_list in placeholder_meta.items():
+                if pk in context:
+                    continue  # already resolved upstream
+                for entry in col_list:
+                    if entry["gcs_path"] == gcs_path:
+                        desc = entry.get("role") or entry["column_name"]
+                        ph_descs[pk] = desc
+                        break
+            if ph_descs:
+                try:
+                    computed = analyse_dataframe(df, ph_descs, llm)
+                    context.update(computed)
+                    logger.info(
+                        "[clinical_reader] data_analyst computed %d value(s) from %s",
+                        len(computed), filename_short.get(gcs_path, gcs_path),
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "[clinical_reader] data_analyst failed for %s: %s — falling back",
+                        filename_short.get(gcs_path, gcs_path), exc,
+                    )
+
+    # Build context: accumulate raw column snippets for any keys still missing
     for pk, col_list in placeholder_meta.items():
+        if pk in context:
+            continue  # already computed by data_analyst above
         parts: list[str] = []
         for entry in col_list:
             gp = entry["gcs_path"]
