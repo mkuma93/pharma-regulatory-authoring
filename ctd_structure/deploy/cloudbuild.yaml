@@ -18,7 +18,7 @@ substitutions:
   _SERVICE_NAME:  ctd-structure
   _AR_REPO:       ich4
   _TAG:           latest
-  _ICH_INDEX_URL: "https://ich4-index-811317821863.us-central1.run.app"
+  _ICH_INDEX_URL: "https://ich4-index-74ugcbbbya-uc.a.run.app"
   _GCS_BUCKET:    pharma-reguatory-author-life-science
 
 steps:

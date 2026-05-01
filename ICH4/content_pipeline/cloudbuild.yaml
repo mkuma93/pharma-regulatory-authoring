@@ -5,8 +5,8 @@ substitutions:
   _AR_REPO: ich4
   _TAG: latest
   # Service URLs injected as env vars at deploy time
-  _INDEX_SERVICE_URL: https://ich4-index-811317821863.us-central1.run.app
-  _TEMPLATE_SERVICE_URL: https://ich4-template-811317821863.us-central1.run.app
+  _INDEX_SERVICE_URL: https://ich4-index-74ugcbbbya-uc.a.run.app
+  _TEMPLATE_SERVICE_URL: https://ich4-template-74ugcbbbya-uc.a.run.app
   _CLINICAL_ANALYST_SERVICE_URL: "https://clinical-analyst-74ugcbbbya-uc.a.run.app"
 
 steps:

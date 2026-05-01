@@ -6,7 +6,7 @@ cloudrun:
   service_name: ctd-structure
   worker_name: ctd-worker
   ich_index_service: ich4-index
-  ich_index_url: https://ich4-index-811317821863.us-central1.run.app
+  ich_index_url: https://ich4-index-74ugcbbbya-uc.a.run.app
   ar_repo: ich4
 
 pubsub:

@@ -318,6 +318,8 @@ def get_clinical_manifest(
     sources: list[ManifestSource] = []
     total = 0
     for entry in raw.get("sources", []):
+        # GCS manifest stores columns under "column_mappings"; fall back to "columns"
+        raw_cols = entry.get("column_mappings") or entry.get("columns", [])
         cols = [
             ManifestColumn(
                 column_name=c.get("column_name", ""),
@@ -325,7 +327,7 @@ def get_clinical_manifest(
                 ctd_section_keys=c.get("ctd_section_keys", []),
                 placeholder_key=c.get("placeholder_key", ""),
             )
-            for c in entry.get("columns", [])
+            for c in raw_cols
             if c.get("column_name")
         ]
         sources.append(ManifestSource(

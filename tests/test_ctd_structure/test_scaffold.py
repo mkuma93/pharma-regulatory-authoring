@@ -149,19 +149,18 @@ class TestScaffoldInGcs:
         bucket.blob.assert_any_call("programs/neuro/bells/pred/ctd/module1/.keep")
         bucket.blob.return_value.upload_from_string.assert_called()
 
-    def test_skips_existing_blobs(self, capsys):
+    def test_always_uploads_keep_blobs(self, capsys):
+        """scaffold_in_gcs always writes .keep blobs (GCS PUT is idempotent — no exists() check)."""
         bucket = _make_bucket()
-        bucket.blob.return_value.exists.return_value = True  # already exists
 
         scaffold_in_gcs(bucket, "programs/neuro/bells/pred", ["ctd/module1/"])
 
-        # upload_from_string should only be called for the status.json update, not the .keep
-        calls = bucket.blob.return_value.upload_from_string.call_args_list
-        # All calls should be for status.json (content_type=application/json)
-        for c in calls:
-            assert c.kwargs.get("content_type") == "application/json"
-
-        assert "exists" in capsys.readouterr().out
+        # .keep blob must be uploaded regardless
+        keep_calls = [
+            c for c in bucket.blob.return_value.upload_from_string.call_args_list
+            if c.kwargs.get("content_type") == "application/octet-stream"
+        ]
+        assert len(keep_calls) == 1
 
     def test_updates_status_json(self):
         bucket = _make_bucket()

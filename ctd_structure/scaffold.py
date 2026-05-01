@@ -26,6 +26,7 @@ import json
 import os
 import shutil
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from pathlib import Path
 
@@ -103,14 +104,15 @@ def scaffold_in_gcs(bucket: storage.Bucket, base: str, folder_paths: list[str]) 
         folder_paths: List of relative paths from ``flatten_to_folder_paths()``,
                       e.g. ["ctd/module1/", "ctd/module1/1.1_table_of_contents/", ...].
     """
-    for folder in folder_paths:
-        blob_path = f"{base}/{folder}.keep"
-        blob = bucket.blob(blob_path)
-        if not blob.exists():
-            blob.upload_from_string(b"", content_type="application/octet-stream")
-            print(f"  created  gs://{bucket.name}/{base}/{folder}")
-        else:
-            print(f"  exists   gs://{bucket.name}/{base}/{folder}")
+    def _ensure_keep(folder: str) -> None:
+        # Always upload — GCS PUT is idempotent; skipping exists() halves API calls.
+        bucket.blob(f"{base}/{folder}.keep").upload_from_string(
+            b"", content_type="application/octet-stream"
+        )
+
+    with ThreadPoolExecutor(max_workers=32) as pool:
+        list(pool.map(_ensure_keep, folder_paths))
+    print(f"  scaffold  {len(folder_paths)} blobs → gs://{bucket.name}/{base}/")
 
     # Update workflow/status.json
     status_blob = bucket.blob(f"{base}/workflow/status.json")

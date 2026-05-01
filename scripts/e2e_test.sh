@@ -11,14 +11,14 @@ TA="neurology"
 DIS="bells_palsy"
 DRUG="prednisolone"
 
-CTD_API="https://ctd-api-811317821863.us-central1.run.app"
-ANALYST="https://clinical-analyst-811317821863.us-central1.run.app"
-PIPELINE="https://ich4-content-pipeline-811317821863.us-central1.run.app"
-TEMPLATE="https://ich4-template-811317821863.us-central1.run.app"
-WRITER="https://ich4-writer-811317821863.us-central1.run.app"
-INDEX="https://ich4-index-811317821863.us-central1.run.app"
-WORKER="https://ich4-content-worker-811317821863.us-central1.run.app"
-UI="https://reguatory-ui-811317821863.us-central1.run.app"
+CTD_API="https://ctd-api-74ugcbbbya-uc.a.run.app"
+ANALYST="https://clinical-analyst-74ugcbbbya-uc.a.run.app"
+PIPELINE="https://ich4-content-pipeline-74ugcbbbya-uc.a.run.app"
+TEMPLATE="https://ich4-template-74ugcbbbya-uc.a.run.app"
+WRITER="https://ich4-writer-74ugcbbbya-uc.a.run.app"
+INDEX="https://ich4-index-74ugcbbbya-uc.a.run.app"
+WORKER="https://ich4-content-worker-74ugcbbbya-uc.a.run.app"
+UI="https://reguatory-ui-74ugcbbbya-uc.a.run.app"
 
 # ── Colours ───────────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'

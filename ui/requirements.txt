@@ -1,5 +1,5 @@
 # Gradio UI shell
-gradio>=5.0.0
+gradio>=5.0.0,<6.0.0
 
 # HTTP client — calls ctd-api and future service APIs
 requests

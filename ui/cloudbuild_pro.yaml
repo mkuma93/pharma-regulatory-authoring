@@ -75,8 +75,9 @@ steps:
       - "--memory=1Gi"
       - "--cpu=1"
       - "--port=8080"
-      - "--timeout=120"
+      - "--timeout=3600"
       - "--cpu-boost"
+      - "--no-use-http2"
       - "--set-env-vars=GCP_PROJECT_ID=$_PROJECT_ID,CTD_API_URL=$_CTD_API_URL,GCS_BUCKET=$_GCS_BUCKET,ICH4_WRITER_URL=$_ICH4_WRITER_URL,CLINICAL_ANALYST_URL=$_CLINICAL_ANALYST_URL"
       - "--set-secrets=OPENAI_API_KEY=OPENAI_API_KEY:latest"
 

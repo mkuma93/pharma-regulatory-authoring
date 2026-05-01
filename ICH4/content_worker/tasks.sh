@@ -34,8 +34,8 @@ PROJECT_ID="${PROJECT_ID:-pharma-reguatory-author}"
 REGION="${REGION:-us-central1}"
 CONTENT_WORKER_NAME="${CONTENT_WORKER_NAME:-ich4-content-worker}"
 CONTENT_PUBSUB_TOPIC="${CONTENT_PUBSUB_TOPIC:-ich4-content-generation}"
-CONTENT_PIPELINE_URL="${CONTENT_PIPELINE_URL:-https://ich4-content-pipeline-811317821863.us-central1.run.app}"
-WRITER_URL="${WRITER_URL:-https://ich4-writer-811317821863.us-central1.run.app}"
+CONTENT_PIPELINE_URL="${CONTENT_PIPELINE_URL:-https://ich4-content-pipeline-74ugcbbbya-uc.a.run.app}"
+WRITER_URL="${WRITER_URL:-https://ich4-writer-74ugcbbbya-uc.a.run.app}"
 PROJECT_NUMBER="${PROJECT_NUMBER:-$(gcloud projects describe "${PROJECT_ID}" \
   --format='value(projectNumber)' 2>/dev/null || echo 811317821863)}"
 

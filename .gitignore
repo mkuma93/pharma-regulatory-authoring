@@ -48,6 +48,9 @@ ctd/
 ICH4/index/data/
 ICH4/index/knowledge/
 
+# Local notes (not for version control)
+docs/
+
 # Clinical patient data (upload via API, not committed)
 clinical/**/*.csv
 

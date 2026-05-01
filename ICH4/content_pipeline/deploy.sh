@@ -22,9 +22,9 @@ SERVICE_NAME="${SERVICE_NAME:-ich4-content-pipeline}"
 AR_REPO="${AR_REPO:-$(_yaml_get cloudrun.ar_repo)}"
 
 # Service URLs — set these after deploying the index and template services
-INDEX_SERVICE_URL="${INDEX_SERVICE_URL:-https://ich4-index-811317821863.us-central1.run.app}"
+INDEX_SERVICE_URL="${INDEX_SERVICE_URL:-https://ich4-index-74ugcbbbya-uc.a.run.app}"
 TEMPLATE_SERVICE_URL="${TEMPLATE_SERVICE_URL:-}"
-CLINICAL_ANALYST_SERVICE_URL="${CLINICAL_ANALYST_SERVICE_URL:-https://ich4-clinical-analyst-811317821863.us-central1.run.app}"
+CLINICAL_ANALYST_SERVICE_URL="${CLINICAL_ANALYST_SERVICE_URL:-https://clinical-analyst-74ugcbbbya-uc.a.run.app}"
 
 if [[ -z "${TEMPLATE_SERVICE_URL}" ]]; then
   echo "[ERROR] Set TEMPLATE_SERVICE_URL before deploying."

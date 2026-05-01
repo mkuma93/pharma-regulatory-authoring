@@ -11,11 +11,11 @@ class Settings(BaseSettings):
     # URLs for the three internal services
     # Override via env vars or .env file before deploying
     index_service_url: str = Field(
-        default="https://ich4-index-811317821863.us-central1.run.app",
+        default="https://ich4-index-74ugcbbbya-uc.a.run.app",
         description="Base URL of the ICH4 index (RAG) service",
     )
     template_service_url: str = Field(
-        default="https://ich4-template-811317821863.us-central1.run.app",
+        default="https://ich4-template-74ugcbbbya-uc.a.run.app",
         description="Base URL of the ICH4 template generation service",
     )
     clinical_analyst_service_url: str = Field(

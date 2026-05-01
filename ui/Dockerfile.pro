@@ -24,6 +24,7 @@ COPY ui/app_pro.py app.py
 
 ENV PYTHONPATH=/app
 ENV PORT=8080
+ENV PYTHONUNBUFFERED=1
 
 RUN useradd --create-home appuser
 USER appuser

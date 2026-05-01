@@ -33,8 +33,30 @@ from datetime import datetime
 import io
 import tempfile
 
+import json as _json_mod
+import logging as _logging
+
 import gradio as gr
 import requests
+
+# ── Structured logging (Cloud Run captures stderr → Cloud Logging) ─────────────
+_logging.basicConfig(
+    stream=sys.stderr,
+    level=_logging.INFO,
+    format='{"severity":"%(levelname)s","message":%(message)s,"logger":"%(name)s"}',
+    force=True,
+)
+_log = _logging.getLogger("app_pro")
+
+
+def _clog(msg: str, severity: str = "INFO") -> None:
+    """Write a JSON-structured log entry to stderr for Cloud Logging."""
+    print(
+        _json_mod.dumps({"severity": severity, "message": msg}),
+        file=sys.stderr,
+        flush=True,
+    )
+
 
 # ── Path bootstrap ─────────────────────────────────────────────────────────────
 _here = os.path.dirname(os.path.abspath(__file__))
@@ -49,37 +71,51 @@ _DEFAULT_BUCKET       = os.environ.get("GCS_BUCKET",           "pharma-reguatory
 
 
 # ── OIDC ───────────────────────────────────────────────────────────────────────
+_TOKEN_CACHE: dict[str, tuple[str, float]] = {}  # audience → (token, expires_at)
+
 def _oidc_headers(base_url: str) -> dict[str, str]:
+    import time
     from urllib.parse import urlparse
     p = urlparse(base_url)
+    # No auth needed for local proxy — avoids token fetch overhead
+    if p.hostname in ("localhost", "127.0.0.1"):
+        return {}
     audience = f"{p.scheme}://{p.netloc}"
+
+    # Return cached token if still valid (refresh 5 min before expiry)
+    cached = _TOKEN_CACHE.get(audience)
+    if cached and time.time() < cached[1] - 300:
+        return {"Authorization": f"Bearer {cached[0]}"}
+
+    token = ""
     # Try google-auth library first (works on Cloud Run / GCE)
     try:
         from google.auth.transport.requests import Request as AuthRequest
         from google.oauth2.id_token import fetch_id_token
         token = fetch_id_token(AuthRequest(), audience)
-        return {"Authorization": f"Bearer {token}"}
     except Exception:
         pass
+
     # Fallback: use gcloud CLI (works for local dev with gcloud auth login)
-    try:
-        import subprocess
-        result = subprocess.run(
-            ["gcloud", "auth", "print-identity-token"],
-            capture_output=True, text=True, timeout=10
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"gcloud exited {result.returncode}: {result.stderr.strip()}")
-        token = result.stdout.strip()
-        # Validate token looks like a JWT (3 base64url segments separated by dots)
-        if token and token.count(".") == 2 and all(
-            c in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_="
-            for part in token.split(".")
-            for c in part
-        ):
-            return {"Authorization": f"Bearer {token}"}
-    except Exception:
-        pass
+    if not token:
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["gcloud", "auth", "print-identity-token"],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0:
+                t = result.stdout.strip()
+                if t and t.count(".") == 2:
+                    token = t
+        except Exception:
+            pass
+
+    if token:
+        # OIDC tokens are valid for 1 hour; cache for 55 min
+        import time as _t
+        _TOKEN_CACHE[audience] = (token, _t.time() + 3300)
+        return {"Authorization": f"Bearer {token}"}
     return {}
 
 
@@ -105,10 +141,20 @@ def _ctd_get(path: str, params: dict, timeout: int = 30) -> dict:
         return {}
 
 
+def _sanitize_str(v: str) -> str:
+    """Strip characters that break URL query strings in the writer (e.g. apostrophes)."""
+    import re
+    return re.sub(r"['\"]", "", v) if isinstance(v, str) else v
+
+
+def _sanitize_params(d: dict) -> dict:
+    return {k: _sanitize_str(v) for k, v in d.items() if v is not None}
+
+
 def _writer_get(path: str, params: dict, timeout: int = 60) -> dict:
     url = f"{_ICH4_WRITER_URL.rstrip('/')}{path}"
     try:
-        r = requests.get(url, params={k: v for k, v in params.items() if v is not None},
+        r = requests.get(url, params=_sanitize_params(params),
                          headers=_oidc_headers(_ICH4_WRITER_URL), timeout=timeout)
         r.raise_for_status()
         return r.json()
@@ -127,6 +173,8 @@ def _writer_put(path: str, payload: dict, iap_user: str = "", timeout: int = 60)
     headers = _oidc_headers(_ICH4_WRITER_URL)
     if iap_user:
         headers["X-Goog-Authenticated-User-Email"] = iap_user
+    if "disease_type" in payload:
+        payload = {**payload, "disease_type": _sanitize_str(payload["disease_type"])}
     try:
         r = requests.put(url, json=payload, headers=headers, timeout=timeout)
         if r.status_code >= 400:
@@ -142,6 +190,8 @@ def _writer_post(path: str, payload: dict, iap_user: str = "", timeout: int = 60
     headers = _oidc_headers(_ICH4_WRITER_URL)
     if iap_user:
         headers["X-Goog-Authenticated-User-Email"] = iap_user
+    if "disease_type" in payload:
+        payload = {**payload, "disease_type": _sanitize_str(payload["disease_type"])}
     try:
         r = requests.post(url, json=payload, headers=headers, timeout=timeout)
         if r.status_code >= 400:
@@ -181,12 +231,12 @@ def _init_session(bucket: str, browser_session: str):
     if raw.startswith("{"):
         try:
             bs = _json.loads(raw)
-            sid = bs.get("session_id") or str(uuid.uuid4())
+            sid = bs.get("session_id") or "default"
             saved_prog = bs.get("content_program")
         except Exception:
-            sid = raw or str(uuid.uuid4())
+            sid = raw or "default"
     else:
-        sid = raw or str(uuid.uuid4())
+        sid = raw or "default"
 
     bkt  = (bucket or "").strip() or _DEFAULT_BUCKET
     data = _ctd_get("/session", {"session_id": sid, "bucket": bkt})
@@ -364,8 +414,15 @@ def _action_build_framework(state: dict, log: str):
 def _action_publish_framework(state: dict, log: str):
     sid = state.get("session_id", "default")
     bkt = state.get("bucket", _DEFAULT_BUCKET)
+    _clog(f"[PUBLISH] sid={sid} bkt={bkt} folder_paths_len={len(state.get('folder_paths') or [])} approved={state.get('approved')} keys={list(state.keys())}")
     if not state.get("folder_paths"):
-        return state, _log(log, "⚠️ Build the framework first."), _framework_status_html(state)
+        # Recover: if state was empty but a session exists in GCS, reload it.
+        sess = _ctd_get("/session", {"session_id": sid, "bucket": bkt})
+        fp = sess.get("folder_paths") or []
+        _clog(f"[PUBLISH] state had no folder_paths; /session returned {len(fp)} paths")
+        if not fp:
+            return state, _log(log, "⚠️ Build the framework first."), _framework_status_html(state), _program_status_html(state)
+        state = {**state, "folder_paths": fp}
     result = _ctd_post("/approve", {
         "session_id":   sid,
         "bucket":       bkt,
@@ -373,9 +430,12 @@ def _action_publish_framework(state: dict, log: str):
         "state":        state,
     })
     new_state = {**state, **result.get("state_patch", {})}
+    # Ensure approved flag is set locally so step 2 unlocks immediately
+    if "approved" not in new_state or not new_state.get("approved"):
+        new_state["approved"] = True
     msg = result.get("reply", "Framework published.")
     new_log = _log(log, f"✅ {msg}")
-    return new_state, new_log, _framework_status_html(new_state)
+    return new_state, new_log, _framework_status_html(new_state), _program_status_html(new_state)
 
 
 def _action_setup_program(ta: str, dis: str, drug: str, state: dict, log: str):
@@ -383,16 +443,18 @@ def _action_setup_program(ta: str, dis: str, drug: str, state: dict, log: str):
     ta   = (ta   or "").strip()
     dis  = (dis  or "").strip()
     drug = (drug or "").strip()
+    _clog(f"[SETUP] ta={ta!r} dis={dis!r} drug={drug!r} state_keys={list((state or {}).keys())}")
     if not ta or not dis or not drug:
         msg = "⚠️ Please fill in all three fields: Therapeutic Area, Disease, and Drug Name."
         return state, _log(log, msg), _program_status_html(state), msg, state.get("_browser_session_val", "")
 
-    if not (state.get("approved") or state.get("canonical_exists")):
-        msg = "⚠️ Complete Step 1 (publish the document framework) first."
-        return state, _log(log, msg), _program_status_html(state), msg, state.get("_browser_session_val", "")
-
     sid = state.get("session_id", "default")
     bkt = state.get("bucket", _DEFAULT_BUCKET)
+
+    # Skip the state guard: the /copy endpoint itself checks whether the canonical
+    # template exists and returns a clear error if Step 1 hasn't been done yet.
+    # This avoids a slow /session round-trip (4–5 s GCS list) when the state is
+    # empty due to the race between demo.load and the first button click.
     result = _ctd_post("/copy", {
         "session_id":       sid,
         "bucket":           bkt,
@@ -858,13 +920,22 @@ def _render_validation_report_html(report: dict) -> str:
 
 
 # ── Auto-poll ──────────────────────────────────────────────────────────────────
-def _poll(state: dict, log: str, gen_msg: str):
-    """Poll extraction + generation status every 20 s."""
+def _poll(state: dict, gen_msg: str):
+    """Poll extraction + generation status every 30 s.
+
+    READ-ONLY: never writes _state, _log_box, or _gen_msg so it cannot race
+    with concurrent button handlers (Step 2 / 3 / 4 set content_program and
+    other keys into _state; if the timer read a pre-button snapshot and wrote
+    it back *after* the button, it would clobber the button's state update).
+
+    Only outputs the three status banners — all computed from a non-mutating
+    'view' dict that augments current state with the live API status.
+    """
     st  = state or {}
     sid = st.get("session_id")
     bkt = st.get("bucket", _DEFAULT_BUCKET)
     if not sid:
-        return state, log, gen_msg, _framework_status_html(st), _generation_status_html(st, gen_msg)
+        return _framework_status_html(st), _program_status_html(st), _generation_status_html(st, gen_msg)
 
     prog = st.get("content_program") or {}
     data = _ctd_get("/status", {
@@ -873,51 +944,64 @@ def _poll(state: dict, log: str, gen_msg: str):
         "therapeutic_area": prog.get("therapeutic_area") or None,
         "disease_type":     prog.get("disease_type")     or None,
         "drug_name":        prog.get("drug_name")        or None,
-    })
+    }, timeout=8)
     ext  = data.get("extraction") or {}
     cont = data.get("content")    or {}
 
-    new_state = dict(st)
-    new_log   = log
-    new_gen   = gen_msg
+    # Non-mutating view of state, augmented with live status for banner rendering.
+    # We NEVER write back to the real _state from here.
+    view       = dict(st)
+    ext_status = ext.get("status")
 
-    # ── Extraction done ───────────────────────────────────────────────────────
-    if st.get("extraction_in_progress") and ext.get("status") == "done":
-        sess  = _ctd_get("/session", {"session_id": sid, "bucket": bkt})
-        paths = sess.get("folder_paths", [])
-        if paths:
-            new_state = {**new_state, "folder_paths": paths, "extraction_in_progress": False}
+    if ext_status == "done":
+        view["extraction_in_progress"] = False
+        # Load folder_paths for banner rendering if state doesn't have them yet.
+        # This is a fast GCS read; we only store the result in the local view dict.
+        if not view.get("folder_paths"):
+            sess = _ctd_get("/session", {"session_id": sid, "bucket": bkt}, timeout=5)
+            view["folder_paths"] = sess.get("folder_paths", [])
+            if sess.get("canonical_exists"):
+                view["canonical_exists"] = True
+            if sess.get("approved"):
+                view["approved"] = True
             if sess.get("ctd_output"):
-                new_state["ctd_output"] = sess["ctd_output"]
-            n = len(paths)
-            new_log = _log(new_log, f"✅ Framework built — {n} folders. Review and click Publish Framework.")
+                view["ctd_output"] = sess["ctd_output"]
+    elif ext_status in ("running", "refining"):
+        view["extraction_in_progress"] = True
+    elif ext_status is None and view.get("extraction_in_progress"):
+        # /status returned no extraction record — the job may have completed
+        # without writing a status file (e.g. ctd-api restarted after writing
+        # to GCS). Check /session directly for canonical_exists.
+        sess = _ctd_get("/session", {"session_id": sid, "bucket": bkt}, timeout=5)
+        if sess.get("canonical_exists"):
+            view["extraction_in_progress"] = False
+            view["canonical_exists"] = True
+            view["approved"] = sess.get("approved", False)
+            if not view.get("folder_paths"):
+                view["folder_paths"] = sess.get("folder_paths", [])
+            if sess.get("ctd_output"):
+                view["ctd_output"] = sess["ctd_output"]
 
-    # ── Content done / failed ─────────────────────────────────────────────────
+    # ── Content status ────────────────────────────────────────────────────────
+    effective_gen = gen_msg
     if cont:
         cstatus = cont.get("status")
         if cstatus == "done":
             secs     = cont.get("sections_written", "?")
             val_pass = cont.get("validation_passed", False)
             val_sum  = cont.get("validation_summary", "") or ("passed" if val_pass else "issues found")
-            completed_gen = f"✅ Complete — {secs} sections written. Validation: {val_sum}"
-            if st.get("generation_in_progress"):
-                new_state = {**new_state, "generation_in_progress": False, "content_run_id": None}
-                new_log   = _log(new_log, completed_gen)
-            # Always reflect the completed status in gen_msg so page reloads show it
-            new_gen = completed_gen
+            effective_gen = f"✅ Complete — {secs} sections written. Validation: {val_sum}"
+            view["generation_in_progress"] = False
         elif cstatus == "failed":
-            failed_gen = f"❌ Failed — {cont.get('error', 'unknown error')}"
-            if st.get("generation_in_progress"):
-                new_state = {**new_state, "generation_in_progress": False, "content_run_id": None}
-                new_log   = _log(new_log, failed_gen)
-            new_gen = failed_gen
+            effective_gen = f"❌ Failed — {cont.get('error', 'unknown error')}"
+            view["generation_in_progress"] = False
+        elif cstatus == "running":
+            view["generation_in_progress"] = True
 
     return (
-        new_state,
-        new_log,
-        new_gen,
-        _framework_status_html(new_state),
-        _generation_status_html(new_state, new_gen),
+        _framework_status_html(view),
+        _program_status_html(view),
+        _generation_status_html(view, effective_gen),
     )
 
 
@@ -1002,6 +1086,7 @@ html.dark input, html.dark textarea, html.dark select { background-color: #fffff
 _HEAD = """
 <script>
 (function() {
+    // ── Force light mode ──────────────────────────────────────────────────────
     var html = document.documentElement;
     html.classList.remove('dark');
     html.style.colorScheme = 'light';
@@ -1011,6 +1096,70 @@ _HEAD = """
             html.style.colorScheme = 'light';
         }
     }).observe(html, { attributes: true, attributeFilter: ['class'] });
+
+    // ── Auto-reconnect watchdog ───────────────────────────────────────────────
+    // Gradio 5 uses fetch-based SSE (NOT native EventSource) for /queue/data.
+    // We patch fetch() to track the last successful /queue/ response.
+    // Watchdog: if no /queue/ fetch completes for 90 s → show banner + reload.
+    var _lastAlive = Date.now();
+    var _reloading = false;
+    var _banner = null;
+
+    function _showBanner() {
+        if (_banner) return;
+        _banner = document.createElement('div');
+        _banner.innerHTML = '🔄  <strong>Session disconnected — reconnecting&hellip;</strong>';
+        Object.assign(_banner.style, {
+            position:'fixed', top:'0', left:'0', right:'0', zIndex:'99999',
+            background:'#b91c1c', color:'#fff', padding:'12px 20px',
+            fontSize:'15px', textAlign:'center', boxShadow:'0 2px 8px rgba(0,0,0,0.4)'
+        });
+        document.body && document.body.prepend(_banner);
+    }
+
+    function _scheduleReload() {
+        if (_reloading) return;
+        _reloading = true;
+        _showBanner();
+        setTimeout(function() { location.reload(true); }, 3000);
+    }
+
+    // Patch fetch to track liveness via /queue/ requests (Gradio 5 queue polling)
+    var _origFetch = window.fetch;
+    window.fetch = function(url, opts) {
+        var p = _origFetch.apply(this, arguments);
+        var urlStr = (typeof url === 'string') ? url : (url && url.url) || '';
+        if (urlStr.indexOf('/queue/') !== -1 || urlStr.indexOf('/gradio_api/') !== -1) {
+            p.then(function(r) {
+                if (r && r.ok) { _lastAlive = Date.now(); }
+            }).catch(function() {});
+        }
+        return p;
+    };
+
+    // Also keep EventSource patch as fallback (some Gradio builds do use it)
+    if (window.EventSource) {
+        var _OrigES = window.EventSource;
+        window.EventSource = function(url, cfg) {
+            var es = new _OrigES(url, cfg);
+            es.addEventListener('message', function() { _lastAlive = Date.now(); });
+            es.addEventListener('error', function() {
+                if (es.readyState === 2) { _scheduleReload(); }
+            });
+            return es;
+        };
+        window.EventSource.prototype = _OrigES.prototype;
+    }
+
+    // Watchdog: check every 15 s; if no queue activity for 90 s, reload.
+    // Start after 30 s to let demo.load + second yield finish first.
+    setTimeout(function() {
+        setInterval(function() {
+            if (!_reloading && Date.now() - _lastAlive > 90000) {
+                _scheduleReload();
+            }
+        }, 15000);
+    }, 30000);
 })();
 </script>
 """
@@ -1122,7 +1271,7 @@ with gr.Blocks(title="Regulatory Authoring Platform") as demo:
             ))
             with gr.Row():
                 _s2_ta   = gr.Textbox(label="Therapeutic Area",  placeholder="e.g. Neurology",    scale=1)
-                _s2_dis  = gr.Textbox(label="Disease / Indication", placeholder="e.g. Bell's Palsy", scale=1)
+                _s2_dis  = gr.Textbox(label="Disease / Indication", placeholder="e.g. Bells Palsy", scale=1)
                 _s2_drug = gr.Textbox(label="Drug Name",          placeholder="e.g. Prednisolone", scale=1)
             _s2_setup_btn = gr.Button("📁  Set Up Program Folder", variant="primary", elem_classes=["action-btn"])
             _s2_msg = gr.Markdown(value="")
@@ -1189,9 +1338,9 @@ with gr.Blocks(title="Regulatory Authoring Platform") as demo:
                 "Module 5 — Clinical Study Reports)."
             ))
             with gr.Row():
-                _s5_ta_disp   = gr.Textbox(label="Therapeutic Area",    interactive=True, scale=1, placeholder="e.g. neurology")
-                _s5_dis_disp  = gr.Textbox(label="Disease / Indication", interactive=True, scale=1, placeholder="e.g. bells_palsy")
-                _s5_drug_disp = gr.Textbox(label="Drug Name",            interactive=True, scale=1, placeholder="e.g. prednisolone")
+                _s5_ta_disp   = gr.Textbox(label="Therapeutic Area",    interactive=True, scale=1, placeholder="e.g. Neurology")
+                _s5_dis_disp  = gr.Textbox(label="Disease / Indication", interactive=True, scale=1, placeholder="e.g. Bells Palsy")
+                _s5_drug_disp = gr.Textbox(label="Drug Name",            interactive=True, scale=1, placeholder="e.g. Prednisolone")
             with gr.Row():
                 _s5_load_btn = gr.Button("🔄  Load Sections", variant="secondary", scale=1)
                 _s5_load_msg = gr.Markdown(value="")
@@ -1377,31 +1526,103 @@ with gr.Blocks(title="Regulatory Authoring Platform") as demo:
     # ══════════════════════════════════════════════════════════════════════════
     def _on_load(bucket: str, browser_session: str, request: gr.Request = None):
         import json as _json
-        state, sid = _init_session(bucket or _DEFAULT_BUCKET, browser_session)
-        prog = state.get("content_program") or {}
+        # ── GENERATOR: two yields ─────────────────────────────────────────────
+        # Yield 1 (instant, ~0 ms): minimal state from BrowserState localStorage.
+        #   → Gradio unlocks all buttons/tabs immediately.
+        # Yield 2 (after /session API call, ~5-10 s): full state with real
+        #   canonical_exists / approved values from GCS.
+        #   → Step 2 banner updates to "unlocked" without user having to wait.
+        #
+        # NOTE: /status does NOT return canonical_exists, so we cannot rely on
+        # _poll to discover it. The second yield here is the authoritative source.
+        raw = (browser_session or "").strip()
+        saved_prog = None
+        if raw.startswith("{"):
+            try:
+                bs = _json.loads(raw)
+                sid = bs.get("session_id") or str(uuid.uuid4())[:8]
+                saved_prog = bs.get("content_program")
+            except Exception:
+                sid = raw or str(uuid.uuid4())[:8]
+        else:
+            sid = raw or str(uuid.uuid4())[:8]
+
+        bkt = (bucket or "").strip() or _DEFAULT_BUCKET
+        prog = saved_prog or {}
         ta   = prog.get("therapeutic_area", "")
         dis  = prog.get("disease_type",     "")
         drug = prog.get("drug_name",        "")
-        log  = f"[{_ts()}]  Session loaded — ID: {sid[:8]}…"
-        s1b  = _framework_status_html(state)
-        s2b  = _program_status_html(state)
-        # Extract IAP-authenticated user email from request headers.
-        # Cloud Run injects X-Goog-Authenticated-User-Email in format
-        # "accounts.google.com:user@example.com" — strip the prefix.
+
+        # Extract IAP user immediately (no network call needed)
         iap_user = ""
         if request:
-            raw = request.headers.get("x-goog-authenticated-user-email", "")
-            iap_user = raw.split(":", 1)[-1] if ":" in raw else raw
-        # Preserve the full JSON browser session (session_id + content_program).
-        # Writing just `sid` here would clobber the stored content_program on reload.
-        new_browser_session = _json.dumps({"session_id": sid, "content_program": prog}) if prog else sid
-        return (
-            state, new_browser_session, log,
-            s1b, s2b,
+            raw_hdr = request.headers.get("x-goog-authenticated-user-email", "")
+            iap_user = raw_hdr.split(":", 1)[-1] if ":" in raw_hdr else raw_hdr
+
+        minimal_state = {
+            "session_id":              sid,
+            "bucket":                  bkt,
+            "folder_paths":            [],
+            "approved":                False,
+            "canonical_exists":        False,
+            "program_scaffold_exists": bool(prog),
+            "content_program":         prog or None,
+            "content_run_id":          None,
+            "ctd_output":              None,
+            "extraction_in_progress":  False,
+            "generation_in_progress":  False,
+        }
+        log  = f"[{_ts()}]  Session loading — ID: {sid[:8]}…"
+        new_bs = _json.dumps({"session_id": sid, "content_program": prog}) if prog else sid
+
+        # ── YIELD 1: instant — unblocks the entire Gradio UI ─────────────────
+        yield (
+            minimal_state, new_bs, log,
+            _framework_status_html(minimal_state), _program_status_html(minimal_state),
             gr.update(value=ta), gr.update(value=dis), gr.update(value=drug),  # step 2
             gr.update(value=ta), gr.update(value=dis), gr.update(value=drug),  # step 3
             gr.update(value=ta), gr.update(value=dis), gr.update(value=drug),  # step 4
             gr.update(value=ta), gr.update(value=dis), gr.update(value=drug),  # step 5
+            iap_user,
+        )
+
+        # ── YIELD 2: hydrate from GCS (UI already interactive during this) ───
+        # /session takes ~1s warm, up to ~15s if ctd-api is cold-starting.
+        # The UI is already fully interactive during this wait (first yield
+        # already ran). Timeout at 12s — enough for a warm+cold call.
+        data = _ctd_get("/session", {"session_id": sid, "bucket": bkt}, timeout=12)
+        full_state = {
+            **minimal_state,
+            "folder_paths":            data.get("folder_paths", []),
+            "approved":                data.get("approved", False),
+            "canonical_exists":        data.get("canonical_exists", False),
+            "program_scaffold_exists": data.get("program_scaffold_exists", False),
+            "content_program":         data.get("content_program") or saved_prog,
+            "content_run_id":          data.get("content_run_id"),
+            "ctd_output":              data.get("ctd_output"),
+        }
+        full_prog = full_state.get("content_program") or {}
+        ta2   = full_prog.get("therapeutic_area", "")
+        dis2  = full_prog.get("disease_type",     "")
+        drug2 = full_prog.get("drug_name",        "")
+        new_bs2 = _json.dumps({"session_id": sid, "content_program": full_prog}) if full_prog else sid
+        log2  = f"[{_ts()}]  Session ready — ID: {sid[:8]}…"
+
+        yield (
+            full_state, new_bs2, log2,
+            _framework_status_html(full_state), _program_status_html(full_state),
+            gr.update(value=ta2) if ta2 else gr.update(),
+            gr.update(value=dis2) if dis2 else gr.update(),
+            gr.update(value=drug2) if drug2 else gr.update(),
+            gr.update(value=ta2) if ta2 else gr.update(),
+            gr.update(value=dis2) if dis2 else gr.update(),
+            gr.update(value=drug2) if drug2 else gr.update(),
+            gr.update(value=ta2) if ta2 else gr.update(),
+            gr.update(value=dis2) if dis2 else gr.update(),
+            gr.update(value=drug2) if drug2 else gr.update(),
+            gr.update(value=ta2) if ta2 else gr.update(),
+            gr.update(value=dis2) if dis2 else gr.update(),
+            gr.update(value=drug2) if drug2 else gr.update(),
             iap_user,
         )
 
@@ -1435,17 +1656,83 @@ with gr.Blocks(title="Regulatory Authoring Platform") as demo:
     _s1_publish_btn.click(
         fn=_action_publish_framework,
         inputs=[_state, _log_box],
-        outputs=[_state, _log_box, _s1_banner],
+        outputs=[_state, _log_box, _s1_banner, _s2_banner],
     )
 
     # Step 2 — Setup program (also propagates program to steps 3-5)
+    # Generator: first yield sends immediate SSE data (keeps mobile connection alive);
+    # second yield sends the final result after the /copy API call completes.
     def _setup_and_propagate(ta, dis, drug, state, log):
-        new_state, new_log, s2b, msg, new_bs = _action_setup_program(ta, dis, drug, state, log)
+        import threading as _threading
+        _clog(f"[SETUP-GEN] entered ta={ta!r} dis={dis!r} drug={drug!r} state_keys={list((state or {}).keys())}")
+        _no_update = gr.update()
+
+        # ── First yield: immediate loading feedback ──────────────────────────
+        # Use gr.update() for _browser_session so we don't wipe localStorage
+        # while the API call is still in flight.
+        yield (
+            state, _no_update, log,
+            _program_status_html(state), "⏳ Setting up program folder, please wait…",
+            _no_update, _no_update, _no_update,
+            _no_update, _no_update, _no_update,
+            _no_update, _no_update, _no_update,
+            _clinical_status_html("", state),
+            _generation_status_html(state, ""),
+        )
+
+        # ── Run the /copy API call in a background thread ────────────────────
+        # This lets us yield SSE heartbeats every few seconds and prevents the
+        # browser-side SSE connection from timing out during a slow GCS scaffold.
+        _result: list = [None]
+        _done = _threading.Event()
+
+        def _call():
+            try:
+                _result[0] = _action_setup_program(ta, dis, drug, state, log)
+            except Exception as _exc:
+                _result[0] = (
+                    state, _log(log, f"❌ Unexpected error: {_exc}"),
+                    _program_status_html(state), f"❌ Unexpected error: {_exc}", "",
+                )
+            finally:
+                _done.set()
+
+        _threading.Thread(target=_call, daemon=True).start()
+
+        # Heartbeat yields every 4 s keep the SSE stream alive (max 80 s = 20 × 4)
+        for _ in range(20):
+            if _done.wait(timeout=4):
+                break
+            yield (
+                state, _no_update, log,
+                _program_status_html(state), "⏳ Setting up program folder, please wait…",
+                _no_update, _no_update, _no_update,
+                _no_update, _no_update, _no_update,
+                _no_update, _no_update, _no_update,
+                _clinical_status_html("", state),
+                _generation_status_html(state, ""),
+            )
+
+        if _result[0] is None:
+            msg = "⚠️ Request timed out. Please check the service and try again."
+            yield (
+                state, _no_update, log,
+                _program_status_html(state), msg,
+                _no_update, _no_update, _no_update,
+                _no_update, _no_update, _no_update,
+                _no_update, _no_update, _no_update,
+                _clinical_status_html("", state),
+                _generation_status_html(state, ""),
+            )
+            return
+
+        # ── Final yield: actual result ───────────────────────────────────────
+        new_state, new_log, s2b, msg, new_bs = _result[0]
         prog = new_state.get("content_program") or {}
         t = prog.get("therapeutic_area", ta)
         d = prog.get("disease_type",     dis)
         n = prog.get("drug_name",        drug)
-        return (
+        yield (
             new_state, new_bs, new_log, s2b, msg,
             gr.update(value=t), gr.update(value=d), gr.update(value=n),
             gr.update(value=t), gr.update(value=d), gr.update(value=n),
@@ -1602,8 +1889,8 @@ with gr.Blocks(title="Regulatory Authoring Platform") as demo:
         section_key, module = _parse_section_key_module(section)
         bkt = state.get("bucket", _DEFAULT_BUCKET)
         try:
-            r = httpx.get(
-                f"{_WRITER_URL}/documents/version",
+            r = requests.get(
+                f"{_ICH4_WRITER_URL.rstrip('/')}/documents/version",
                 params={
                     "therapeutic_area": ta,
                     "disease_type":     dis,
@@ -1613,7 +1900,7 @@ with gr.Blocks(title="Regulatory Authoring Platform") as demo:
                     "version":          version_num,
                     "bucket_name":      bkt,
                 },
-                headers=_oidc_headers(_WRITER_URL),
+                headers=_oidc_headers(_ICH4_WRITER_URL),
                 timeout=15,
             )
             r.raise_for_status()
@@ -2051,8 +2338,8 @@ with gr.Blocks(title="Regulatory Authoring Platform") as demo:
                 f"<div style='font-size:0.88em;color:{fg};margin-top:2px;'>"
                 f"<strong>{role}</strong>"
                 f"{': ' + actor if actor else ''}</div>"
-                f"{'<div style=\"font-size:0.85em;margin-top:3px;color:' + fg + ';\">' + reason + '</div>' if reason else ''}"
-                f"</div></div>"
+                + (f"<div style='font-size:0.85em;margin-top:3px;color:{fg};'>{reason}</div>" if reason else "")
+                + "</div></div>"
             )
         return (
             f"<div style='font-size:0.9em;'>"
@@ -2265,15 +2552,26 @@ with gr.Blocks(title="Regulatory Authoring Platform") as demo:
         outputs=[_s5_gate_banner, _s5_gate_cards, _s5_admin_msg],
     )
 
-    # ── Auto-poll every 20 s ───────────────────────────────────────────────────
-    _timer = gr.Timer(value=20, active=True)
+    # ── Auto-poll every 30 s ─────────────────────────────────────────────────
+    # _poll is READ-ONLY: it does NOT write _state, _log_box, or _gen_msg.
+    # This prevents a race where the timer reads a pre-button snapshot of state
+    # and writes it back after a button handler (Step 2/3/4) has already written
+    # its own updated state — which would silently wipe content_program and other
+    # keys set by the button, causing all steps after Step 1 to appear broken.
+    # concurrency_id="bg_poll" keeps poll events in their own queue so they
+    # never block button-click events.
+    _timer = gr.Timer(value=30, active=True)
     _timer.tick(
         fn=_poll,
-        inputs=[_state, _log_box, _gen_msg],
-        outputs=[_state, _log_box, _gen_msg, _s1_banner, _s4_banner],
+        inputs=[_state, _gen_msg],
+        outputs=[_s1_banner, _s2_banner, _s4_banner],
+        concurrency_limit=1,
+        concurrency_id="bg_poll",
+        show_progress="hidden",
     )
 
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7860))
+    demo.queue(default_concurrency_limit=20)
     demo.launch(server_name="0.0.0.0", server_port=port)

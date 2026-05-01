@@ -49,7 +49,7 @@ from main import CoordinatorDecision  # Pydantic model only — no LLM calls in 
 # ── Config ────────────────────────────────────────────────────────────────────
 
 _DEFAULT_URL    = os.environ.get("ICH_INDEX_URL",
-                                 "https://ich4-index-811317821863.us-central1.run.app")
+                                 "https://ich4-index-74ugcbbbya-uc.a.run.app")
 _DEFAULT_BUCKET = os.environ.get("GCS_BUCKET",
                                  "pharma-reguatory-author-life-science")
 _GCS_TEMPLATE   = "ctd_structure/ctd"
@@ -215,7 +215,8 @@ def _save_session_state(bucket_name: str, state: dict) -> None:
             "content_run_id":          state.get("content_run_id"),
         }
         _get_bucket(bucket_name).blob(_gcs_session_path(session_id)).upload_from_string(
-            json.dumps(payload), content_type="application/json"
+            json.dumps(payload), content_type="application/json",
+            timeout=15,  # Prevent indefinite hang if GCS throttles after bulk scaffold writes
         )
     except Exception as exc:
         print(f"[api] Warning: could not save session state: {exc}")

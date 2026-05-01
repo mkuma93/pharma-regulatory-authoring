@@ -62,7 +62,7 @@ except ImportError:
 # ── Config ────────────────────────────────────────────────────────────────────
 
 _DEFAULT_URL    = os.environ.get("ICH_INDEX_URL",
-                                 "https://ich4-index-811317821863.us-central1.run.app")
+                                 "https://ich4-index-74ugcbbbya-uc.a.run.app")
 _DEFAULT_BUCKET = os.environ.get("GCS_BUCKET",
                                  "pharma-reguatory-author-life-science")
 _GCS_TEMPLATE  = "ctd_structure/ctd"

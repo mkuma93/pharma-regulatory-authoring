@@ -16,10 +16,10 @@ substitutions:
   _WORKER_NAME:     ich4-content-worker
   _AR_REPO:         ich4
   _TAG:             latest
-  _CONTENT_PIPELINE_URL: "https://ich4-content-pipeline-811317821863.us-central1.run.app"
-  _WRITER_URL:       "https://ich4-writer-811317821863.us-central1.run.app"
-  _INDEX_URL:        "https://ich4-index-811317821863.us-central1.run.app"
-  _CLINICAL_ANALYST_URL: "https://ich4-clinical-analyst-811317821863.us-central1.run.app"
+  _CONTENT_PIPELINE_URL: "https://ich4-content-pipeline-74ugcbbbya-uc.a.run.app"
+  _WRITER_URL:       "https://ich4-writer-74ugcbbbya-uc.a.run.app"
+  _INDEX_URL:        "https://ich4-index-74ugcbbbya-uc.a.run.app"
+  _CLINICAL_ANALYST_URL: "https://clinical-analyst-74ugcbbbya-uc.a.run.app"
   _PUBSUB_TOPIC:    ich4-content-generation
   _SA_NAME:         ich4-content-worker
 
