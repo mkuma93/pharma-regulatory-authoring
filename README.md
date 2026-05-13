@@ -1,6 +1,10 @@
 # pharma-regulatory-authoring
 
-LLM-powered platform for **ICH M4(R4) CTD** regulatory authoring. Automates folder structure generation, clinical data integration, section content writing, cross-module validation, and a 3-gate approval workflow — all through a single Gradio chat interface backed by Cloud Run microservices.
+**Regulatory Document Generation & Validation**
+
+## 🎯 Business Outcome
+
+**Reduce draft-to-release cycle time and strengthen compliance audit readiness** by automating ICH M4(R4) CTD folder structure generation, clinical data integration, section content writing, cross-module validation, and three-gate approval workflows — all through a single Gradio chat interface backed by Cloud Run microservices.
 
 **Live demo** → [`https://reguatory-ui-pro-your-service-id-uc.a.run.app`](https://reguatory-ui-pro-your-service-id-uc.a.run.app)
 
