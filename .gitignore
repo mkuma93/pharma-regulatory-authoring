@@ -51,7 +51,9 @@ ICH4/index/data/
 ICH4/index/knowledge/
 
 # Local notes (not for version control)
-docs/
+docs/*
+!docs/architecture/
+!docs/architecture/AI-Regulatory Authoring_v1.pdf
 
 # Clinical patient data (upload via API, not committed)
 clinical/**/*.csv
