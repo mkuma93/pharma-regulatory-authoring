@@ -29,7 +29,7 @@ from ctd_structure.scaffold import run
 
 ICH_INDEX_URL = os.environ.get(
     "ICH_INDEX_URL",
-    "https://ich4-index-74ugcbbbya-uc.a.run.app",
+    "https://ich4-index-your-service-id-uc.a.run.app",
 )
 
 if __name__ == "__main__":

@@ -12,10 +12,10 @@
 #   {REGION}-docker.pkg.dev/{PROJECT_ID}/{AR_REPO}/{SERVICE_NAME}:{TAG}
 
 substitutions:
-  _PROJECT_ID: pharma-reguatory-author
+  _PROJECT_ID: your-gcp-project-id
   _REGION: us-central1
   _SERVICE_NAME: ich4-index
-  _GCS_BUCKET: pharma-reguatory-author-ich4-index
+  _GCS_BUCKET: your-ich-index-bucket-name
   _AR_REPO: ich4
   # Tag defaults to 'latest' for manual submissions; overridden by trigger with $SHORT_SHA
   _TAG: latest

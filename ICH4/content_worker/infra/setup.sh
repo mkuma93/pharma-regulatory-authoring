@@ -4,11 +4,11 @@
 # One-time Pub/Sub + IAM setup for the content worker.
 # Run this ONCE from your local machine (with owner/editor + iam.admin rights):
 #
-#   PROJECT_ID=pharma-reguatory-author bash ICH4/content_worker/infra/setup.sh
+#   PROJECT_ID=your-gcp-project-id bash ICH4/content_worker/infra/setup.sh
 #
 set -euo pipefail
 
-PROJECT_ID="${PROJECT_ID:-pharma-reguatory-author}"
+PROJECT_ID="${PROJECT_ID:-your-gcp-project-id}"
 REGION="${REGION:-us-central1}"
 WORKER_NAME="${WORKER_NAME:-ich4-content-worker}"
 PUBSUB_TOPIC="${PUBSUB_TOPIC:-ich4-content-generation}"

@@ -96,12 +96,14 @@ def ingest_program(body: IngestProgramRequest):
     passes (e.g. Module 2.7 after Module 5) can retrieve prior evidence via RAG.
     """
     try:
-        build_program_index(body.sections, body.program_namespace)
+        index = build_program_index(body.sections, body.program_namespace)
     except Exception as exc:
         logger.exception("[ingest-program] Failed to build index for %s", body.program_namespace)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    n = len([s for s in body.sections if s.get("content", "").strip()])
+    # Count from the index itself — not from raw input — so the number
+    # reflects what was actually inserted into the VectorStoreIndex.
+    n = len(index.docstore.docs)
     logger.info("[ingest-program] Indexed %d sections → namespace %s", n, body.program_namespace)
     return IngestProgramResponse(
         status="ok",

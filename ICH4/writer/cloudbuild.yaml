@@ -1,5 +1,5 @@
 substitutions:
-  _PROJECT_ID: pharma-reguatory-author
+  _PROJECT_ID: your-gcp-project-id
   _REGION: us-central1
   _SERVICE_NAME: ich4-writer
   _AR_REPO: ich4

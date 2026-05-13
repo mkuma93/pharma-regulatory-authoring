@@ -2,7 +2,7 @@
 
 LLM-powered platform for **ICH M4(R4) CTD** regulatory authoring. Automates folder structure generation, clinical data integration, section content writing, cross-module validation, and a 3-gate approval workflow — all through a single Gradio chat interface backed by Cloud Run microservices.
 
-**Live demo** → [`https://reguatory-ui-pro-74ugcbbbya-uc.a.run.app`](https://reguatory-ui-pro-74ugcbbbya-uc.a.run.app)
+**Live demo** → [`https://reguatory-ui-pro-your-service-id-uc.a.run.app`](https://reguatory-ui-pro-your-service-id-uc.a.run.app)
 
 ---
 
@@ -190,7 +190,7 @@ Upload a trial CSV via the **🔬 Clinical Data Upload** panel. The LLM mapper i
 ## GCS Layout
 
 ```
-gs://pharma-reguatory-author-life-science/
+gs://your-gcs-bucket-name/
 ├── ctd_structure/
 │   ├── ctd/                              # Canonical ICH M4 folder template
 │   └── users/{session_id}/
@@ -218,13 +218,13 @@ gs://pharma-reguatory-author-life-science/
 
 | Resource | Value |
 |---|---|
-| Project | `pharma-reguatory-author` |
+| Project | `your-gcp-project-id` |
 | Region | `us-central1` |
 | Compute | Cloud Run (all services) |
-| Storage | GCS `pharma-reguatory-author-life-science` |
+| Storage | GCS `your-gcs-bucket-name` |
 | Messaging | Pub/Sub `ctd-extraction`, `ich4-content-generation` |
 | Secrets | Secret Manager: `OPENAI_API_KEY` |
-| Registry | Artifact Registry `us-central1-docker.pkg.dev/pharma-reguatory-author/ich4` |
+| Registry | Artifact Registry `us-central1-docker.pkg.dev/your-gcp-project-id/ich4` |
 | LLM | OpenAI `gpt-4o` / `gpt-4o-mini` |
 
 ---
@@ -235,28 +235,28 @@ Each service has its own `cloudbuild.yaml`. Submit from the **repo root**:
 
 ```bash
 # UI
-gcloud builds submit . --config=ui/cloudbuild.yaml --project=pharma-reguatory-author
+gcloud builds submit . --config=ui/cloudbuild.yaml --project=your-gcp-project-id
 
 # CTD API
-gcloud builds submit . --config=ctd_structure/api/cloudbuild.yaml --project=pharma-reguatory-author
+gcloud builds submit . --config=ctd_structure/api/cloudbuild.yaml --project=your-gcp-project-id
 
 # Clinical Analyst
-gcloud builds submit . --config=clinical-analyst/cloudbuild.yaml --project=pharma-reguatory-author
+gcloud builds submit . --config=clinical-analyst/cloudbuild.yaml --project=your-gcp-project-id
 
 # ICH4 Writer (doc gen + validator + document reader)
-gcloud builds submit . --config=ICH4/writer/cloudbuild.yaml --project=pharma-reguatory-author
+gcloud builds submit . --config=ICH4/writer/cloudbuild.yaml --project=your-gcp-project-id
 
 # ICH4 Content Worker
-gcloud builds submit . --config=ICH4/content_worker/cloudbuild.yaml --project=pharma-reguatory-author
+gcloud builds submit . --config=ICH4/content_worker/cloudbuild.yaml --project=your-gcp-project-id
 
 # ICH4 Index
-gcloud builds submit . --config=ICH4/index/cloudbuild.yaml --project=pharma-reguatory-author
+gcloud builds submit . --config=ICH4/index/cloudbuild.yaml --project=your-gcp-project-id
 
 # ICH4 Template
-gcloud builds submit . --config=ICH4/template/cloudbuild.yaml --project=pharma-reguatory-author
+gcloud builds submit . --config=ICH4/template/cloudbuild.yaml --project=your-gcp-project-id
 
 # ICH4 Content Pipeline
-gcloud builds submit . --config=ICH4/content_pipeline/cloudbuild.yaml --project=pharma-reguatory-author
+gcloud builds submit . --config=ICH4/content_pipeline/cloudbuild.yaml --project=your-gcp-project-id
 ```
 
 ---
@@ -375,7 +375,7 @@ The `reguatory-ui` coordinator classifies every user message and routes it to th
 ## GCS Layout
 
 ```
-gs://pharma-reguatory-author-life-science/
+gs://your-gcs-bucket-name/
 ├── ctd_structure/
 │   ├── ctd/                              # Canonical ICH M4 folder template (.keep markers)
 │   └── users/{session_id}/
@@ -468,13 +468,13 @@ The UI polls for content generation status every 20 seconds and posts a completi
 
 | Resource | Value |
 |---|---|
-| Project | `pharma-reguatory-author` |
+| Project | `your-gcp-project-id` |
 | Region | `us-central1` |
 | Compute | Cloud Run (all services, min-instances=0, `--no-allow-unauthenticated`) |
-| Storage | GCS `pharma-reguatory-author-life-science` |
+| Storage | GCS `your-gcs-bucket-name` |
 | Messaging | Pub/Sub topics: `ctd-extraction`, `ich4-content-generation` |
 | Secrets | Secret Manager: `OPENAI_API_KEY` |
-| Registry | Artifact Registry `us-central1-docker.pkg.dev/pharma-reguatory-author/ich4` |
+| Registry | Artifact Registry `us-central1-docker.pkg.dev/your-gcp-project-id/ich4` |
 | Access | Identity-Aware Proxy (IAP) on `reguatory-ui` |
 | LLM | OpenAI `gpt-4o-mini` |
 
@@ -496,28 +496,28 @@ Each service has its own `cloudbuild.yaml`. Submit from the **repo root**:
 
 ```bash
 # UI (Gradio + coordinator)
-gcloud builds submit . --config=ui/cloudbuild.yaml --project=pharma-reguatory-author
+gcloud builds submit . --config=ui/cloudbuild.yaml --project=your-gcp-project-id
 
 # CTD API (structure backend)
-gcloud builds submit . --config=ctd_structure/api/cloudbuild.yaml --project=pharma-reguatory-author
+gcloud builds submit . --config=ctd_structure/api/cloudbuild.yaml --project=your-gcp-project-id
 
 # Clinical Analyst
-gcloud builds submit . --config=clinical-analyst/cloudbuild.yaml --project=pharma-reguatory-author
+gcloud builds submit . --config=clinical-analyst/cloudbuild.yaml --project=your-gcp-project-id
 
 # ICH4 Writer (doc gen + validator + document reader)
-gcloud builds submit . --config=ICH4/writer/cloudbuild.yaml --project=pharma-reguatory-author
+gcloud builds submit . --config=ICH4/writer/cloudbuild.yaml --project=your-gcp-project-id
 
 # ICH4 Content Worker
-gcloud builds submit . --config=ICH4/content_worker/cloudbuild.yaml --project=pharma-reguatory-author
+gcloud builds submit . --config=ICH4/content_worker/cloudbuild.yaml --project=your-gcp-project-id
 
 # ICH4 Index
-gcloud builds submit . --config=ICH4/index/cloudbuild.yaml --project=pharma-reguatory-author
+gcloud builds submit . --config=ICH4/index/cloudbuild.yaml --project=your-gcp-project-id
 
 # ICH4 Template
-gcloud builds submit . --config=ICH4/template/cloudbuild.yaml --project=pharma-reguatory-author
+gcloud builds submit . --config=ICH4/template/cloudbuild.yaml --project=your-gcp-project-id
 
 # ICH4 Content Pipeline
-gcloud builds submit . --config=ICH4/content_pipeline/cloudbuild.yaml --project=pharma-reguatory-author
+gcloud builds submit . --config=ICH4/content_pipeline/cloudbuild.yaml --project=your-gcp-project-id
 ```
 
 ---
@@ -668,7 +668,7 @@ The `reguatory-ui` coordinator classifies every user message into one of these i
 ## GCS Layout
 
 ```
-gs://pharma-reguatory-author-life-science/
+gs://your-gcs-bucket-name/
 ├── ctd_structure/
 │   ├── ctd/                              # Canonical ICH M4 folder template (.keep markers)
 │   └── users/{session_id}/
@@ -727,13 +727,13 @@ LangGraph graph that runs after writing. Catches drug name mismatches, demograph
 
 | Resource | Value |
 |---|---|
-| Project | `pharma-reguatory-author` |
+| Project | `your-gcp-project-id` |
 | Region | `us-central1` |
 | Compute | Cloud Run (all services, min-instances=0) |
-| Storage | GCS bucket `pharma-reguatory-author-life-science` |
+| Storage | GCS bucket `your-gcs-bucket-name` |
 | Messaging | Pub/Sub topics: `ctd-extraction`, `ich4-content-generation` |
 | Secrets | Secret Manager: `OPENAI_API_KEY` |
-| Registry | Artifact Registry `us-central1-docker.pkg.dev/pharma-reguatory-author/cloud-run-source-deploy` |
+| Registry | Artifact Registry `us-central1-docker.pkg.dev/your-gcp-project-id/cloud-run-source-deploy` |
 
 ---
 

@@ -25,20 +25,20 @@ Public API (signatures unchanged):
   extract_from_ich_index(ich_index_url, reviewer_email) → (CTDStructureOutput, EvaluationResult)
   refine_from_feedback(ich_index_url, feedback, current_output) → (CTDStructureOutput, EvaluationResult)
 """
-from __future__ import annotations
+from __future__ import annotations  # allows | union syntax in type hints on Python 3.9
 
-import json
-import os
-import re
-import smtplib
-import subprocess
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
+import json       # parsing LLM JSON responses from the ICH index
+import os         # reading SMTP_HOST, SMTP_PORT, CTD_REVIEWER_EMAIL env vars
+import re         # stripping markdown fences from LLM responses in _extract_json_object
+import smtplib    # sending plain-SMTP approval emails in _send_approval_email
+import subprocess # running 'gcloud auth print-identity-token' for local dev auth
+from email.mime.multipart import MIMEMultipart  # constructing multipart MIME email
+from email.mime.text import MIMEText            # attaching plain-text body to MIME email
 
-import requests
-from langgraph.graph import END, StateGraph
-from pydantic import BaseModel, Field
-from typing_extensions import TypedDict
+import requests                          # HTTP POST to ICH index /index/query endpoint
+from langgraph.graph import END, StateGraph  # END sentinel and graph builder for the pipeline
+from pydantic import BaseModel, Field    # domain models with schema validation
+from typing_extensions import TypedDict  # LangGraph state dict — must be TypedDict, not Pydantic
 
 
 # ── Pydantic output models ────────────────────────────────────────────────────
@@ -98,18 +98,18 @@ CTDModule.model_rebuild()
 
 
 class EvaluationIssue(BaseModel):
-    path: str
-    level: str   # "module" | "section" | "subsection"
-    reason: str
+    path: str    # slash-separated folder path of the offending node, e.g. 'module3/3.2.S_drug_substance'
+    level: str   # granularity of the issue: "module" | "section" | "subsection" | "sub_subsection"
+    reason: str  # human-readable explanation of why this path failed validation
 
 
 class EvaluationResult(BaseModel):
-    passed: bool
-    issues: list[EvaluationIssue] = Field(default_factory=list)
-    summary: str = ""
+    passed: bool                                              # True only when issues list is empty
+    issues: list[EvaluationIssue] = Field(default_factory=list)  # all structural problems found
+    summary: str = ""                                         # one-paragraph human-readable verdict
 
 
-EvaluationResult.model_rebuild()
+EvaluationResult.model_rebuild()  # defensive rebuild — EvaluationIssue is already resolved but kept for symmetry
 
 
 class CTDStructureOutput(BaseModel):
@@ -125,22 +125,22 @@ class CTDStructureOutput(BaseModel):
         program-specific study sub-folders injected by expand_program_studies
         at depth 5+.
         """
-        paths: list[str] = []
+        paths: list[str] = []  # accumulates every folder path in depth-first order
 
         def _recurse(prefix: str, sub: "CTDSubsection") -> None:
-            p = f"{prefix}{sub.key}/"
-            paths.append(p)
+            p = f"{prefix}{sub.key}/"  # append this subsection's key with trailing slash
+            paths.append(p)            # record this level before descending into children
             for child in sub.sub_subsections:
-                _recurse(p, child)
+                _recurse(p, child)     # recurse: handles depth 4 (sub-subsection) and beyond
 
         for module in self.modules:
-            mp = f"ctd/{module.key}/"
+            mp = f"ctd/{module.key}/"   # level 1: e.g. 'ctd/module2/'
             paths.append(mp)
             for section in module.sections:
-                sp = f"{mp}{section.key}/"
+                sp = f"{mp}{section.key}/"  # level 2: e.g. 'ctd/module2/2.5_clinical_overview/'
                 paths.append(sp)
                 for sub in section.subsections:
-                    _recurse(sp, sub)
+                    _recurse(sp, sub)   # level 3+: delegates to recursive helper
         return paths
 
 
@@ -657,18 +657,20 @@ _ICH_M4_CANONICAL: list[tuple] = [
 
 # Structural gaps in the canonical template are code bugs; one rebuild pass is
 # enough to self-heal any transient deserialisation edge-cases.
-_MAX_REPAIR_RETRIES = 1
+_MAX_REPAIR_RETRIES = 1  # cap repair_canonical loop to prevent infinite cycles on persistent bugs
 
 
 class EnrichState(TypedDict):
-    ich_index_url: str
-    reviewer_email: str | None
+    # TypedDict (not Pydantic BaseModel) because LangGraph merges node return dicts
+    # directly into this state via shallow merge — Pydantic models are not compatible.
+    ich_index_url: str          # base URL of the ICH4/index Cloud Run service; empty string skips enrichment
+    reviewer_email: str | None  # approval email recipient; falls back to CTD_REVIEWER_EMAIL env var
     # Optional program-specific expansion — see expand_program_studies docstring.
-    program_context: dict | None
-    modules: list[dict]  # serialised CTDModule dicts (keys fixed, labels may be enriched)
-    evaluation: dict | None
-    repair_retries: int  # counts repair_canonical invocations; capped at _MAX_REPAIR_RETRIES
-    human_notified: bool
+    program_context: dict | None  # studies dict for Module 5 injection; None = static template only
+    modules: list[dict]           # serialised CTDModule dicts (keys fixed, labels may be enriched)
+    evaluation: dict | None       # serialised EvaluationResult; None until evaluate_completeness runs
+    repair_retries: int           # counts repair_canonical invocations; capped at _MAX_REPAIR_RETRIES
+    human_notified: bool          # True if approval email was sent successfully
 
 
 # ── Query for label enrichment only ──────────────────────────────────────────
@@ -693,73 +695,73 @@ def _gcloud_token(audience: str = "") -> str:
     Always fetches a fresh token — callers should not cache the result across
     long-running operations because OIDC tokens expire after ~1 hour.
     """
-    if audience:
+    if audience:  # skip token fetch entirely if no audience provided (unauthenticated calls)
         try:
             r = subprocess.run(
                 ["gcloud", "auth", "print-identity-token", f"--audiences={audience}"],
-                capture_output=True, text=True,
+                capture_output=True, text=True,  # capture stdout/stderr; don't print to terminal
             )
-            if r.returncode == 0:
-                return r.stdout.strip()
+            if r.returncode == 0:          # gcloud succeeded — use its token
+                return r.stdout.strip()    # strip trailing newline from gcloud output
         except FileNotFoundError:
-            pass  # gcloud not installed (e.g. inside a container)
+            pass  # gcloud not installed (e.g. inside a container) — fall through to metadata server
         try:
-            import google.auth.transport.requests
+            import google.auth.transport.requests  # lazy import — only needed inside Cloud Run/GCE
             import google.oauth2.id_token
             return google.oauth2.id_token.fetch_id_token(
-                google.auth.transport.requests.Request(), audience
+                google.auth.transport.requests.Request(), audience  # uses metadata server inside GCP
             )
         except Exception:
-            pass
-    return ""
+            pass  # metadata server unreachable — return empty token below
+    return ""  # no token available; caller will proceed without Authorization header
 
 
 def _post_query(url: str, question: str) -> str:
     """POST a question to the ICH index with a fresh token on each call."""
-    token = _gcloud_token(audience=url)
-    headers = {"Content-Type": "application/json"}
+    token = _gcloud_token(audience=url)        # fresh OIDC token scoped to this URL
+    headers = {"Content-Type": "application/json"}  # ICH index expects JSON body
     if token:
-        headers["Authorization"] = f"Bearer {token}"
+        headers["Authorization"] = f"Bearer {token}"  # attach token only when available
     resp = requests.post(
-        f"{url}/index/query",
+        f"{url}/index/query",   # /index/query is the only endpoint called from structure.py
         headers=headers,
-        json={"question": question},
-        timeout=60,
+        json={"question": question},  # body schema expected by the ICH index service
+        timeout=60,  # 60s — enrichment calls can be slow; subsection queries are skipped entirely
     )
-    resp.raise_for_status()
-    return resp.json().get("answer", "")
+    resp.raise_for_status()  # raise HTTPError on 4xx/5xx so caller's except block catches it
+    return resp.json().get("answer", "")  # index returns {"answer": "<label text>"}
 
 
 def _extract_json_object(text: str) -> dict | None:
-    text = re.sub(r"```(?:json)?|```", "", text).strip()
-    start, end = text.find("{"), text.rfind("}") + 1
-    if start == -1 or end == 0:
+    text = re.sub(r"```(?:json)?|```", "", text).strip()  # strip markdown code fences the LLM may add
+    start, end = text.find("{"), text.rfind("}") + 1       # find outermost JSON object boundaries
+    if start == -1 or end == 0:  # no braces found — LLM returned plain text or empty string
         return None
     try:
-        return json.loads(text[start:end])
+        return json.loads(text[start:end])  # parse only the JSON object, ignoring surrounding prose
     except Exception:
-        return None
+        return None  # malformed JSON — caller treats missing label as no-op and keeps canonical
 
 
 # ── Canonical tree builder ────────────────────────────────────────────────────
 
 def _build_subsection(raw: tuple) -> "CTDSubsection":
     """Recursively build a CTDSubsection from a (key, label, children) tuple."""
-    key, label, children = raw
+    key, label, children = raw  # unpack the 3-element canonical tuple
     return CTDSubsection(
         key=key,
         label=label,
-        sub_subsections=[_build_subsection(c) for c in children],
+        sub_subsections=[_build_subsection(c) for c in children],  # recurse for each child tuple
     )
 
 
 def _build_canonical_modules() -> list[CTDModule]:
     """Instantiate CTDModule objects directly from _ICH_M4_CANONICAL (4-level)."""
-    modules: list[CTDModule] = []
-    for mod_key, mod_label, sections_raw in _ICH_M4_CANONICAL:
-        sections: list[CTDSection] = []
-        for sec_key, sec_label, subs_raw in sections_raw:
-            subsections = [_build_subsection(s) for s in subs_raw]
+    modules: list[CTDModule] = []  # accumulates all 5 CTDModule objects
+    for mod_key, mod_label, sections_raw in _ICH_M4_CANONICAL:  # iterate over 5 top-level modules
+        sections: list[CTDSection] = []  # accumulates CTDSection objects for this module
+        for sec_key, sec_label, subs_raw in sections_raw:  # iterate over sections within this module
+            subsections = [_build_subsection(s) for s in subs_raw]  # build depth-3+ tree recursively
             sections.append(
                 CTDSection(key=sec_key, label=sec_label, subsections=subsections)
             )
@@ -771,17 +773,17 @@ def _build_canonical_modules() -> list[CTDModule]:
 
 def _collect_canonical_paths() -> set[str]:
     """Return every expected folder path from _ICH_M4_CANONICAL for validation."""
-    paths: set[str] = set()
+    paths: set[str] = set()  # stores slash-joined paths like 'module3/3.2.S_drug_substance'
 
     def _recurse(prefix: str, children: list) -> None:
-        for key, _label, grandchildren in children:
-            p = f"{prefix}/{key}"
+        for key, _label, grandchildren in children:  # _label unused — only path matters here
+            p = f"{prefix}/{key}"  # build slash-joined path from root to this node
             paths.add(p)
-            _recurse(p, grandchildren)
+            _recurse(p, grandchildren)  # recurse into sub-subsections
 
     for mod_key, _mod_label, sections in _ICH_M4_CANONICAL:
-        paths.add(mod_key)
-        _recurse(mod_key, sections)
+        paths.add(mod_key)         # add top-level module key (e.g. 'module3')
+        _recurse(mod_key, sections)  # add all descendant paths under this module
     return paths
 
 
@@ -800,11 +802,11 @@ def _ich_number_prefix(key: str) -> str:
         'module3'                     -> ''
         'study_001_phase3_t2d'        -> ''  # program-specific, no ICH number
     """
-    idx = key.find("_")
+    idx = key.find("_")           # find first underscore separating ICH number from label words
     if idx == -1:
-        return ""
-    prefix = key[:idx]
-    return prefix if "." in prefix else ""
+        return ""                  # no underscore — key has no ICH number prefix
+    prefix = key[:idx]             # e.g. '3.2.S.1' from '3.2.S.1_general_information'
+    return prefix if "." in prefix else ""  # reject 'module3', 'study001' — no dot = no ICH number
 
 
 def _prefix_is_child(parent_key: str, child_key: str) -> bool:
@@ -813,11 +815,11 @@ def _prefix_is_child(parent_key: str, child_key: str) -> bool:
     Valid: child prefix starts with parent prefix + "."
     Skipped (returns True) when either key has no ICH numeric prefix.
     """
-    parent_pfx = _ich_number_prefix(parent_key)
-    child_pfx = _ich_number_prefix(child_key)
+    parent_pfx = _ich_number_prefix(parent_key)  # e.g. '3.2.S' from '3.2.S_drug_substance'
+    child_pfx = _ich_number_prefix(child_key)    # e.g. '3.2.S.1' from '3.2.S.1_general_information'
     if not parent_pfx or not child_pfx:
-        return True  # no ICH number to validate
-    return child_pfx.startswith(parent_pfx + ".")
+        return True  # one side has no ICH number (module key or program-specific) — skip check
+    return child_pfx.startswith(parent_pfx + ".")  # valid: '3.2.S.1'.startswith('3.2.S.') → True
 
 
 def _evaluate(modules: list[CTDModule]) -> EvaluationResult:
@@ -835,62 +837,62 @@ def _evaluate(modules: list[CTDModule]) -> EvaluationResult:
                                   present.  Program-specific additions are
                                   allowed but cannot remove canonical paths.
     """
-    issues: list[EvaluationIssue] = []
+    issues: list[EvaluationIssue] = []  # collects all validation failures found during the walk
 
     # ── 1. Module presence ────────────────────────────────────────────────────
-    canonical_keys = {mod_key for mod_key, *_ in _ICH_M4_CANONICAL}
-    present_keys = {m.key for m in modules}
-    for key in canonical_keys - present_keys:
+    canonical_keys = {mod_key for mod_key, *_ in _ICH_M4_CANONICAL}  # expected: {'module1'..'module5'}
+    present_keys = {m.key for m in modules}                           # actual keys in assembled tree
+    for key in canonical_keys - present_keys:  # any module in canonical but absent from tree
         issues.append(EvaluationIssue(
             path=key, level="module",
             reason="module missing from canonical template"))
 
     # ── Walk the tree collecting paths and running checks ─────────────────────
-    actual_paths: set[str] = set()
+    actual_paths: set[str] = set()  # all slash-joined paths seen in the assembled tree
 
     def _walk_sub(prefix: str, parent_key: str, sub: CTDSubsection) -> None:
-        sp = f"{prefix}{sub.key}"
-        actual_paths.add(sp)
+        sp = f"{prefix}{sub.key}"  # full slash-joined path to this subsection
+        actual_paths.add(sp)       # record so check 5 can compare against canonical
         # ── 4. Prefix chain check ─────────────────────────────────────────────
-        if not _prefix_is_child(parent_key, sub.key):
+        if not _prefix_is_child(parent_key, sub.key):  # e.g. '4.2.1' under '3.2.S' is invalid
             issues.append(EvaluationIssue(
                 path=sp, level="subsection",
                 reason=(
                     f"ICH prefix mismatch: '{sub.key}' is not a numbered "
                     f"child of '{parent_key}'"
                 )))
-        seen: set[str] = set()
+        seen: set[str] = set()  # tracks child keys within this subsection to catch duplicates
         for child in sub.sub_subsections:
-            if child.key in seen:
+            if child.key in seen:  # duplicate key at depth 4
                 issues.append(EvaluationIssue(
                     path=f"{sp}/{child.key}", level="sub_subsection",
                     reason=f"duplicate sub-subsection key '{child.key}'"))
             seen.add(child.key)
-            _walk_sub(f"{sp}/", sub.key, child)
+            _walk_sub(f"{sp}/", sub.key, child)  # recurse: sub becomes parent for its children
 
     for mod in modules:
-        actual_paths.add(mod.key)
+        actual_paths.add(mod.key)  # record top-level module path (e.g. 'module3')
         # ── 2. Empty module ───────────────────────────────────────────────────
-        if not mod.sections:
+        if not mod.sections:  # a module with no sections is a structural bug
             issues.append(EvaluationIssue(
                 path=mod.key, level="module",
                 reason="module has zero sections"))
-            continue
-        seen_sec: set[str] = set()
+            continue  # skip section walk — nothing to traverse
+        seen_sec: set[str] = set()  # tracks section keys within this module
         for sec in mod.sections:
-            sec_path = f"{mod.key}/{sec.key}"
+            sec_path = f"{mod.key}/{sec.key}"  # e.g. 'module2/2.5_clinical_overview'
             actual_paths.add(sec_path)
             # ── 3a. Duplicate section ─────────────────────────────────────────
-            if sec.key in seen_sec:
+            if sec.key in seen_sec:  # same section key appears twice under this module
                 issues.append(EvaluationIssue(
                     path=sec_path, level="section",
                     reason=f"duplicate section key '{sec.key}'"))
             seen_sec.add(sec.key)
-            seen_sub: set[str] = set()
+            seen_sub: set[str] = set()  # tracks subsection keys within this section
             for sub in sec.subsections:
-                sub_path = f"{sec_path}/{sub.key}"
+                sub_path = f"{sec_path}/{sub.key}"  # e.g. '…/2.5_clinical_overview/2.5.1_…'
                 # ── 3b. Duplicate subsection ──────────────────────────────────
-                if sub.key in seen_sub:
+                if sub.key in seen_sub:  # same subsection key appears twice under this section
                     issues.append(EvaluationIssue(
                         path=sub_path, level="subsection",
                         reason=f"duplicate subsection key '{sub.key}'"))
@@ -899,38 +901,38 @@ def _evaluate(modules: list[CTDModule]) -> EvaluationResult:
                 _walk_sub(f"{sec_path}/", sec.key, sub)
 
     # ── 5. Canonical completeness ─────────────────────────────────────────────
-    canonical_paths = _collect_canonical_paths()
-    for path in sorted(canonical_paths - actual_paths):
+    canonical_paths = _collect_canonical_paths()         # full expected path set from _ICH_M4_CANONICAL
+    for path in sorted(canonical_paths - actual_paths):  # paths expected but not found in assembled tree
         issues.append(EvaluationIssue(
             path=path, level="section",
             reason="canonical ICH M4(R4) path missing from assembled structure"))
 
-    passed = not issues
+    passed = not issues  # True only when zero issues were found
     if passed:
-        n_sec = sum(len(m.sections) for m in modules)
-        n_sub = sum(len(s.subsections) for m in modules for s in m.sections)
+        n_sec = sum(len(m.sections) for m in modules)                          # total section count
+        n_sub = sum(len(s.subsections) for m in modules for s in m.sections)  # total subsection count
         n_subsub = sum(
             len(sub.sub_subsections)
             for m in modules for s in m.sections for sub in s.subsections
-        )
+        )  # total sub-subsection count
         summary = (
             f"Structure complete: {len(modules)} modules, {n_sec} sections, "
             f"{n_sub} subsections, {n_subsub} sub-subsections"
             f" — ready for human review."
         )
     else:
-        lines = [f"{len(issues)} issue(s) found:"]
+        lines = [f"{len(issues)} issue(s) found:"]  # header line for the issues report
         for iss in issues:
             lines.append(f"  [{iss.level.upper()}] {iss.path} — {iss.reason}")
-        summary = "\n".join(lines)
+        summary = "\n".join(lines)  # multi-line string shown to the reviewer
     return EvaluationResult(passed=passed, issues=issues, summary=summary)
 
 
 # ── Email helpers ─────────────────────────────────────────────────────────────
 
 def _format_email_body(modules: list[CTDModule], evaluation: EvaluationResult) -> str:
-    sep = "=" * 60
-    status = "PASSED" if evaluation.passed else "ISSUES FOUND"
+    sep = "=" * 60                                  # visual separator line in plain-text email
+    status = "PASSED" if evaluation.passed else "ISSUES FOUND"  # one-word verdict for email subject line
     lines = [
         "ICH CTD Canonical Folder Structure — Approval Required",
         sep, "",
@@ -938,52 +940,54 @@ def _format_email_body(modules: list[CTDModule], evaluation: EvaluationResult) -
         evaluation.summary, "",
         "── Proposed folder structure ──────────────────────────────────────",
     ]
-    flagged = {i.path: i.reason for i in evaluation.issues}
+    flagged = {i.path: i.reason for i in evaluation.issues}  # path → reason lookup for inline annotation
     for mod in modules:
-        ann = f"  ◄ {flagged[mod.key]}" if mod.key in flagged else ""
+        ann = f"  ◄ {flagged[mod.key]}" if mod.key in flagged else ""  # annotate flagged modules
         lines.append(f"\n{mod.key}/  {mod.label}{ann}")
         for sec in mod.sections:
-            sec_path = f"{mod.key}/{sec.key}"
-            ann = f"  ◄ {flagged[sec_path]}" if sec_path in flagged else ""
+            sec_path = f"{mod.key}/{sec.key}"                              # build path for lookup
+            ann = f"  ◄ {flagged[sec_path]}" if sec_path in flagged else ""  # annotate flagged sections
             lines.append(f"  {sec.key}/  {sec.label}{ann}")
             for sub in sec.subsections:
-                sub_path = f"{mod.key}/{sec.key}/{sub.key}"
-                ann = f"  ◄ {flagged[sub_path]}" if sub_path in flagged else ""
+                sub_path = f"{mod.key}/{sec.key}/{sub.key}"                     # depth-3 path
+                ann = f"  ◄ {flagged[sub_path]}" if sub_path in flagged else ""  # annotate flagged subsections
                 lines.append(f"    {sub.key}/  {sub.label}{ann}")
                 for subsub in sub.sub_subsections:
-                    ss_path = f"{mod.key}/{sec.key}/{sub.key}/{subsub.key}"
-                    ann = f"  ◄ {flagged[ss_path]}" if ss_path in flagged else ""
+                    ss_path = f"{mod.key}/{sec.key}/{sub.key}/{subsub.key}"       # depth-4 path
+                    ann = f"  ◄ {flagged[ss_path]}" if ss_path in flagged else ""  # annotate flagged sub-subsections
                     lines.append(f"      {subsub.key}/  {subsub.label}{ann}")
     lines += [
         "", sep,
         "Reply APPROVE or REJECT to this email, or confirm in the terminal.",
     ]
-    return "\n".join(lines)
+    return "\n".join(lines)  # single string with newlines — sent as plain/text MIME part
 
 
 def _send_approval_email(to_address: str, subject: str, body: str) -> None:
-    host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
-    port = int(os.environ.get("SMTP_PORT", "587"))
-    user = os.environ["SMTP_USER"]
-    password = os.environ["SMTP_PASSWORD"]
-    msg = MIMEMultipart("alternative")
+    host = os.environ.get("SMTP_HOST", "smtp.gmail.com")  # default to Gmail; override for SendGrid etc.
+    port = int(os.environ.get("SMTP_PORT", "587"))         # 587 = STARTTLS; use 465 for SSL
+    user = os.environ["SMTP_USER"]                         # raises KeyError if not set — caught by caller
+    password = os.environ["SMTP_PASSWORD"]                 # raises KeyError if not set — caught by caller
+    msg = MIMEMultipart("alternative")  # multipart/alternative allows plain + HTML parts
     msg["Subject"] = subject
-    msg["From"] = user
-    msg["To"] = to_address
-    msg.attach(MIMEText(body, "plain"))
-    with smtplib.SMTP(host, port) as smtp:
-        smtp.ehlo()
-        smtp.starttls()
-        smtp.login(user, password)
-        smtp.sendmail(user, to_address, msg.as_string())
+    msg["From"] = user         # sender address shown in email client
+    msg["To"] = to_address     # reviewer's email address
+    msg.attach(MIMEText(body, "plain"))  # only plain text for now — no HTML part
+    with smtplib.SMTP(host, port) as smtp:  # opens connection; context manager ensures close
+        smtp.ehlo()      # identify client to server (required before STARTTLS)
+        smtp.starttls()  # upgrade to TLS — must be called before login
+        smtp.login(user, password)              # authenticate with SMTP credentials
+        smtp.sendmail(user, to_address, msg.as_string())  # send the fully-assembled message
 
 
 # ── Graph nodes ───────────────────────────────────────────────────────────────
 
 def load_canonical(state: EnrichState) -> dict:
     """Build the full module tree from the hardcoded canonical template."""
-    modules = _build_canonical_modules()
-    return {"modules": [m.model_dump() for m in modules]}
+    # state is intentionally unused — this is the seed node; nothing upstream has produced state yet.
+    # LangGraph requires all nodes to accept state as their first argument regardless.
+    modules = _build_canonical_modules()  # instantiate all 5 CTDModule objects from _ICH_M4_CANONICAL
+    return {"modules": [m.model_dump() for m in modules]}  # seeds state["modules"] for downstream nodes
 
 
 def enrich_labels(state: EnrichState) -> dict:
@@ -992,68 +996,68 @@ def enrich_labels(state: EnrichState) -> dict:
     Keys are NEVER changed — only labels may be updated.
     If the index is unreachable the canonical labels are kept as-is.
     """
-    url = state.get("ich_index_url", "")
+    url = state.get("ich_index_url", "")  # empty string means enrichment is disabled
     if not url:
-        return {}
+        return {}  # return empty dict — LangGraph merges nothing, state["modules"] unchanged
 
-    modules = [CTDModule(**m) for m in state["modules"]]
-    enriched: list[dict] = []
+    modules = [CTDModule(**m) for m in state["modules"]]  # deserialise from state dicts to Pydantic models
+    enriched: list[dict] = []  # accumulates enriched module dicts to return
 
     for mod in modules:
         try:
-            ans = _post_query(url, _LABEL_QUERY.format(level="module", key=mod.key))
-            data = _extract_json_object(ans)
-            if data and data.get("label"):
-                mod = mod.model_copy(update={"label": data["label"]})
+            ans = _post_query(url, _LABEL_QUERY.format(level="module", key=mod.key))  # query ICH index for module label
+            data = _extract_json_object(ans)    # parse {"label": "..."} from response
+            if data and data.get("label"):      # only update if index returned a non-empty label
+                mod = mod.model_copy(update={"label": data["label"]})  # Pydantic immutable update — key is never changed
         except Exception:
-            pass
+            pass  # network error or bad JSON — keep canonical label as-is
 
-        enriched_sections: list[CTDSection] = []
+        enriched_sections: list[CTDSection] = []  # accumulates enriched sections for this module
         for sec in mod.sections:
             try:
-                ans = _post_query(url, _LABEL_QUERY.format(level="section", key=sec.key))
+                ans = _post_query(url, _LABEL_QUERY.format(level="section", key=sec.key))  # query ICH index for section label
                 data = _extract_json_object(ans)
                 if data and data.get("label"):
-                    sec = sec.model_copy(update={"label": data["label"]})
+                    sec = sec.model_copy(update={"label": data["label"]})  # update label only; key unchanged
             except Exception:
-                pass
+                pass  # keep canonical label on any failure
             enriched_sections.append(sec)
 
-        mod = mod.model_copy(update={"sections": enriched_sections})
-        enriched.append(mod.model_dump())
+        mod = mod.model_copy(update={"sections": enriched_sections})  # attach enriched sections to module
+        enriched.append(mod.model_dump())  # serialise back to dict for state merge
 
-    return {"modules": enriched}
+    return {"modules": enriched}  # LangGraph merges this into state, replacing state["modules"]
 
 
 def evaluate_completeness(state: EnrichState) -> dict:
-    modules = [CTDModule(**m) for m in state["modules"]]
-    evaluation = _evaluate(modules)
-    return {"evaluation": evaluation.model_dump()}
+    modules = [CTDModule(**m) for m in state["modules"]]  # deserialise enriched module dicts to Pydantic models
+    evaluation = _evaluate(modules)                         # run all 5 structural checks
+    return {"evaluation": evaluation.model_dump()}          # seeds state["evaluation"] for after_evaluate routing
 
 
 def notify_human(state: EnrichState) -> dict:
-    reviewer = state.get("reviewer_email") or os.environ.get("CTD_REVIEWER_EMAIL")
-    if not reviewer:
+    reviewer = state.get("reviewer_email") or os.environ.get("CTD_REVIEWER_EMAIL")  # state value overrides env var
+    if not reviewer:  # no email configured — skip silently
         print("[ctd_structure] No reviewer email — skipping notification.")
-        return {"human_notified": False}
+        return {"human_notified": False}  # update state so callers know email was skipped
 
-    modules = [CTDModule(**m) for m in state["modules"]]
+    modules = [CTDModule(**m) for m in state["modules"]]  # deserialise for email body formatting
     evaluation = (
-        EvaluationResult(**state["evaluation"])
+        EvaluationResult(**state["evaluation"])  # deserialise evaluation result from state
         if state.get("evaluation")
-        else EvaluationResult(passed=False, summary="Evaluation not available.")
+        else EvaluationResult(passed=False, summary="Evaluation not available.")  # fallback if node was skipped
     )
-    subject = "[CTD Approval Required] ICH M4(R4) Canonical Structure"
-    body = _format_email_body(modules, evaluation)
+    subject = "[CTD Approval Required] ICH M4(R4) Canonical Structure"  # fixed subject for all approval emails
+    body = _format_email_body(modules, evaluation)  # build plain-text email body with folder tree
     try:
-        _send_approval_email(reviewer, subject, body)
+        _send_approval_email(reviewer, subject, body)  # raises KeyError on missing SMTP_USER/SMTP_PASSWORD
         print(f"[ctd_structure] Approval email sent → {reviewer}")
-        return {"human_notified": True}
+        return {"human_notified": True}   # email delivered successfully
     except KeyError as exc:
-        print(f"[ctd_structure] Email skipped — missing env var: {exc}")
+        print(f"[ctd_structure] Email skipped — missing env var: {exc}")  # SMTP_USER or SMTP_PASSWORD not set
     except Exception as exc:
-        print(f"[ctd_structure] Email failed: {exc}")
-    return {"human_notified": False}
+        print(f"[ctd_structure] Email failed: {exc}")  # network error, auth failure, etc.
+    return {"human_notified": False}  # email was not sent — caller can check this flag
 
 
 # ── Dynamic expansion node ────────────────────────────────────────────────────
@@ -1080,44 +1084,44 @@ def expand_program_studies(state: EnrichState) -> dict:
     parent 4th-level ICH category folder.  Keys must be folder-safe strings.
     This is a NO-OP when ``program_context`` is absent or ``studies`` is empty.
     """
-    ctx = state.get("program_context") or {}
-    study_map: dict[str, list[dict]] = ctx.get("studies", {})
+    ctx = state.get("program_context") or {}               # guard against None
+    study_map: dict[str, list[dict]] = ctx.get("studies", {})  # maps 5.3.x.y key → list of study entries
     if not study_map:
-        return {}
+        return {}  # no studies to inject — leave state["modules"] unchanged
 
-    modules = [CTDModule(**m) for m in state["modules"]]
-    updated = False
+    modules = [CTDModule(**m) for m in state["modules"]]  # deserialise from state dicts
+    updated = False  # flag: True if at least one study sub-folder was injected
 
     def _inject(sub: CTDSubsection) -> CTDSubsection:
         nonlocal updated
-        new_children = [_inject(c) for c in sub.sub_subsections]
-        for s in study_map.get(sub.key, []):
+        new_children = [_inject(c) for c in sub.sub_subsections]  # recurse to find matching leaf nodes
+        for s in study_map.get(sub.key, []):  # look up this subsection's key in the study map
             if not s.get("key"):
-                continue
+                continue  # skip malformed entries with no key
             new_children.append(CTDSubsection(
-                key=s["key"],
-                label=s.get("label", s["key"]),
-                sub_subsections=[],
+                key=s["key"],                      # program-specific folder key, e.g. 'study_001_ba'
+                label=s.get("label", s["key"]),    # human-readable label; falls back to key if missing
+                sub_subsections=[],                # studies are leaf nodes — no children
             ))
             updated = True
-        if new_children != list(sub.sub_subsections):
+        if new_children != list(sub.sub_subsections):  # only rebuild if something changed
             return sub.model_copy(update={"sub_subsections": new_children})
-        return sub
+        return sub  # unchanged — return original object
 
     result_modules: list[CTDModule] = []
     for mod in modules:
-        if mod.key != "module5":
+        if mod.key != "module5":       # expansion only applies to Module 5 (clinical study reports)
             result_modules.append(mod)
             continue
         new_sections = [
             sec.model_copy(update={"subsections": [_inject(s) for s in sec.subsections]})
-            for sec in mod.sections
+            for sec in mod.sections    # walk every section in module5 to find injection targets
         ]
         result_modules.append(mod.model_copy(update={"sections": new_sections}))
 
-    if updated:
+    if updated:  # only update state if at least one study was injected
         return {"modules": [m.model_dump() for m in result_modules]}
-    return {}
+    return {}  # nothing changed — return empty dict so LangGraph skips the merge
 
 
 # ── Recovery node ─────────────────────────────────────────────────────────────
@@ -1134,32 +1138,32 @@ def repair_canonical(state: EnrichState) -> dict:
     ``repair_retries`` is incremented here so ``after_evaluate`` can cap the
     loop at ``_MAX_REPAIR_RETRIES`` and avoid infinite cycles.
     """
-    evaluation = EvaluationResult(**state["evaluation"])
-    canonical_modules = _build_canonical_modules()
-    canonical_by_key = {m.key: m for m in canonical_modules}
+    evaluation = EvaluationResult(**state["evaluation"])      # deserialise to access issue list
+    canonical_modules = _build_canonical_modules()              # fresh canonical tree — always correct
+    canonical_by_key = {m.key: m for m in canonical_modules}   # lookup: module key → CTDModule
 
-    flagged_mods: set[str] = set()
+    flagged_mods: set[str] = set()  # module keys that have at least one structural issue
     for issue in evaluation.issues:
-        flagged_mods.add(issue.path.split("/")[0])
+        flagged_mods.add(issue.path.split("/")[0])  # first path segment is always the module key
 
     repaired: list[dict] = []
     for mod_data in state["modules"]:
         mod_key = mod_data["key"]
         if mod_key in flagged_mods and mod_key in canonical_by_key:
-            print(f"[ctd_structure] repair: rebuilt canonical {mod_key}")
-            repaired.append(canonical_by_key[mod_key].model_dump())
+            print(f"[ctd_structure] repair: rebuilt canonical {mod_key}")  # log which module was repaired
+            repaired.append(canonical_by_key[mod_key].model_dump())  # replace with clean canonical copy
         else:
-            repaired.append(mod_data)
+            repaired.append(mod_data)  # unflagged module — preserve as-is (keeps program-specific additions)
 
-    present = {m["key"] for m in repaired}
+    present = {m["key"] for m in repaired}  # keys already in the repaired list
     for mod in canonical_modules:
-        if mod.key not in present:
+        if mod.key not in present:  # module was entirely missing (not just flagged)
             print(f"[ctd_structure] repair: added missing {mod.key}")
-            repaired.append(mod.model_dump())
+            repaired.append(mod.model_dump())  # append the missing canonical module
 
     return {
-        "modules": repaired,
-        "repair_retries": state.get("repair_retries", 0) + 1,
+        "modules": repaired,                                    # patched module list
+        "repair_retries": state.get("repair_retries", 0) + 1,  # increment counter so after_evaluate can cap the loop
     }
 
 
@@ -1173,36 +1177,39 @@ def after_evaluate(state: EnrichState) -> str:
     prevent infinite loops.  Duplicate/prefix issues are advisory and go
     directly to the reviewer.
     """
-    evaluation = EvaluationResult(**state["evaluation"])
+    evaluation = EvaluationResult(**state["evaluation"])  # deserialise to inspect issue list
     structural = [
         i for i in evaluation.issues
-        if i.level == "module"
-        or i.reason.startswith("canonical ICH")
-    ]
+        if i.level == "module"                      # missing or empty module
+        or i.reason.startswith("canonical ICH")     # canonical path absent from assembled tree
+    ]  # duplicate/prefix issues are advisory — route straight to reviewer without repair
     if structural and state.get("repair_retries", 0) < _MAX_REPAIR_RETRIES:
-        return "repair_canonical"
-    return "notify_human"
+        return "repair_canonical"  # trigger repair loop — will re-run evaluate_completeness after
+    return "notify_human"  # no structural issues, or repair retries exhausted — proceed to reviewer
 
 
 # ── Graph assembly ────────────────────────────────────────────────────────────
 
 def _build_graph():
-    g = StateGraph(EnrichState)
-    g.add_node("load_canonical",         load_canonical)
-    g.add_node("expand_program_studies", expand_program_studies)
-    g.add_node("enrich_labels",          enrich_labels)
-    g.add_node("evaluate_completeness",  evaluate_completeness)
-    g.add_node("repair_canonical",       repair_canonical)
-    g.add_node("notify_human",           notify_human)
+    g = StateGraph(EnrichState)  # creates a graph whose nodes share EnrichState as their state type
 
-    g.set_entry_point("load_canonical")
-    g.add_edge("load_canonical",          "expand_program_studies")
-    g.add_edge("expand_program_studies",  "enrich_labels")
-    g.add_edge("enrich_labels",           "evaluate_completeness")
-    g.add_conditional_edges("evaluate_completeness", after_evaluate)
-    g.add_edge("repair_canonical",        "evaluate_completeness")
-    g.add_edge("notify_human",            END)
-    return g.compile()
+    # ── Register all nodes ────────────────────────────────────────────────────
+    g.add_node("load_canonical",         load_canonical)          # seeds state["modules"] from hardcoded template
+    g.add_node("expand_program_studies", expand_program_studies)  # injects program-specific study folders into module5
+    g.add_node("enrich_labels",          enrich_labels)           # queries ICH index to improve module/section labels
+    g.add_node("evaluate_completeness",  evaluate_completeness)   # validates tree against canonical; sets state["evaluation"]
+    g.add_node("repair_canonical",       repair_canonical)        # rebuilds flagged modules from canonical template
+    g.add_node("notify_human",           notify_human)            # sends approval email to reviewer
+
+    # ── Wire edges ────────────────────────────────────────────────────────────
+    g.set_entry_point("load_canonical")                                    # pipeline always starts here
+    g.add_edge("load_canonical",          "expand_program_studies")        # always expand after seeding
+    g.add_edge("expand_program_studies",  "enrich_labels")                 # always enrich after expansion
+    g.add_edge("enrich_labels",           "evaluate_completeness")         # always evaluate after enrichment
+    g.add_conditional_edges("evaluate_completeness", after_evaluate)       # routes to repair_canonical or notify_human
+    g.add_edge("repair_canonical",        "evaluate_completeness")         # re-evaluate after repair (loop)
+    g.add_edge("notify_human",            END)                             # terminal node — pipeline ends here
+    return g.compile()  # compile locks the graph and returns a runnable Pregel executor
 
 
 _graph = _build_graph()
@@ -1229,8 +1236,12 @@ def refine_from_feedback(
     Returns:
         (updated_CTDStructureOutput, EvaluationResult)
     """
-    print(f"[ctd_structure] refine_from_feedback: '{feedback[:120]}'")
-    return extract_from_ich_index(ich_index_url, reviewer_email=None)
+    print(f"[ctd_structure] refine_from_feedback: '{feedback[:120]}'")  # logs first 120 chars only; feedback is NOT forwarded to the pipeline
+    # BUG (Item 7): feedback is silently discarded here — EnrichState has no feedback field,
+    # so there is no mechanism to route it into the LangGraph pipeline.
+    # current_output is also ignored — this is a full rebuild, not a refinement.
+    # The result is identical to calling extract_from_ich_index directly.
+    return extract_from_ich_index(ich_index_url, reviewer_email=None)  # full rebuild from canonical; feedback has no effect
 
 
 def extract_from_ich_index(
@@ -1270,20 +1281,20 @@ def extract_from_ich_index(
     Returns:
         (CTDStructureOutput, EvaluationResult)
     """
-    result = _graph.invoke({
-        "ich_index_url": ich_index_url or "",
-        "reviewer_email": reviewer_email,
-        "program_context": program_context,
-        "modules": [],
-        "evaluation": None,
-        "repair_retries": 0,
-        "human_notified": False,
+    result = _graph.invoke({  # runs the full pipeline synchronously; blocks until notify_human completes
+        "ich_index_url": ich_index_url or "",  # normalise None to empty string for enrich_labels guard
+        "reviewer_email": reviewer_email,       # passed through state to notify_human
+        "program_context": program_context,     # passed through state to expand_program_studies
+        "modules": [],        # empty list — load_canonical will populate this
+        "evaluation": None,   # None until evaluate_completeness runs
+        "repair_retries": 0,  # counter starts at zero; capped at _MAX_REPAIR_RETRIES
+        "human_notified": False,  # updated by notify_human
     })
 
-    modules = [CTDModule(**m) for m in result["modules"]]
+    modules = [CTDModule(**m) for m in result["modules"]]  # deserialise final module list from state
     evaluation = (
-        EvaluationResult(**result["evaluation"])
+        EvaluationResult(**result["evaluation"])  # deserialise evaluation result
         if result.get("evaluation")
-        else EvaluationResult(passed=False, summary="Evaluation did not run.")
+        else EvaluationResult(passed=False, summary="Evaluation did not run.")  # defensive fallback
     )
-    return CTDStructureOutput(modules=modules, evaluation=evaluation), evaluation
+    return CTDStructureOutput(modules=modules, evaluation=evaluation), evaluation  # return both for API consumers

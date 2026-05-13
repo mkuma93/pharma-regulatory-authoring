@@ -5,20 +5,20 @@
 set -euo pipefail
 
 # ── Config ────────────────────────────────────────────────────────────────────
-BUCKET=pharma-reguatory-author-life-science
+BUCKET=your-gcs-bucket-name
 SESSION_ID="e2e-test-$(date +%s)"
 TA="neurology"
 DIS="bells_palsy"
 DRUG="prednisolone"
 
-CTD_API="https://ctd-api-74ugcbbbya-uc.a.run.app"
-ANALYST="https://clinical-analyst-74ugcbbbya-uc.a.run.app"
-PIPELINE="https://ich4-content-pipeline-74ugcbbbya-uc.a.run.app"
-TEMPLATE="https://ich4-template-74ugcbbbya-uc.a.run.app"
-WRITER="https://ich4-writer-74ugcbbbya-uc.a.run.app"
-INDEX="https://ich4-index-74ugcbbbya-uc.a.run.app"
-WORKER="https://ich4-content-worker-74ugcbbbya-uc.a.run.app"
-UI="https://reguatory-ui-74ugcbbbya-uc.a.run.app"
+CTD_API="https://ctd-api-your-service-id-uc.a.run.app"
+ANALYST="https://clinical-analyst-your-service-id-uc.a.run.app"
+PIPELINE="https://ich4-content-pipeline-your-service-id-uc.a.run.app"
+TEMPLATE="https://ich4-template-your-service-id-uc.a.run.app"
+WRITER="https://ich4-writer-your-service-id-uc.a.run.app"
+INDEX="https://ich4-index-your-service-id-uc.a.run.app"
+WORKER="https://ich4-content-worker-your-service-id-uc.a.run.app"
+UI="https://reguatory-ui-your-service-id-uc.a.run.app"
 
 # ── Colours ───────────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'

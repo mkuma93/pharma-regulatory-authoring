@@ -10,13 +10,13 @@
 #   4. Create/update Pub/Sub topic + push subscription
 
 substitutions:
-  _PROJECT_ID:    pharma-reguatory-author
+  _PROJECT_ID:    your-gcp-project-id
   _REGION:        us-central1
   _WORKER_NAME:   ctd-worker
   _AR_REPO:       ich4
   _TAG:           latest
-  _ICH_INDEX_URL: "https://ich4-index-74ugcbbbya-uc.a.run.app"
-  _GCS_BUCKET:    pharma-reguatory-author-life-science
+  _ICH_INDEX_URL: "https://ich4-index-your-service-id-uc.a.run.app"
+  _GCS_BUCKET:    your-gcs-bucket-name
   _PUBSUB_TOPIC:  ctd-extraction
 
 steps:

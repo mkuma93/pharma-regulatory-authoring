@@ -49,13 +49,13 @@ from main import CoordinatorDecision  # Pydantic model only — no LLM calls in 
 # ── Config ────────────────────────────────────────────────────────────────────
 
 _DEFAULT_URL    = os.environ.get("ICH_INDEX_URL",
-                                 "https://ich4-index-74ugcbbbya-uc.a.run.app")
+                                 "https://ich4-index-your-service-id-uc.a.run.app")
 _DEFAULT_BUCKET = os.environ.get("GCS_BUCKET",
-                                 "pharma-reguatory-author-life-science")
+                                 "your-gcs-bucket-name")
 _GCS_TEMPLATE   = "ctd_structure/ctd"
 _GCS_PROGRAMS   = "therapeutic-area"
 _PUBSUB_TOPIC         = os.environ.get("PUBSUB_TOPIC", "ctd-extraction")
-_GCP_PROJECT    = os.environ.get("GCP_PROJECT_ID", "pharma-reguatory-author")
+_GCP_PROJECT    = os.environ.get("GCP_PROJECT_ID", "your-gcp-project-id")
 _RUNNING_TIMEOUT_SECONDS        = 20 * 60   # 20 min
 # Content status timeout is used only by the combined GET /status auto-poll below.
 # ctd-api does not generate content — it just reads the status blob that

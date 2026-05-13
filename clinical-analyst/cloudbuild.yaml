@@ -5,12 +5,12 @@
 #   gcloud builds submit . --config=clinical-analyst/cloudbuild.yaml
 
 substitutions:
-  _PROJECT_ID:   pharma-reguatory-author
+  _PROJECT_ID:   your-gcp-project-id
   _REGION:       us-central1
   _SERVICE_NAME: clinical-analyst
   _AR_REPO:      ich4
   _TAG:          latest
-  _GCS_BUCKET:   pharma-reguatory-author-life-science
+  _GCS_BUCKET:   your-gcs-bucket-name
   _LLM_MODEL:    gpt-4o-mini
 
 steps:

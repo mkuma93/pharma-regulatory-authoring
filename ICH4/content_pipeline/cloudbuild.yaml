@@ -1,13 +1,13 @@
 substitutions:
-  _PROJECT_ID: pharma-reguatory-author
+  _PROJECT_ID: your-gcp-project-id
   _REGION: us-central1
   _SERVICE_NAME: ich4-content-pipeline
   _AR_REPO: ich4
   _TAG: latest
   # Service URLs injected as env vars at deploy time
-  _INDEX_SERVICE_URL: https://ich4-index-74ugcbbbya-uc.a.run.app
-  _TEMPLATE_SERVICE_URL: https://ich4-template-74ugcbbbya-uc.a.run.app
-  _CLINICAL_ANALYST_SERVICE_URL: "https://clinical-analyst-74ugcbbbya-uc.a.run.app"
+  _INDEX_SERVICE_URL: https://ich4-index-your-service-id-uc.a.run.app
+  _TEMPLATE_SERVICE_URL: https://ich4-template-your-service-id-uc.a.run.app
+  _CLINICAL_ANALYST_SERVICE_URL: "https://clinical-analyst-your-service-id-uc.a.run.app"
 
 steps:
   # 0. Run unit tests — deployment is blocked if any test fails

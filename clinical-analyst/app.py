@@ -61,13 +61,15 @@ logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-_DEFAULT_BUCKET         = os.environ.get("GCS_BUCKET", "pharma-reguatory-author-life-science")
-_LLM_MODEL              = os.environ.get("LLM_MODEL", "gpt-4o-mini")
-_MAX_ROWS               = int(os.environ.get("MAX_ANALYSIS_ROWS", "1000"))
-_GCP_PROJECT            = os.environ.get("GCP_PROJECT_ID", "pharma-reguatory-author")
-_CONTENT_PUBSUB_TOPIC   = os.environ.get("CONTENT_PUBSUB_TOPIC", "ich4-content-generation")
-_CONTENT_STATUS_TIMEOUT = int(os.environ.get("CONTENT_STATUS_TIMEOUT_SECONDS", str(30 * 60)))
+_DEFAULT_BUCKET         = os.environ.get("GCS_BUCKET", "your-gcs-bucket-name")  # GCS bucket that stores all program data
+_LLM_MODEL              = os.environ.get("LLM_MODEL", "gpt-4o-mini")  # LLM used for planning, codegen, and analysis
+_MAX_ROWS               = int(os.environ.get("MAX_ANALYSIS_ROWS", "1000"))  # cap rows sent to the LLM to control token cost
+_GCP_PROJECT            = os.environ.get("GCP_PROJECT_ID", "your-gcp-project-id")  # GCP project for Secret Manager and Pub/Sub
+_CONTENT_PUBSUB_TOPIC   = os.environ.get("CONTENT_PUBSUB_TOPIC", "ich4-content-generation")  # topic the trigger endpoint publishes to
+_CONTENT_STATUS_TIMEOUT = int(os.environ.get("CONTENT_STATUS_TIMEOUT_SECONDS", str(30 * 60)))  # declare a job timed-out after this many seconds
 
+# Allowlist prevents arbitrary or newly-released models from being injected via
+# env vars — only well-tested models with known output formats are permitted.
 _ALLOWED_LLM_MODELS: frozenset[str] = frozenset({
     "gpt-4o",
     "gpt-4o-mini",
@@ -78,6 +80,8 @@ _ALLOWED_LLM_MODELS: frozenset[str] = frozenset({
     "gemini-1.5-flash",
 })
 
+# Fail fast at import time rather than at first request so misconfigured
+# containers surface the error immediately in Cloud Run logs.
 if _LLM_MODEL not in _ALLOWED_LLM_MODELS:
     raise ValueError(
         f"LLM_MODEL '{_LLM_MODEL}' is not in the allowlist {sorted(_ALLOWED_LLM_MODELS)}. "
@@ -213,12 +217,12 @@ _DERIVED_STAT_PREFIXES = ("nnt_", "arr_", "rrr_", "hratio_", "oratio_", "hr_",
 
 def _exec_proportion(df: pd.DataFrame, step: dict) -> str:
     col, pos = step["column"], step["positive_value"]
-    pct = df[col].eq(pos).mean() * 100
-    n   = int(df[col].eq(pos).sum())
+    pct = df[col].eq(pos).mean() * 100  # percentage of rows matching the positive value
+    n   = int(df[col].eq(pos).sum())     # absolute count for the n= annotation
     return f"{pct:.1f}% ({n}/{len(df)})"
 
 def _exec_mean_sd(df: pd.DataFrame, step: dict) -> str:
-    s = pd.to_numeric(df[step["column"]], errors="coerce")
+    s = pd.to_numeric(df[step["column"]], errors="coerce")  # coerce non-numeric to NaN
     valid_n = int(s.notna().sum())
     if valid_n == 0:
         raise ValueError(f"column '{step['column']}' has no numeric values")
@@ -233,12 +237,13 @@ def _exec_median_range(df: pd.DataFrame, step: dict) -> str:
             f" (n={valid_n})")
 
 def _exec_row_count(df: pd.DataFrame, step: dict) -> str:
-    return str(len(df))
+    return str(len(df))  # total subject / record count
 
 def _exec_unique_count(df: pd.DataFrame, step: dict) -> str:
-    return str(df[step["column"]].nunique())
+    return str(df[step["column"]].nunique())  # distinct non-null values (e.g. number of treatment arms)
 
 # Mutable registry — extended at startup + at runtime by generated functions
+# Keys are computation type strings; values are executor callables.
 _COMPUTATION_MAP: dict[str, Callable] = {
     "proportion":   _exec_proportion,
     "mean_sd":      _exec_mean_sd,
@@ -302,7 +307,8 @@ def _ast_safe(code: str) -> str | None:
         return f"SyntaxError: {exc}"
     for node in ast.walk(tree):
         if isinstance(node, (ast.Import, ast.ImportFrom)):
-            # Only pandas / numpy / re allowed
+            # Only pandas / numpy / re are allowed inside generated functions;
+            # any other import (e.g. os, subprocess, socket) is rejected.
             names = (
                 [a.name for a in node.names]
                 if isinstance(node, ast.Import)
@@ -312,6 +318,8 @@ def _ast_safe(code: str) -> str | None:
                 if nm and nm.split(".")[0] not in ("pandas", "pd", "numpy", "np", "re"):
                     return f"Forbidden import: {nm}"
         if isinstance(node, ast.Attribute):
+            # Block dunder attribute access (__class__, __globals__, etc.) which
+            # could be used to escape the restricted namespace.
             if node.attr.startswith("__"):
                 return f"Dunder attribute access forbidden: {node.attr}"
     return None
@@ -331,18 +339,22 @@ def _safe_exec(code: str, source_label: str) -> dict:
     if ast_err:
         raise ValueError(f"AST safety check failed ({source_label}): {ast_err}")
 
+    # Minimal set of builtins exposed to generated functions.
+    # All standard builtins are replaced to prevent file I/O, network calls,
+    # and other dangerous operations.  __import__ is explicitly blocked so that
+    # generated code cannot re-import the os or subprocess module.
     _SAFE_BUILTINS = {
         "len": len, "int": int, "float": float, "str": str,
         "round": round, "range": range, "enumerate": enumerate,
         "zip": zip, "list": list, "dict": dict, "tuple": tuple,
         "bool": bool, "abs": abs, "min": min, "max": max, "sum": sum,
         "isinstance": isinstance, "hasattr": hasattr,
-        "__import__": _blocked_import,
+        "__import__": _blocked_import,  # explicit block — raises ImportError at call time
     }
     ns: dict = {
         "pd": pd,
         "np": np,
-        "__builtins__": _SAFE_BUILTINS,
+        "__builtins__": _SAFE_BUILTINS,  # replace default builtins with the safe subset
     }
     try:
         compiled = compile(code, source_label, "exec")
@@ -364,10 +376,10 @@ def _load_extensions(bucket: str) -> None:
             logger.info("[ext] No extension module found at %s — starting fresh", _EXTENSION_GCS_PATH)
             return
         code = blob.download_as_text()
-        ns = _safe_exec(code, _EXTENSION_GCS_PATH)
-        registry: dict = ns.get("_REGISTRY", {})
+        ns = _safe_exec(code, _EXTENSION_GCS_PATH)  # run the module in the sandbox
+        registry: dict = ns.get("_REGISTRY", {})    # pick up all registered functions
         with _COMPUTATION_MAP_LOCK:
-            _COMPUTATION_MAP.update(registry)
+            _COMPUTATION_MAP.update(registry)  # merge into the global executor map
         logger.info("[ext] Loaded %d extension function(s): %s",
                     len(registry), list(registry.keys()))
     except (ValueError, RuntimeError) as exc:
@@ -421,14 +433,14 @@ def _persist_extension(
     codegen_messages: list[dict] | None = None,
 ) -> None:
     """Append a new function to the GCS extension module and hot-register it."""
-    with _EXT_MODULE_LOCK:
+    with _EXT_MODULE_LOCK:  # serialize GCS writes across concurrent requests
         try:
             blob = _gcs_client().bucket(bucket).blob(_EXTENSION_GCS_PATH)
             current = blob.download_as_text() if blob.exists() else _EXT_MODULE_HEADER
             entry = (
                 f"\n# ── Generated {datetime.now(timezone.utc).date()} ─────────\n"
                 f"{fn_code}\n"
-                f'_REGISTRY["{comp_type}"] = {fn_name}\n'
+                f'_REGISTRY["{comp_type}"] = {fn_name}\n'  # register the function by comp_type
             )
             updated = current + entry
             blob.upload_from_string(updated, content_type="text/plain")
@@ -461,7 +473,8 @@ def _persist_extension(
         except Exception as exc:
             logger.warning("[ext] Codegen prompt save failed for '%s': %s", comp_type, exc)
 
-    # Hot-register in memory
+    # Hot-register in memory so subsequent requests in the same instance use the
+    # new function immediately without waiting for a container restart.
     try:
         ns = _safe_exec(fn_code, "<generated>")
         fn = ns.get(fn_name)
@@ -660,10 +673,10 @@ def _build_schema(df: pd.DataFrame) -> list[dict]:
     for col in df.columns:
         dtype = str(df[col].dtype)
         if df[col].dtype == object:
-            sample_vals = df[col].dropna().unique()[:5].tolist()
+            sample_vals = df[col].dropna().unique()[:5].tolist()  # representative values for the LLM
             kind = "categorical"
         else:
-            sample_vals = []
+            sample_vals = []  # numeric columns don't need sample values
             kind = "numeric"
         schema.append({"column": col, "dtype": dtype, "kind": kind,
                         "sample_values": sample_vals})
@@ -677,11 +690,11 @@ def _validate_plan_step(step: dict, df_columns: set[str]) -> str | None:
     if computation not in _ALLOWED_COMPUTATIONS:
         return f"unknown computation '{computation}'"
     if computation == "suggest":
-        return None
+        return None  # suggest steps skip column validation — no executor runs
     if computation != "row_count":
         if not column:
             return "missing column"
-        if column not in df_columns:
+        if column not in df_columns:  # reject hallucinated column names from the LLM
             return f"column '{column}' not in dataset"
     if computation == "proportion" and not step.get("positive_value"):
         return "proportion requires positive_value"
@@ -736,7 +749,7 @@ def _plan_and_execute(
     computable_meta = {
         k: v for k, v in placeholder_meta.items()
         if not any(k.lower().endswith(sfx) for sfx in _NARRATIVE_SUFFIXES)
-    }
+    }  # skip free-text narrative keys — no statistic can be computed for them
     if not computable_meta:
         return {}, {}, {}, []
 
@@ -761,7 +774,7 @@ def _plan_and_execute(
         return {}, {}, {}, serialised_planner
 
     try:
-        plan: list[dict] = json.loads(raw)
+        plan: list[dict] = json.loads(raw)  # expect a JSON array of step objects
         if not isinstance(plan, list):
             raise ValueError("not a list")
     except Exception as exc:
@@ -847,7 +860,7 @@ def _plan_and_execute(
         if step.get("computation") == "proportion":
             pv = computable_meta[key].get("positive_value")
             if pv:
-                step["positive_value"] = pv
+                step["positive_value"] = pv  # use the manifest-declared value over the LLM’s guess
             elif not step.get("positive_value"):
                 # Infer positive_value from column sample_values: prefer "Yes" / "Female" /
                 # "Male" / first sample; fall back to first categorical sample value.
@@ -863,7 +876,7 @@ def _plan_and_execute(
                     elif "male" in key_lower and any(str(s).lower() == "male" for s in samples):
                         preferred = next(s for s in samples if str(s).lower() == "male")
                     else:
-                        preferred = samples[0] if samples else None
+                        preferred = samples[0] if samples else None  # fall back to first observed value
                     if preferred is not None:
                         step["positive_value"] = str(preferred)
 
@@ -1176,12 +1189,12 @@ def resolve(req: ResolveRequest, http_request: Request) -> ResolveResponse:
             cn   = mapping.get("column_name", "")
             role = mapping.get("role", "")
             if not pk or not cn:
-                continue
+                continue  # skip incomplete mappings
             if role in _SKIP_ROLES:
                 logger.debug("[resolve] Skipping %s (role=%s) — not a CTD narrative value", pk, role)
                 continue
             if filter_keys is not None and pk not in filter_keys:
-                continue
+                continue  # caller specified explicit keys — skip everything else
             placeholder_meta[pk] = {
                 "gcs_path":      gcs_path,
                 "description":   f"{role} — column: {cn}",
@@ -1207,6 +1220,7 @@ def resolve(req: ResolveRequest, http_request: Request) -> ResolveResponse:
         )
 
     # Group by CSV source so each file is loaded only once
+    # (multiple placeholders may map to the same CSV)
     file_groups: dict[str, dict[str, dict]] = {}
     for pk, meta in placeholder_meta.items():
         file_groups.setdefault(meta["gcs_path"], {})[pk] = meta
@@ -1253,14 +1267,14 @@ def resolve(req: ResolveRequest, http_request: Request) -> ResolveResponse:
         )
 
     keys_failed = [pk for pk in placeholder_meta
-                   if pk not in resolved and pk not in all_suggested]
+                   if pk not in resolved and pk not in all_suggested]  # not resolved and no suggestion either
     if keys_failed:
         logger.warning("[resolve] %d keys unresolved: %s", len(keys_failed), keys_failed)
 
     try:
         _gcs_client().bucket(bucket).blob(saved_path).upload_from_string(
             json.dumps(resolved, indent=2), content_type="application/json"
-        )
+        )  # primary output read by content_worker to fill placeholders
         logger.info("[resolve] Saved %d values to gs://%s/%s", len(resolved), bucket, saved_path)
     except Exception as exc:
         logger.error("[resolve] GCS save failed: %s", exc)
@@ -1528,6 +1542,8 @@ def trigger(req: TriggerRequest, http_request: Request) -> ActionResponse:
         logger.error("[trigger] Pub/Sub publish failed: %s", exc)
         raise HTTPException(status_code=500, detail=f"Failed to queue content job: {exc}") from exc
 
+    # Clear any previous awaiting-confirm state and record the new run so the UI
+    # can poll /content_status with the correct identifiers.
     patch = {
         "awaiting_write_confirm": None,
         "content_run_id":  run_id,
@@ -1555,7 +1571,7 @@ def content_status(
 ) -> ActionResponse:
     """Return current content-generation status for a program."""
     job    = _load_content_status(bucket, ta, dis, drug)
-    status = job.get("status")
+    status = job.get("status")  # one of: "running", "done", "failed", "timed_out", or None
 
     if status == "running":
         pass_label = job.get("pass_label", "")

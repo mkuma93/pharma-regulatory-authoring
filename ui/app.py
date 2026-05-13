@@ -52,7 +52,7 @@ from coordinator import CoordinatorDecision, run_coordinator  # global UI coordi
 _CTD_API_URL             = os.environ.get("CTD_API_URL", "http://localhost:8081")
 _ICH4_WRITER_URL         = os.environ.get("ICH4_WRITER_URL", "http://localhost:8083")
 _CLINICAL_ANALYST_URL    = os.environ.get("CLINICAL_ANALYST_URL", "http://localhost:8084")
-_DEFAULT_BUCKET          = os.environ.get("GCS_BUCKET", "pharma-reguatory-author-life-science")
+_DEFAULT_BUCKET          = os.environ.get("GCS_BUCKET", "your-gcs-bucket-name")
 
 # ── OIDC helper ───────────────────────────────────────────────────────────────
 

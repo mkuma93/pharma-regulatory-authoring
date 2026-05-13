@@ -4,13 +4,13 @@
 # Dockerfile:    ctd_structure/api/Dockerfile
 
 substitutions:
-  _PROJECT_ID:   pharma-reguatory-author
+  _PROJECT_ID:   your-gcp-project-id
   _REGION:       us-central1
   _SERVICE_NAME: ctd-api
   _AR_REPO:      ich4
   _TAG:          latest
-  _ICH_INDEX_URL: "https://ich4-index-811317821863.us-central1.run.app"
-  _GCS_BUCKET:   pharma-reguatory-author-life-science
+  _ICH_INDEX_URL: "https://ich4-index-PROJECT_NUMBER.us-central1.run.app"
+  _GCS_BUCKET:   your-gcs-bucket-name
 
 steps:
   # 1. Unit tests

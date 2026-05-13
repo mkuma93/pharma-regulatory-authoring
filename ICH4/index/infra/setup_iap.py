@@ -19,7 +19,7 @@ Re-running is safe — each resource is created only if it doesn't exist.
 Prerequisites:
   gcloud auth login
   gcloud auth application-default login
-  gcloud config set project pharma-reguatory-author
+  gcloud config set project your-gcp-project-id
 
 After running:
   - Note the printed BACKEND_SERVICE_ID and set it as IAP_AUDIENCE in Cloud Run:

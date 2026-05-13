@@ -6,7 +6,7 @@
 #   _AR_REPO      — Artifact Registry repo name
 
 substitutions:
-  _PROJECT_ID: pharma-reguatory-author
+  _PROJECT_ID: your-gcp-project-id
   _REGION: us-central1
   _SERVICE_NAME: ich4-template
   _AR_REPO: ich4
@@ -69,7 +69,7 @@ steps:
       - "--memory=1Gi"
       - "--cpu=1"
       - "--timeout=300"
-      - "--set-env-vars=GCP_PROJECT_ID=$_PROJECT_ID,GCS_BUCKET_NAME=pharma-reguatory-author-life-science"
+      - "--set-env-vars=GCP_PROJECT_ID=$_PROJECT_ID,GCS_BUCKET_NAME=your-gcs-bucket-name"
       - "--set-secrets=OPENAI_API_KEY=OPENAI_API_KEY:latest"
 
 images:

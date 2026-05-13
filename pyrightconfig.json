@@ -1,0 +1,5 @@
+{
+  "extraPaths": [
+    "ctd_structure/deploy"
+  ]
+}

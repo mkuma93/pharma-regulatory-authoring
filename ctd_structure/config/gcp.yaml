@@ -1,17 +1,17 @@
 gcp:
-  project_id: pharma-reguatory-author
+  project_id: your-gcp-project-id
   region: us-central1
 
 cloudrun:
   service_name: ctd-structure
   worker_name: ctd-worker
   ich_index_service: ich4-index
-  ich_index_url: https://ich4-index-74ugcbbbya-uc.a.run.app
+  ich_index_url: https://ich4-index-your-service-id-uc.a.run.app
   ar_repo: ich4
 
 pubsub:
   topic: ctd-extraction
 
 gcs:
-  bucket: pharma-reguatory-author-life-science
+  bucket: your-gcs-bucket-name
   prefix: therapeutic-area/

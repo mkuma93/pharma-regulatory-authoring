@@ -27,7 +27,7 @@ PROJECT_ID="${PROJECT_ID:-$(_yaml_get gcp.project_id)}"
 REGION="${REGION:-$(_yaml_get gcp.region)}"
 SERVICE_NAME="${SERVICE_NAME:-clinical-analyst}"
 AR_REPO="${AR_REPO:-$(_yaml_get cloudrun.ar_repo)}"
-GCS_BUCKET="${GCS_BUCKET:-pharma-reguatory-author-life-science}"
+GCS_BUCKET="${GCS_BUCKET:-your-gcs-bucket-name}"
 
 echo "=== Clinical Analyst — Deploy to Cloud Run ==="
 echo "  Project  : ${PROJECT_ID}"

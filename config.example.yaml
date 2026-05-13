@@ -1,0 +1,11 @@
+gcp:
+  project_id: your-gcp-project-id
+  region: us-central1
+
+gcs:
+  bucket: your-gcs-bucket-name
+
+services:
+  ich_index_url: https://your-service-id-uc.a.run.app
+  ctd_api_url: https://your-service-id-uc.a.run.app
+  clinical_analyst_url: https://your-service-id-uc.a.run.app

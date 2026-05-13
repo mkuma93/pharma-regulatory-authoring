@@ -4,7 +4,7 @@ ui/app_pro.py
 Professional, step-by-step guided UI for the Regulatory Authoring Platform.
 
 Designed for regulatory authors who are not technical. Each step clearly explains
-what to do, why it matters, and what will happen — no jargon, no lost feeling.
+what to do, why it matters, and what will happen.
 
 Workflow
 ────────
@@ -67,7 +67,7 @@ if _here not in sys.path:
 _CTD_API_URL          = os.environ.get("CTD_API_URL",          "http://localhost:8081")
 _ICH4_WRITER_URL      = os.environ.get("ICH4_WRITER_URL",      "http://localhost:8083")
 _CLINICAL_ANALYST_URL = os.environ.get("CLINICAL_ANALYST_URL", "http://localhost:8084")
-_DEFAULT_BUCKET       = os.environ.get("GCS_BUCKET",           "pharma-reguatory-author-life-science")
+_DEFAULT_BUCKET       = os.environ.get("GCS_BUCKET",           "your-gcs-bucket-name")
 
 
 # ── OIDC ───────────────────────────────────────────────────────────────────────
@@ -415,7 +415,7 @@ def _action_publish_framework(state: dict, log: str):
     sid = state.get("session_id", "default")
     bkt = state.get("bucket", _DEFAULT_BUCKET)
     _clog(f"[PUBLISH] sid={sid} bkt={bkt} folder_paths_len={len(state.get('folder_paths') or [])} approved={state.get('approved')} keys={list(state.keys())}")
-    if not state.get("folder_paths"):
+    if not state.get("folder_paths"): 
         # Recover: if state was empty but a session exists in GCS, reload it.
         sess = _ctd_get("/session", {"session_id": sid, "bucket": bkt})
         fp = sess.get("folder_paths") or []

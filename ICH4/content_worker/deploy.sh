@@ -8,17 +8,17 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname "$(dirname "${SCRIPT_DIR}")")"
-PROJECT_ID="${PROJECT_ID:-pharma-reguatory-author}"
+PROJECT_ID="${PROJECT_ID:-your-gcp-project-id}"
 REGION="${REGION:-us-central1}"
 AR_REPO="${AR_REPO:-ich4}"
 WORKER_NAME="${WORKER_NAME:-ich4-content-worker}"
 PUBSUB_TOPIC="${PUBSUB_TOPIC:-ich4-content-generation}"
-CONTENT_PIPELINE_URL="${CONTENT_PIPELINE_URL:-https://ich4-content-pipeline-74ugcbbbya-uc.a.run.app}"
-WRITER_URL="${WRITER_URL:-https://ich4-writer-74ugcbbbya-uc.a.run.app}"
-INDEX_URL="${INDEX_URL:-https://ich4-index-74ugcbbbya-uc.a.run.app}"
-CLINICAL_ANALYST_URL="${CLINICAL_ANALYST_URL:-https://clinical-analyst-74ugcbbbya-uc.a.run.app}"
+CONTENT_PIPELINE_URL="${CONTENT_PIPELINE_URL:-https://ich4-content-pipeline-your-service-id-uc.a.run.app}"
+WRITER_URL="${WRITER_URL:-https://ich4-writer-your-service-id-uc.a.run.app}"
+INDEX_URL="${INDEX_URL:-https://ich4-index-your-service-id-uc.a.run.app}"
+CLINICAL_ANALYST_URL="${CLINICAL_ANALYST_URL:-https://clinical-analyst-your-service-id-uc.a.run.app}"
 
-PROJECT_NUMBER="${PROJECT_NUMBER:-$(gcloud projects describe "${PROJECT_ID}" --format='value(projectNumber)' 2>/dev/null || echo 811317821863)}"
+PROJECT_NUMBER="${PROJECT_NUMBER:-$(gcloud projects describe "${PROJECT_ID}" --format='value(projectNumber)' 2>/dev/null || echo PROJECT_NUMBER)}"
 
 echo "=== Deploying ${WORKER_NAME} ==="
     echo "    Content pipeline     : ${CONTENT_PIPELINE_URL}"

@@ -10,16 +10,16 @@
 #   5. Create/update Pub/Sub topic + push subscription
 
 substitutions:
-  _PROJECT_ID:      pharma-reguatory-author
-  _PROJECT_NUMBER:  "811317821863"
+  _PROJECT_ID:      your-gcp-project-id
+  _PROJECT_NUMBER:  "PROJECT_NUMBER"
   _REGION:          us-central1
   _WORKER_NAME:     ich4-content-worker
   _AR_REPO:         ich4
   _TAG:             latest
-  _CONTENT_PIPELINE_URL: "https://ich4-content-pipeline-74ugcbbbya-uc.a.run.app"
-  _WRITER_URL:       "https://ich4-writer-74ugcbbbya-uc.a.run.app"
-  _INDEX_URL:        "https://ich4-index-74ugcbbbya-uc.a.run.app"
-  _CLINICAL_ANALYST_URL: "https://clinical-analyst-74ugcbbbya-uc.a.run.app"
+  _CONTENT_PIPELINE_URL: "https://ich4-content-pipeline-your-service-id-uc.a.run.app"
+  _WRITER_URL:       "https://ich4-writer-your-service-id-uc.a.run.app"
+  _INDEX_URL:        "https://ich4-index-your-service-id-uc.a.run.app"
+  _CLINICAL_ANALYST_URL: "https://clinical-analyst-your-service-id-uc.a.run.app"
   _PUBSUB_TOPIC:    ich4-content-generation
   _SA_NAME:         ich4-content-worker
 

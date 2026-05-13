@@ -62,14 +62,14 @@ except ImportError:
 # ── Config ────────────────────────────────────────────────────────────────────
 
 _DEFAULT_URL    = os.environ.get("ICH_INDEX_URL",
-                                 "https://ich4-index-74ugcbbbya-uc.a.run.app")
+                                 "https://ich4-index-your-service-id-uc.a.run.app")
 _DEFAULT_BUCKET = os.environ.get("GCS_BUCKET",
-                                 "pharma-reguatory-author-life-science")
+                                 "your-gcs-bucket-name")
 _GCS_TEMPLATE  = "ctd_structure/ctd"
 _GCS_PROGRAMS  = "therapeutic-area"
 _PUBSUB_TOPIC         = os.environ.get("PUBSUB_TOPIC", "ctd-extraction")
 _CONTENT_PUBSUB_TOPIC = os.environ.get("CONTENT_PUBSUB_TOPIC", "ich4-content-generation")
-_GCP_PROJECT   = os.environ.get("GCP_PROJECT_ID", "pharma-reguatory-author")
+_GCP_PROJECT   = os.environ.get("GCP_PROJECT_ID", "your-gcp-project-id")
 _CONTENT_STATUS_TIMEOUT_SECONDS = 30 * 60  # 30 min
 _COMPLIANCE_OFFICERS = {
     e.strip().lower()

@@ -20,6 +20,8 @@ env/
 config/secrets/
 **/config/secrets/
 **/config/.env
+config.yaml
+ctd_structure/config/gcp.local.yaml
 *.env
 .env.*
 *.key

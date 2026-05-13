@@ -8,7 +8,7 @@
 
 set -euo pipefail
 
-PROJECT=pharma-reguatory-author
+PROJECT=your-gcp-project-id
 REGION=us-central1
 
 CTD_PORT=8081
@@ -50,7 +50,7 @@ echo ""
 export CTD_API_URL="http://localhost:$CTD_PORT"
 export ICH4_WRITER_URL="http://localhost:$WRITER_PORT"
 export CLINICAL_ANALYST_URL="http://localhost:$ANALYST_PORT"
-export GCS_BUCKET="${GCS_BUCKET:-pharma-reguatory-author-life-science}"
+export GCS_BUCKET="${GCS_BUCKET:-your-gcs-bucket-name}"
 export PYTHONUNBUFFERED=1
 
 # OPENAI_API_KEY: pull from Secret Manager if not already set

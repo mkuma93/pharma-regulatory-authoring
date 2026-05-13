@@ -7,15 +7,15 @@
 # The original reguatory-ui service is kept unchanged for reference.
 
 substitutions:
-  _PROJECT_ID:              pharma-reguatory-author
+  _PROJECT_ID:              your-gcp-project-id
   _REGION:                  us-central1
   _SERVICE_NAME:            reguatory-ui-pro
   _AR_REPO:                 ich4
   _TAG:                     latest
-  _CTD_API_URL:             "https://ctd-api-811317821863.us-central1.run.app"
-  _ICH4_WRITER_URL:         "https://ich4-writer-811317821863.us-central1.run.app"
-  _CLINICAL_ANALYST_URL:    "https://clinical-analyst-811317821863.us-central1.run.app"
-  _GCS_BUCKET:              pharma-reguatory-author-life-science
+  _CTD_API_URL:             "https://ctd-api-PROJECT_NUMBER.us-central1.run.app"
+  _ICH4_WRITER_URL:         "https://ich4-writer-PROJECT_NUMBER.us-central1.run.app"
+  _CLINICAL_ANALYST_URL:    "https://clinical-analyst-PROJECT_NUMBER.us-central1.run.app"
+  _GCS_BUCKET:              your-gcs-bucket-name
 
 steps:
   # 1. Ensure Artifact Registry repo exists

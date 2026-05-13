@@ -84,7 +84,7 @@ def _bq() -> Any:
     if _bq_client is None:
         from google.cloud import bigquery  # noqa: PLC0415
         _bq_client = bigquery.Client(
-            project=os.environ.get("GCP_PROJECT_ID", "pharma-reguatory-author")
+            project=os.environ.get("GCP_PROJECT_ID", "your-gcp-project-id")
         )
     return _bq_client
 
@@ -104,7 +104,7 @@ def emit_audit_event(event: dict) -> None:
     if not dataset:
         return  # BQ not configured — structured log is enough for now
 
-    project = os.environ.get("GCP_PROJECT_ID", "pharma-reguatory-author")
+    project = os.environ.get("GCP_PROJECT_ID", "your-gcp-project-id")
     table   = f"{project}.{dataset}.audit_events"
 
     # BigQuery expects TIMESTAMP as an ISO string; BOOL as Python bool; JSON as str.

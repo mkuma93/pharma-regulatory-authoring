@@ -23,9 +23,11 @@ Pub/Sub message envelope (base64-encoded JSON):
   }
 
 Environment variables (injected by Cloud Run):
-  ORCHESTRATOR_URL  — base URL of the orchestrator service
-  WRITER_URL        — base URL of the writer service
-  PORT              — port to bind (injected by Cloud Run)
+  CONTENT_PIPELINE_URL  — base URL of the ich4-content-pipeline service (template orchestration + RAG)
+  WRITER_URL            — base URL of the ich4-writer service
+  INDEX_URL             — base URL of the ich4-index service (per-program RAG ingest)
+  CLINICAL_ANALYST_URL  — base URL of the clinical-analyst service (schema-diff + resolve)
+  PORT                  — port to bind (injected by Cloud Run)
 """
 from __future__ import annotations
 
@@ -65,28 +67,83 @@ _gcs_client = storage.Client()
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _program_prefix(ta: str, dis: str, drug: str) -> str:
+    """Return the GCS key prefix for all program artefacts.
+
+    All blobs owned by a drug program (templates, documents, content_status,
+    evidence manifests) are stored under this prefix:
+      therapeutic-area/{ta}/{dis}/{drug}/
+
+    The slug normalisation (lowercase, spaces → underscores) is applied so that
+    'Lung Cancer' and 'lung_cancer' resolve to the same GCS path.
+    """
     def _slug(s: str) -> str:
         return s.strip().lower().replace(" ", "_")
     return f"therapeutic-area/{_slug(ta)}/{_slug(dis)}/{_slug(drug)}"
 
 
 def _program_namespace(ta: str, dis: str, drug: str) -> str:
-    """Build the base program namespace used for per-program LlamaIndex namespaces."""
+    """Build the base LlamaIndex namespace for a drug program's RAG index.
+
+    Each generation pass appends its own suffix to this base namespace:
+      program_{ta}_{dis}_{drug}_module5
+      program_{ta}_{dis}_{drug}_module2_clinical_summary
+
+    These namespaces are used by content_pipeline POST /index/query to retrieve
+    prior-pass evidence, and by POST /index/ingest-program to store validated
+    generated content for use by downstream passes.
+    """
     def _slug(s: str) -> str:
         return s.strip().lower().replace(" ", "_")
     return f"program_{_slug(ta)}_{_slug(dis)}_{_slug(drug)}"
 
 
 def _content_status_path(ta: str, dis: str, drug: str, session_id: str = "") -> str:
+    """Return the GCS path for the per-session content status blob.
+
+    If session_id is provided the path is:
+      therapeutic-area/{ta}/{dis}/{drug}/content_status/{session_id}.json
+
+    If session_id is empty the path falls back to the shared latest blob:
+      therapeutic-area/{ta}/{dis}/{drug}/content_status/latest.json
+
+    NOTE (Item 11b): _write_status always overwrites this blob — no history is
+    retained between status transitions. See improvement plan Item 11b for the
+    append-only event log design.
+    """
     suffix = session_id.strip() if session_id and session_id.strip() else "latest"
     return f"{_program_prefix(ta, dis, drug)}/content_status/{suffix}.json"
 
 
 def _latest_status_path(ta: str, dis: str, drug: str) -> str:
+    """Return the GCS path for the shared latest-status blob.
+
+    This blob is always mirrored by _write_status so that the Gradio UI's
+    30-second poll can read the most recent status without knowing the
+    session_id or run_id of the active job.
+    """
     return f"{_program_prefix(ta, dis, drug)}/content_status/latest.json"
 
 
 def _write_status(bucket: str, path: str, payload: dict, also_latest: str | None = None) -> None:
+    """Write a status payload to GCS, always mirroring to latest.json.
+
+    Dual-write strategy:
+      1. Writes payload to `path` (the per-session or per-run blob).
+      2. Automatically derives and writes a mirror to `latest.json` in the same
+         content_status/ directory, so the UI poll always gets the freshest state
+         without needing the session_id.
+
+    Guards against double-writes:
+      - If `path` already ends with '/latest.json', the mirror derivation is skipped.
+      - `also_latest != path` prevents writing the same blob twice.
+
+    All writes are non-fatal: GCS errors are logged as warnings so a status
+    write failure never aborts an in-progress generation job.
+
+    NOTE (Item 11b): Every call overwrites the blob — no intermediate transitions
+    are retained. The improvement plan proposes an append-only event log at
+    content_status/{run_id}/events/{timestamp}_{step}.json.
+    """
     stamped = {**payload, "updated_at": datetime.now(timezone.utc).isoformat()}
     data = json.dumps(stamped)
     # Derive latest.json path automatically (content_status/{uuid}.json → content_status/latest.json)
