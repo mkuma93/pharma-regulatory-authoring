@@ -6,6 +6,29 @@ LLM-powered platform for **ICH M4(R4) CTD** regulatory authoring. Automates fold
 
 ---
 
+## Repo Workflow (Venture Setup)
+
+- `core` remote is the private repository for day-to-day development.
+- `origin` remote is the public showcase repository.
+- Default push target is configured to `core` in local git config (`git push` goes to private by default).
+- Public mirroring is guarded by `scripts/mirror_to_public.sh`:
+      - Only allows source branches named `public/*`
+      - Requires a clean working tree
+      - Runs `scripts/check_public_safety.sh` before push
+
+Typical flow:
+
+```bash
+# private development
+git push
+
+# when ready to publish safe changes
+git switch -c public/main
+scripts/mirror_to_public.sh public/main main
+```
+
+---
+
 ## Example — Bell's Palsy / Prednisolone CTD (end-to-end)
 
 This walkthrough uses the bundled demo program (neurology / bells_palsy / prednisolone, 494-patient RCT).
